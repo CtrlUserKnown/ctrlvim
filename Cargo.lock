@@ -56,6 +56,113 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "ctrlvim-api"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-api-macro",
+ "ctrlvim-editor",
+ "ctrlvim-text",
+ "ctrlvim-types",
+ "ctrlvim-vimscript",
+ "inventory",
+]
+
+[[package]]
+name = "ctrlvim-api-macro"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "ctrlvim-async"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-types",
+ "rmpv",
+ "tokio",
+]
+
+[[package]]
+name = "ctrlvim-core"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-api",
+ "ctrlvim-async",
+ "ctrlvim-editor",
+ "ctrlvim-lua",
+ "ctrlvim-options",
+ "ctrlvim-text",
+ "ctrlvim-types",
+ "mlua",
+ "tree-sitter-json",
+]
+
+[[package]]
+name = "ctrlvim-editor"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-options",
+ "ctrlvim-text",
+ "ctrlvim-types",
+]
+
+[[package]]
+name = "ctrlvim-lua"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-api",
+ "ctrlvim-async",
+ "ctrlvim-editor",
+ "ctrlvim-text",
+ "ctrlvim-treesitter",
+ "ctrlvim-types",
+ "mlua",
+ "tree-sitter-json",
+]
+
+[[package]]
+name = "ctrlvim-options"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-types",
+]
+
+[[package]]
+name = "ctrlvim-text"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-types",
+ "ropey",
+]
+
+[[package]]
+name = "ctrlvim-treesitter"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-types",
+ "tree-sitter",
+ "tree-sitter-json",
+]
+
+[[package]]
+name = "ctrlvim-types"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "ctrlvim-vimscript"
+version = "0.1.0"
+dependencies = [
+ "ctrlvim-editor",
+ "ctrlvim-types",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -173,113 +280,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "nvim-api"
-version = "0.1.0"
-dependencies = [
- "inventory",
- "nvim-api-macro",
- "nvim-editor",
- "nvim-text",
- "nvim-types",
- "nvim-vimscript",
-]
-
-[[package]]
-name = "nvim-api-macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "nvim-async"
-version = "0.1.0"
-dependencies = [
- "nvim-types",
- "rmpv",
- "tokio",
-]
-
-[[package]]
-name = "nvim-core"
-version = "0.1.0"
-dependencies = [
- "mlua",
- "nvim-api",
- "nvim-async",
- "nvim-editor",
- "nvim-lua",
- "nvim-options",
- "nvim-text",
- "nvim-types",
- "tree-sitter-json",
-]
-
-[[package]]
-name = "nvim-editor"
-version = "0.1.0"
-dependencies = [
- "nvim-options",
- "nvim-text",
- "nvim-types",
-]
-
-[[package]]
-name = "nvim-lua"
-version = "0.1.0"
-dependencies = [
- "mlua",
- "nvim-api",
- "nvim-async",
- "nvim-editor",
- "nvim-text",
- "nvim-treesitter",
- "nvim-types",
- "tree-sitter-json",
-]
-
-[[package]]
-name = "nvim-options"
-version = "0.1.0"
-dependencies = [
- "nvim-types",
-]
-
-[[package]]
-name = "nvim-text"
-version = "0.1.0"
-dependencies = [
- "nvim-types",
- "ropey",
-]
-
-[[package]]
-name = "nvim-treesitter"
-version = "0.1.0"
-dependencies = [
- "nvim-types",
- "tree-sitter",
- "tree-sitter-json",
-]
-
-[[package]]
-name = "nvim-types"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "nvim-vimscript"
-version = "0.1.0"
-dependencies = [
- "nvim-editor",
- "nvim-types",
 ]
 
 [[package]]

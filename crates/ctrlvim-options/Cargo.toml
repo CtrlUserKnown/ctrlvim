@@ -1,0 +1,8 @@
+[package]
+name = "ctrlvim-options"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctrlvim-types.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "ctrlvim-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctrlvim-types.workspace = true
+ctrlvim-text.workspace = true
+ctrlvim-editor.workspace = true
+ctrlvim-vimscript.workspace = true
+ctrlvim-api-macro.workspace = true
+inventory = "0.3"

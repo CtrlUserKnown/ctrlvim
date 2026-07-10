@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/nvim-types",
-    "crates/nvim-text",
-    "crates/nvim-options",
-    "crates/nvim-editor",
-    "crates/nvim-vimscript",
-    "crates/nvim-treesitter",
-    "crates/nvim-api-macro",
-    "crates/nvim-api",
-    "crates/nvim-lua",
-    "crates/nvim-async",
-    "crates/nvim-core",
+    "crates/ctrlvim-types",
+    "crates/ctrlvim-text",
+    "crates/ctrlvim-options",
+    "crates/ctrlvim-editor",
+    "crates/ctrlvim-vimscript",
+    "crates/ctrlvim-treesitter",
+    "crates/ctrlvim-api-macro",
+    "crates/ctrlvim-api",
+    "crates/ctrlvim-lua",
+    "crates/ctrlvim-async",
+    "crates/ctrlvim-core",
 ]
 
 [workspace.package]
@@ -21,16 +21,16 @@ license = "Apache-2.0"
 rust-version = "1.80"
 
 [workspace.dependencies]
-nvim-types = { path = "crates/nvim-types" }
-nvim-text = { path = "crates/nvim-text" }
-nvim-options = { path = "crates/nvim-options" }
-nvim-editor = { path = "crates/nvim-editor" }
-nvim-vimscript = { path = "crates/nvim-vimscript" }
-nvim-treesitter = { path = "crates/nvim-treesitter" }
-nvim-api-macro = { path = "crates/nvim-api-macro" }
-nvim-api = { path = "crates/nvim-api" }
-nvim-lua = { path = "crates/nvim-lua" }
-nvim-async = { path = "crates/nvim-async" }
+ctrlvim-types = { path = "crates/ctrlvim-types" }
+ctrlvim-text = { path = "crates/ctrlvim-text" }
+ctrlvim-options = { path = "crates/ctrlvim-options" }
+ctrlvim-editor = { path = "crates/ctrlvim-editor" }
+ctrlvim-vimscript = { path = "crates/ctrlvim-vimscript" }
+ctrlvim-treesitter = { path = "crates/ctrlvim-treesitter" }
+ctrlvim-api-macro = { path = "crates/ctrlvim-api-macro" }
+ctrlvim-api = { path = "crates/ctrlvim-api" }
+ctrlvim-lua = { path = "crates/ctrlvim-lua" }
+ctrlvim-async = { path = "crates/ctrlvim-async" }
 
 ropey = "1.6"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }

@@ -1,8 +1,0 @@
-[package]
-name = "nvim-options"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-nvim-types.workspace = true

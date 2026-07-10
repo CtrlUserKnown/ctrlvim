@@ -1,0 +1,20 @@
+[package]
+name = "ctrlvim-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctrlvim-types.workspace = true
+ctrlvim-text.workspace = true
+ctrlvim-options.workspace = true
+ctrlvim-editor.workspace = true
+ctrlvim-api.workspace = true
+ctrlvim-lua.workspace = true
+ctrlvim-async.workspace = true
+mlua.workspace = true
+tree-sitter-json = "0.21"
+
+[[bin]]
+name = "ctrlvim-demo"
+path = "src/bin/demo.rs"

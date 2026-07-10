@@ -1,9 +1,0 @@
-[package]
-name = "nvim-vimscript"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-nvim-types.workspace = true
-nvim-editor.workspace = true

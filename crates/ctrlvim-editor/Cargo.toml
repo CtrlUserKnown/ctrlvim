@@ -1,0 +1,10 @@
+[package]
+name = "ctrlvim-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctrlvim-types.workspace = true
+ctrlvim-text.workspace = true
+ctrlvim-options.workspace = true

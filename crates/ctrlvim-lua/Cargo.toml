@@ -1,0 +1,17 @@
+[package]
+name = "ctrlvim-lua"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ctrlvim-types.workspace = true
+ctrlvim-text.workspace = true
+ctrlvim-editor.workspace = true
+ctrlvim-api.workspace = true
+ctrlvim-async.workspace = true
+ctrlvim-treesitter.workspace = true
+mlua.workspace = true
+
+[dev-dependencies]
+tree-sitter-json = "0.21"
