@@ -1,0 +1,5 @@
+cargo:rerun-if-changed=build
+cargo:rustc-link-search=native=/home/userknown/development/ctrlvim/target/debug/build/mlua-sys-ef5e283cdcdb95a2/out/lua-build/lib
+cargo:rustc-link-lib=static=lua5.4
+cargo:include=/home/userknown/development/ctrlvim/target/debug/build/mlua-sys-ef5e283cdcdb95a2/out/lua-build/include
+cargo:lib=/home/userknown/development/ctrlvim/target/debug/build/mlua-sys-ef5e283cdcdb95a2/out/lua-build/lib

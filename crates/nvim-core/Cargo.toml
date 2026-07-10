@@ -1,0 +1,20 @@
+[package]
+name = "nvim-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nvim-types.workspace = true
+nvim-text.workspace = true
+nvim-options.workspace = true
+nvim-editor.workspace = true
+nvim-api.workspace = true
+nvim-lua.workspace = true
+nvim-async.workspace = true
+mlua.workspace = true
+tree-sitter-json = "0.21"
+
+[[bin]]
+name = "ctrlvim-demo"
+path = "src/bin/demo.rs"

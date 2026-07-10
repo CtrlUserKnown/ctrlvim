@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nvim-types",
+    "crates/nvim-text",
+    "crates/nvim-options",
+    "crates/nvim-editor",
+    "crates/nvim-vimscript",
+    "crates/nvim-treesitter",
+    "crates/nvim-api-macro",
+    "crates/nvim-api",
+    "crates/nvim-lua",
+    "crates/nvim-async",
+    "crates/nvim-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+nvim-types = { path = "crates/nvim-types" }
+nvim-text = { path = "crates/nvim-text" }
+nvim-options = { path = "crates/nvim-options" }
+nvim-editor = { path = "crates/nvim-editor" }
+nvim-vimscript = { path = "crates/nvim-vimscript" }
+nvim-treesitter = { path = "crates/nvim-treesitter" }
+nvim-api-macro = { path = "crates/nvim-api-macro" }
+nvim-api = { path = "crates/nvim-api" }
+nvim-lua = { path = "crates/nvim-lua" }
+nvim-async = { path = "crates/nvim-async" }
+
+ropey = "1.6"
+mlua = { version = "0.9", features = ["lua54", "vendored"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "net", "io-util", "macros"] }
+rmpv = "1"
+thiserror = "1"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
