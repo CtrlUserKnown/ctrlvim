@@ -1,0 +1,8 @@
+[package]
+name = "ctrlvim-markdown"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UI-less markdown analysis for ctrlvim's live in-editor rendering (source → per-line display segments)"
+
+[dependencies]

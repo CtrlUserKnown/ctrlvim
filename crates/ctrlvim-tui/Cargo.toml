@@ -1,0 +1,16 @@
+[package]
+name = "ctrlvim-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ratatui frontend for the ctrlvim engine (startup dashboard + editor shell)"
+
+[dependencies]
+ctrlvim-core.workspace = true
+ctrlvim-markdown.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[[bin]]
+name = "ctrlvim"
+path = "src/main.rs"

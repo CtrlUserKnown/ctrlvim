@@ -1,18 +1,20 @@
 # ctrlvim-rs
 
-A staged Rust reimplementation of Neovim's editing core, with the UI deliberately
-omitted (the frontend is built separately in [Ratatui]) and existing Neovim Lua
+A staged Rust reimplementation of Neovim's editing core, with a [Ratatui]
+frontend (`ctrlvim-tui`) rendering on top of the engine, and existing Neovim Lua
 plugins as the long-term compatibility target. See the roadmap in
 `~/.claude/plans/vivid-humming-elephant.md` for the full plan.
 
-This tree covers **milestones M0–M9**. Everything here compiles on stable Rust and
-is covered by tests (`cargo test --workspace` — 138 tests, zero warnings).
+This tree covers **milestones M0–M9** plus the TUI frontend. Everything here
+compiles on stable Rust and is covered by tests (`cargo test --workspace` — 150
+tests, zero warnings).
 
 ## Quick start
 
 ```sh
 cargo test --workspace                       # run all tests
 cargo run -p ctrlvim-core --bin ctrlvim-demo    # end-to-end M1–M5 demo (no UI)
+cargo run -p ctrlvim-tui                      # launch the Ratatui dashboard/editor UI
 ```
 
 ## Workspace layout
@@ -30,6 +32,7 @@ cargo run -p ctrlvim-core --bin ctrlvim-demo    # end-to-end M1–M5 demo (no UI
 | `ctrlvim-lua` | `executor.c` + `converter.c` | `mlua` embedding, `Object`↔Lua converter, `LuaRef`/`RegistryKey` callbacks, `vim.api`/`vim.uv`/`vim.fn`/`vim.keymap`/`vim.treesitter` |
 | `ctrlvim-async` | `event/*.c` (libuv), `msgpack_rpc/*.c` | tokio event loop + timers, `rmpv` msgpack-RPC codec/dispatch |
 | `ctrlvim-core` | startup wiring | `Ctrlvim` facade + demo binary a frontend links against |
+| `ctrlvim-tui` | (the UI, split out) | Ratatui + crossterm frontend: startup dashboard, plugin manager, file-buffer viewer, and floating explorer/palette/help overlays, keyboard + mouse driven, atop `ctrlvim-core` |
 
 Dependency direction flows strictly downward; `ctrlvim-async` is a parallel infra branch.
 

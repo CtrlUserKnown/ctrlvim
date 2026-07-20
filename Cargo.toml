@@ -7,11 +7,13 @@ members = [
     "crates/ctrlvim-editor",
     "crates/ctrlvim-vimscript",
     "crates/ctrlvim-treesitter",
+    "crates/ctrlvim-markdown",
     "crates/ctrlvim-api-macro",
     "crates/ctrlvim-api",
     "crates/ctrlvim-lua",
     "crates/ctrlvim-async",
     "crates/ctrlvim-core",
+    "crates/ctrlvim-tui",
 ]
 
 [workspace.package]
@@ -27,11 +29,15 @@ ctrlvim-options = { path = "crates/ctrlvim-options" }
 ctrlvim-editor = { path = "crates/ctrlvim-editor" }
 ctrlvim-vimscript = { path = "crates/ctrlvim-vimscript" }
 ctrlvim-treesitter = { path = "crates/ctrlvim-treesitter" }
+ctrlvim-markdown = { path = "crates/ctrlvim-markdown" }
 ctrlvim-api-macro = { path = "crates/ctrlvim-api-macro" }
 ctrlvim-api = { path = "crates/ctrlvim-api" }
 ctrlvim-lua = { path = "crates/ctrlvim-lua" }
 ctrlvim-async = { path = "crates/ctrlvim-async" }
+ctrlvim-core = { path = "crates/ctrlvim-core" }
 
+ratatui = "0.29"
+crossterm = "0.28"
 ropey = "1.6"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "net", "io-util", "macros"] }
