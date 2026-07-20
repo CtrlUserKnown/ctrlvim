@@ -1,1 +1,21 @@
+# Rust build artifacts
 target/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vscode-test/
+
+# Claude
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
