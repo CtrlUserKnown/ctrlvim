@@ -1,5 +1,5 @@
 [package]
-name = "ctrlvim-tui"
+name = "ctrlvim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,5 +12,5 @@ ratatui.workspace = true
 crossterm.workspace = true
 
 [[bin]]
-name = "ctrlvim"
+name = "cvi"
 path = "src/main.rs"

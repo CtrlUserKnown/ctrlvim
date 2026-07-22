@@ -192,7 +192,11 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
                 return;
             }
         }
-        // Not a digit — fall through and handle this key normally.
+        if c == Some('d') {
+            app.dispatch(Action::OpenDashboard);
+            return;
+        }
+        // Not a recognized leader chord — fall through and handle normally.
     }
     if c == Some(' ') {
         app.leader_pending = true;
@@ -262,15 +266,16 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         if c == Some('e') || c == Some('f') { app.dispatch(Action::OpenFinder); return; }
     }
 
-    // Settings: `d` toggles the drawer-on-startup option; j/k move the LSP
-    // list, Enter/Space toggle the selected server.
+    // Settings: j/k scroll continuously through the EDITOR options and the LSP
+    // list; Enter/Space toggles the focused row. `d`/`m` jump-toggle directly.
     if on_dashboard && app.section == DashboardSection::Settings {
         match (key.code, c) {
             (_, Some('d')) => { app.dispatch(Action::ToggleStartupDrawer); return; }
-            (KeyCode::Down, _) | (_, Some('j')) => { app.move_lsp_selection(1); return; }
-            (KeyCode::Up, _) | (_, Some('k')) => { app.move_lsp_selection(-1); return; }
+            (_, Some('m')) => { app.dispatch(Action::ToggleMouse); return; }
+            (KeyCode::Down, _) | (_, Some('j')) => { app.move_settings(1); return; }
+            (KeyCode::Up, _) | (_, Some('k')) => { app.move_settings(-1); return; }
             (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {
-                app.toggle_lsp(app.lsp_index);
+                app.settings_toggle();
                 return;
             }
             _ => {}

@@ -9,8 +9,8 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use ctrlvim_tui::app::{Action, App, DashboardSection, PanelId};
-use ctrlvim_tui::{input, ui};
+use ctrlvim::app::{Action, App, DashboardSection, PanelId};
+use ctrlvim::{input, ui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -603,6 +603,107 @@ fn finder_creates_a_file_for_an_unmatched_name() {
 }
 
 #[test]
+fn finder_colon_c_creates_and_opens_a_file() {
+    let mut app = temp_project(&[("a.rs", "a\n")]);
+    let path = app.root.join("made.txt");
+    app.dispatch(Action::OpenFinder);
+    typ(&mut app, ":c made.txt");
+    press(&mut app, KeyCode::Enter);
+    assert!(path.exists(), "`:c` should create the file");
+    assert!(app.finder.is_none(), "creating a file closes the browser");
+    assert_eq!(app.active_buffer().label, "made.txt");
+}
+
+#[test]
+fn finder_colon_dir_creates_a_directory_and_stays_open() {
+    let mut app = temp_project(&[("a.rs", "a\n")]);
+    let path = app.root.join("newdir");
+    app.dispatch(Action::OpenFinder);
+    typ(&mut app, ":dir newdir");
+    press(&mut app, KeyCode::Enter);
+    assert!(path.is_dir(), "`:dir` should create the directory");
+    let f = app.finder.as_ref().expect("browser stays open after :dir");
+    assert!(f.query.is_empty(), "prompt is reset after the command");
+    assert!(f.entries.iter().any(|e| e.name == "newdir/"), "listing refreshed");
+}
+
+#[test]
+fn finder_colon_d_with_name_deletes() {
+    let mut app = temp_project(&[("a.rs", "a\n"), ("gone.txt", "x\n")]);
+    let path = app.root.join("gone.txt");
+    app.dispatch(Action::OpenFinder);
+    typ(&mut app, ":d gone.txt");
+    press(&mut app, KeyCode::Enter);
+    assert!(!path.exists(), "`:d <name>` should delete the file");
+    assert!(app.finder.is_some(), "the browser stays open after delete");
+}
+
+#[test]
+fn finder_colon_d_bare_deletes_highlighted_entry() {
+    let mut app = temp_project(&[("only.rs", "a\n")]);
+    let path = app.root.join("only.rs");
+    app.dispatch(Action::OpenFinder);
+    // `../` is pinned last; the sole file "only.rs" is highlighted at index 0.
+    typ(&mut app, ":d");
+    press(&mut app, KeyCode::Enter);
+    assert!(!path.exists(), "bare `:d` should delete the highlighted entry");
+}
+
+#[test]
+fn gt_and_dashboard_commands() {
+    let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n"), ("c.rs", "c\n")]);
+    app.open_file(0);
+    app.open_file(1);
+    app.open_file(2);
+    app.set_active(1); // sit on a middle file tab (a.rs)
+    typ(&mut app, "gt"); // next tab → b.rs (still a file)
+    assert_eq!(app.active, 2);
+    typ(&mut app, "gT"); // previous tab → a.rs
+    assert_eq!(app.active, 1);
+    // `:dash` returns to the dashboard.
+    run_cmd(&mut app, "dash");
+    assert!(app.is_dashboard());
+    // `<leader>d` from the dashboard shell also works.
+    app.open_file(0);
+    typ(&mut app, " d");
+    assert!(app.is_dashboard());
+}
+
+#[test]
+fn mouse_scroll_is_opt_in() {
+    let mut app = temp_project(&[("f.rs", "1\n2\n3\n4\n5\n6\n7\n8\n")]);
+    app.open_file(0);
+    assert_eq!(app.editor_cursor().0, 0);
+    app.scroll_editor(3); // ignored while mouse support is off
+    assert_eq!(app.editor_cursor().0, 0);
+    app.config.mouse = true;
+    app.scroll_editor(3); // now moves down 3 lines
+    assert_eq!(app.editor_cursor().0, 3);
+    app.scroll_editor(-2);
+    assert_eq!(app.editor_cursor().0, 1);
+}
+
+#[test]
+fn settings_navigation_spans_options_and_lsp() {
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    assert_eq!(app.settings_index, 0); // drawer option
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 1); // mouse option
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 2, "j continues into the LSP list");
+    // Toggling the focused LSP flips its enabled state (no disk write).
+    let before = app.lsp_enabled[0];
+    app.settings_toggle();
+    assert_eq!(app.lsp_enabled[0], !before);
+    // Wraps around from the last row back to the first.
+    let last = app.settings_count() - 1;
+    app.settings_index = last;
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 0);
+}
+
+#[test]
 fn ctrl_tab_cycles_buffers() {
     let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n")]);
     app.open_file(0);
@@ -674,10 +775,10 @@ fn ex_colorscheme_reports_unknown() {
     // theme roster/switching itself is unit-tested in `theme`.
     let mut app = temp_project(&[("a.rs", "a\n")]);
     app.open_file(0);
-    let before = ctrlvim_tui::theme::current().name;
+    let before = ctrlvim::theme::current().name;
     run_cmd(&mut app, "colorscheme definitely-not-a-theme");
     assert!(app.message.contains("E185"), "unknown scheme reports E185: {}", app.message);
-    assert_eq!(ctrlvim_tui::theme::current().name, before, "theme unchanged");
+    assert_eq!(ctrlvim::theme::current().name, before, "theme unchanged");
 }
 
 #[test]

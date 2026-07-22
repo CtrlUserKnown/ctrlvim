@@ -88,6 +88,33 @@ pub struct Finder {
     pub selected: usize,
 }
 
+/// A command typed into the file browser's prompt, entered by prefixing the
+/// query with `:` (e.g. `:c foo.txt`, `:d`, `:dir src`). This mirrors the
+/// telescope/oil habit of driving file operations from the browser itself.
+pub enum FinderCommand {
+    /// `:c` / `:create <name>` — make (and open) a new file here.
+    Create(Option<String>),
+    /// `:d` / `:delete [name]` — delete `name`, or the highlighted entry when
+    /// no name is given.
+    Delete(Option<String>),
+    /// `:dir` / `:create-directory <name>` — make a new directory here.
+    Mkdir(Option<String>),
+}
+
+impl FinderCommand {
+    /// One-line description of what pressing Enter will do, for the prompt hint.
+    pub fn describe(&self) -> String {
+        match self {
+            FinderCommand::Create(None) => "type a file name".into(),
+            FinderCommand::Create(Some(n)) => format!("create file “{}”", n.trim()),
+            FinderCommand::Mkdir(None) => "type a directory name".into(),
+            FinderCommand::Mkdir(Some(n)) => format!("create directory “{}/”", n.trim()),
+            FinderCommand::Delete(Some(n)) => format!("delete “{}”", n.trim()),
+            FinderCommand::Delete(None) => "delete highlighted entry".into(),
+        }
+    }
+}
+
 /// Whether a file name looks like markdown.
 fn is_markdown_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -105,8 +132,10 @@ pub enum Action {
     TogglePanel(PanelId),
     OpenFile(usize),
     OpenPlugins,
+    OpenDashboard,
     ToggleLsp(usize),
-    SetLspIndex(usize),
+    ToggleMouse,
+    SetSettingsIndex(usize),
     OpenPalette,
     ClosePalette,
     RunPalette(usize),
@@ -172,7 +201,8 @@ pub struct App {
     pub expand_git: bool,
 
     pub lsp_enabled: Vec<bool>,
-    pub lsp_index: usize,
+    /// Selection index across the Settings tab (editor options + LSP list).
+    pub settings_index: usize,
 
     pub help_open: bool,
 
@@ -220,7 +250,7 @@ impl App {
             message: String::new(),
             expand_git: false,
             lsp_enabled,
-            lsp_index: 0,
+            settings_index: 0,
             help_open: false,
             config,
             should_quit: false,
@@ -297,10 +327,12 @@ impl App {
             Action::TogglePanel(p) => self.toggle_panel(p),
             Action::OpenFile(i) => self.open_file(i),
             Action::OpenPlugins => self.open_plugins(),
+            Action::OpenDashboard => self.open_dashboard(),
             Action::ToggleLsp(i) => self.toggle_lsp(i),
-            Action::SetLspIndex(i) => {
-                if i < self.project.lsp.len() {
-                    self.lsp_index = i;
+            Action::ToggleMouse => self.toggle_mouse(),
+            Action::SetSettingsIndex(i) => {
+                if i < self.settings_count() {
+                    self.settings_index = i;
                 }
             }
             Action::OpenPalette => {
@@ -478,20 +510,45 @@ impl App {
         self.file_index = (((i + dir) % n + n) % n) as usize;
     }
 
-    pub fn move_lsp_selection(&mut self, dir: i32) {
-        let n = self.project.lsp.len() as i32;
+    /// Number of Settings rows: the editor options plus each LSP server.
+    pub const SETTINGS_EDITOR_OPTIONS: usize = 2; // drawer, mouse
+
+    pub fn settings_count(&self) -> usize {
+        Self::SETTINGS_EDITOR_OPTIONS + self.project.lsp.len()
+    }
+
+    /// Move the Settings selection, wrapping across the EDITOR options and the
+    /// LSP list as one continuous list.
+    pub fn move_settings(&mut self, dir: i32) {
+        let n = self.settings_count() as i32;
         if n == 0 {
             return;
         }
-        let i = self.lsp_index as i32;
-        self.lsp_index = (((i + dir) % n + n) % n) as usize;
+        let i = self.settings_index as i32;
+        self.settings_index = (((i + dir) % n + n) % n) as usize;
+    }
+
+    /// Toggle whatever Settings row is selected.
+    pub fn settings_toggle(&mut self) {
+        match self.settings_index {
+            0 => self.toggle_startup_drawer(),
+            1 => self.toggle_mouse(),
+            i => self.toggle_lsp(i - Self::SETTINGS_EDITOR_OPTIONS),
+        }
     }
 
     pub fn toggle_lsp(&mut self, i: usize) {
         if let Some(slot) = self.lsp_enabled.get_mut(i) {
             *slot = !*slot;
-            self.lsp_index = i;
+            self.settings_index = i + Self::SETTINGS_EDITOR_OPTIONS;
         }
+    }
+
+    /// Toggle mouse support, persisting it to the config.
+    pub fn toggle_mouse(&mut self) {
+        self.config.mouse = !self.config.mouse;
+        self.config.save();
+        self.message = format!("mouse: {}", if self.config.mouse { "on" } else { "off" });
     }
 
     /// Open (or focus) one of the dashboard's recent files by list index.
@@ -518,6 +575,13 @@ impl App {
         let render_md = is_markdown_name(&name); // live-render markdown by default
         self.buffers.push(Buffer { label: name, kind: BufferKind::File, path: Some(path), text, render_md, modified: false });
         self.set_active(self.buffers.len() - 1);
+    }
+
+    /// Switch to the dashboard (`:dash` / `<leader>d`).
+    pub fn open_dashboard(&mut self) {
+        if let Some(i) = self.buffers.iter().position(|b| b.kind == BufferKind::Dashboard) {
+            self.set_active(i);
+        }
     }
 
     pub fn open_plugins(&mut self) {
@@ -586,6 +650,18 @@ impl App {
         self.is_file() && self.engine.is_modified()
     }
 
+    /// Scroll the editor by `lines` (negative = up), when mouse support is on
+    /// and a file buffer is focused. Moves the cursor, which drags the viewport.
+    pub fn scroll_editor(&mut self, lines: i32) {
+        if !self.config.mouse || !self.editor_focus() {
+            return;
+        }
+        let key = if lines >= 0 { Key::Char('j') } else { Key::Char('k') };
+        for _ in 0..lines.unsigned_abs() {
+            self.feed_engine(key);
+        }
+    }
+
     /// Feed one key to the engine's editing session, then perform any host
     /// effects the engine requested (`:w`/`:q`/…).
     pub fn feed_engine(&mut self, key: Key) {
@@ -631,6 +707,7 @@ impl App {
                 },
                 ExEffect::Source(path) => self.host_source(&path),
                 ExEffect::OpenBrowser => self.open_finder(),
+                ExEffect::OpenDashboard => self.open_dashboard(),
                 ExEffect::Edit(name) => self.new_file(&name),
                 ExEffect::Message(m) => self.message = m,
             }
@@ -1029,12 +1106,31 @@ impl App {
     /// case-insensitive subsequence of the entry name.
     pub fn finder_matches(&self) -> Vec<usize> {
         let Some(f) = &self.finder else { return Vec::new() };
+        // In command mode (`:cmd …`), keep the whole listing visible and
+        // navigable so a bare `:d` can act on the highlighted row — the `:…`
+        // text is a command, not a fuzzy filter.
+        let filter = if f.query.starts_with(':') { "" } else { f.query.as_str() };
         f.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| fuzzy_match(&f.query, &e.name))
+            .filter(|(_, e)| fuzzy_match(filter, &e.name))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Parse the prompt as a `:`-prefixed browser command, if it is one.
+    pub fn finder_command(&self) -> Option<FinderCommand> {
+        let f = self.finder.as_ref()?;
+        let rest = f.query.strip_prefix(':')?;
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("").trim();
+        let arg = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        match cmd {
+            "c" | "create" => Some(FinderCommand::Create(arg)),
+            "d" | "delete" => Some(FinderCommand::Delete(arg)),
+            "dir" | "mkdir" | "create-directory" => Some(FinderCommand::Mkdir(arg)),
+            _ => None,
+        }
     }
 
     pub fn finder_move(&mut self, dir: i32) {
@@ -1063,7 +1159,13 @@ impl App {
     /// Activate the selected entry: drill into a directory, or open a file.
     /// When the typed name matches nothing, it's treated as a new file to
     /// create in the current directory (telescope `file_browser` style).
+    /// A `:`-prefixed prompt runs a browser command instead (see
+    /// [`finder_run_command`](Self::finder_run_command)).
     pub fn finder_select(&mut self) {
+        if self.finder.as_ref().is_some_and(|f| f.query.starts_with(':')) {
+            self.finder_run_command();
+            return;
+        }
         let matches = self.finder_matches();
         let Some(f) = &self.finder else { return };
         if matches.is_empty() {
@@ -1086,6 +1188,85 @@ impl App {
             let name = entry.name.clone();
             self.finder = None;
             self.open_path(path, name);
+        }
+    }
+
+    /// Run the `:`-prefixed browser command in the prompt: create a file,
+    /// create a directory, or delete an entry. Directory operations refresh
+    /// the listing in place; creating a file opens it.
+    fn finder_run_command(&mut self) {
+        let Some(cmd) = self.finder_command() else {
+            self.message = "E492: not a browser command (try :c, :d, :dir)".into();
+            return;
+        };
+        let dir = match &self.finder {
+            Some(f) => f.dir.clone(),
+            None => return,
+        };
+        // Re-list the current directory and reset the prompt, staying open.
+        let refresh = |app: &mut Self, dir: PathBuf| {
+            app.finder = Some(Finder { entries: list_dir(&dir), dir, query: String::new(), selected: 0 });
+        };
+        match cmd {
+            FinderCommand::Create(name) => {
+                let Some(name) = name else {
+                    self.message = "usage: :create <name>".into();
+                    return;
+                };
+                let path = dir.join(name.trim());
+                self.finder = None;
+                self.create_and_open(path);
+            }
+            FinderCommand::Mkdir(name) => {
+                let Some(name) = name else {
+                    self.message = "usage: :dir <name>".into();
+                    return;
+                };
+                let name = name.trim();
+                match std::fs::create_dir_all(dir.join(name)) {
+                    Ok(()) => {
+                        self.message = format!("created directory {name}/");
+                        refresh(self, dir);
+                    }
+                    Err(e) => self.message = format!("E739: cannot create directory: {e}"),
+                }
+            }
+            FinderCommand::Delete(name) => {
+                // Target: the explicit name, else the highlighted entry.
+                let target = match name {
+                    Some(n) => dir.join(n.trim()),
+                    None => {
+                        let matches = self.finder_matches();
+                        let Some(f) = &self.finder else { return };
+                        let Some(&ei) = matches.get(f.selected) else {
+                            self.message = "nothing highlighted to delete".into();
+                            return;
+                        };
+                        let entry = &f.entries[ei];
+                        if entry.name == "../" {
+                            self.message = "refusing to delete ../".into();
+                            return;
+                        }
+                        entry.path.clone()
+                    }
+                };
+                let label = target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| target.display().to_string());
+                let result = if target.is_dir() {
+                    std::fs::remove_dir_all(&target)
+                } else {
+                    std::fs::remove_file(&target)
+                };
+                match result {
+                    Ok(()) => {
+                        self.message = format!("deleted {label}");
+                        refresh(self, dir);
+                    }
+                    Err(e) => self.message = format!("E: cannot delete {label}: {e}"),
+                }
+            }
         }
     }
 

@@ -2,8 +2,8 @@
 //! eyeball layout without a live terminal. Usage:
 //!   cargo run -p ctrlvim-tui --example snapshot -- [dashboard|settings|about|plugins|drawer|finder|palette|help|file]
 
-use ctrlvim_tui::app::{Action, App, DashboardSection};
-use ctrlvim_tui::ui;
+use ctrlvim::app::{Action, App, DashboardSection};
+use ctrlvim::ui;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 

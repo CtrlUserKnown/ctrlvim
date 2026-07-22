@@ -274,23 +274,27 @@ fn git_rows(f: &mut Frame, app: &App, area: Rect) {
 // --- settings (LSP) --------------------------------------------------------
 
 /// A single labelled on/off setting row with a right-aligned toggle. Clicking
-/// the row dispatches `action` (which flips + persists the setting).
-fn option_row(f: &mut Frame, area: Rect, label: &str, on: bool, zones: &mut Zones, action: Action) {
-    let row = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
-    f.render_widget(Block::default().style(Style::default().bg(theme::bg_dark())), row);
+/// the row dispatches `action`; `selected` highlights the keyboard focus.
+fn option_row(
+    f: &mut Frame,
+    row: Rect,
+    label: &str,
+    on: bool,
+    selected: bool,
+    zones: &mut Zones,
+    action: Action,
+) {
+    f.render_widget(Block::default().style(row_style(selected)), row);
     let toggle = if on { "●on " } else { "○off" };
     let toggle_color = if on { theme::green() } else { theme::fg_dim() };
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(label.to_string(), Style::default().fg(theme::fg())),
-    ];
+    let mut spans = vec![selection_bar(selected, theme::cyan()), Span::styled(label.to_string(), Style::default().fg(theme::fg()))];
     let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
     let tw = toggle.chars().count() as u16;
-    if area.width > used + tw {
-        spans.push(Span::styled(" ".repeat((area.width - used - tw) as usize), Style::default().bg(theme::bg_dark())));
+    if row.width > used + tw {
+        spans.push(Span::styled(" ".repeat((row.width - used - tw) as usize), row_style(selected)));
     }
     spans.push(Span::styled(toggle, Style::default().fg(toggle_color)));
-    f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg_dark())), row);
+    f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
     zones.push(row, action);
 }
 
@@ -299,12 +303,18 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         return;
     }
     // EDITOR options panel: live-toggleable settings backed by config.toml.
-    let opt_h = 4u16.min(area.height);
+    let opt_h = 5u16.min(area.height);
     let opt_rect = Rect { height: opt_h, ..area };
     let cfg_hint = Line::from(Span::styled("┤ ~/.config/ctrlvim/config.toml ├", Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
     let opt_inner = super::titled_panel_with_right(f, opt_rect, "EDITOR", theme::cyan(), Some(cfg_hint));
-    if opt_inner.height > 0 {
-        option_row(f, opt_inner, "Open file drawer on startup", app.config.drawer, zones, Action::ToggleStartupDrawer);
+    let sel = app.settings_index;
+    if opt_inner.height >= 1 {
+        let r = Rect { x: opt_inner.x, y: opt_inner.y, width: opt_inner.width, height: 1 };
+        option_row(f, r, "Open file drawer on startup", app.config.drawer, sel == 0, zones, Action::ToggleStartupDrawer);
+    }
+    if opt_inner.height >= 2 {
+        let r = Rect { x: opt_inner.x, y: opt_inner.y + 1, width: opt_inner.width, height: 1 };
+        option_row(f, r, "Mouse support (scroll the editor)", app.config.mouse, sel == 1, zones, Action::ToggleMouse);
     }
 
     // Header row for the LSP table.
@@ -345,7 +355,8 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             break;
         }
         let on = app.lsp_enabled[i];
-        let selected = i == app.lsp_index;
+        // The Settings selection spans the EDITOR options first, then the LSPs.
+        let selected = app.settings_index == i + App::SETTINGS_EDITOR_OPTIONS;
         let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
         f.render_widget(Block::default().style(row_style(selected)), row);
 
@@ -367,7 +378,7 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             Span::styled(toggle, Style::default().fg(toggle_color)),
         ];
         f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
-        zones.push(row, Action::SetLspIndex(i));
+        zones.push(row, Action::SetSettingsIndex(i + App::SETTINGS_EDITOR_OPTIONS));
         // The toggle glyph itself flips the server.
         let toggle_w = 4u16;
         let tx = row.x + row.width.saturating_sub(toggle_w);

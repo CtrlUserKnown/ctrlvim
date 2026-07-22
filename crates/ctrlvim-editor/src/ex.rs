@@ -21,6 +21,8 @@ pub enum ExEffect {
     CloseApp,
     /// Open the file browser (`:Files`, `:Explore`, `:E`, bare `:e`/`:new`).
     OpenBrowser,
+    /// Switch to the dashboard/start screen (`:dash`, `:Dashboard`).
+    OpenDashboard,
     /// Edit/create a file by name (`:e <name>`, `:new <name>`). The host opens
     /// the buffer, creating the file on disk if it doesn't exist yet.
     Edit(String),
@@ -118,7 +120,8 @@ pub fn is_ex_command(cmd: &str) -> bool {
         // file / quit / buffers / tabs / options / history / theme (also catalog)
         "w", "write", "wq", "x", "xit", "exit", "q", "quit", "qa", "qall", "wa", "wall",
         "wqa", "xa", "xall", "cq", "cquit", "close", "clo", "e", "edit", "new", "enew",
-        "sav", "save", "saveas", "up", "update", "Files", "Explore", "Ex", "E", "ls",
+        "sav", "save", "saveas", "up", "update", "Files", "Explore", "Ex", "E",
+        "dash", "dashboard", "Dash", "Dashboard", "ls",
         "buffers", "b", "bu", "buf", "buffer", "bn", "bnext", "bp", "bprevious", "bN",
         "bNext", "bf", "bfirst", "br", "brewind", "bl", "blast", "bd", "bdel", "bdelete",
         "on", "only", "tabn", "tabnext", "tabp", "tabprevious", "tabc", "tabclose",
@@ -151,6 +154,7 @@ pub fn commands() -> &'static [ExCommand] {
         ExCommand { name: "wqa", desc: "write all and quit" },
         ExCommand { name: "close", desc: "close ctrlvim" },
         ExCommand { name: "new", desc: "create a new file (:new name)" },
+        ExCommand { name: "dashboard", desc: "go to the dashboard" },
         ExCommand { name: "ls", desc: "list open buffers" },
         ExCommand { name: "bnext", desc: "go to the next buffer" },
         ExCommand { name: "bprevious", desc: "go to the previous buffer" },
@@ -340,6 +344,7 @@ pub(crate) fn parse_ex(cmd: &str) -> ExParsed {
             }
         }
         "Files" | "Explore" | "Ex" | "E" => ExEffect::OpenBrowser,
+        "dash" | "dashboard" | "Dash" | "Dashboard" => ExEffect::OpenDashboard,
         // Scripting: run in the core (which owns the interpreters).
         "lua" if !arg.is_empty() => ExEffect::Lua(arg.to_string()),
         "luafile" | "source" | "so" => ExEffect::Source(arg.to_string()),

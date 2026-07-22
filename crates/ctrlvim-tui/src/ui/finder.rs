@@ -4,6 +4,11 @@
 //!
 //! The results list is bottom-anchored (like `fzf`), so the highlighted row and
 //! the search prompt sit together near the bottom of the screen.
+//!
+//! Prefixing the prompt with `:` switches from fuzzy-filter to command mode:
+//! `:c`/`:create <name>` makes a file, `:dir`/`:create-directory <name>` makes
+//! a directory, and `:d`/`:delete [name]` removes the named entry (or the
+//! highlighted one when no name is given).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -127,9 +132,18 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             Span::styled("▏", Style::default().fg(theme::fg())),
         ]);
         f.render_widget(Paragraph::new(prompt), pinner);
-        // Right side: match count, or — when nothing matches a typed name — a
-        // hint that pressing Enter creates that file here.
-        let (right, color) = if matches.is_empty() && !finder.query.trim().is_empty() {
+        // Right side: for a `:`-command, what Enter will do; when a typed name
+        // matches nothing, a hint that Enter creates that file; otherwise the
+        // match count.
+        let (right, color) = if let Some(rest) = finder.query.strip_prefix(':') {
+            if rest.trim().is_empty() {
+                (" :c file · :dir name · :d [sel] ".to_string(), theme::fg_dim())
+            } else if let Some(cmd) = app.finder_command() {
+                (format!("⏎ {} ", cmd.describe()), theme::green())
+            } else {
+                (" unknown command ".to_string(), theme::red())
+            }
+        } else if matches.is_empty() && !finder.query.trim().is_empty() {
             (format!("⏎ create “{}” ", finder.query.trim()), theme::green())
         } else {
             (format!("{} / {} ", matches.len(), total), theme::fg_dim())

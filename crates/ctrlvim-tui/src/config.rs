@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     /// Open the file drawer (the `Ctrl+B` sidebar) automatically on startup.
     pub drawer: bool,
+    /// Enable mouse support in the editor (scrolling to move through the buffer).
+    pub mouse: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { drawer: false }
+        Config { drawer: false, mouse: false }
     }
 }
 
@@ -66,8 +68,12 @@ impl Config {
     /// Render the config as a TOML document.
     fn to_toml(&self) -> String {
         format!(
-            "# ctrlvim config\n\n# Open the file drawer on startup.\ndrawer = {}\n",
-            self.drawer
+            "# ctrlvim config\n\n\
+             # Open the file drawer on startup.\n\
+             drawer = {}\n\n\
+             # Enable mouse support (scroll the editor).\n\
+             mouse = {}\n",
+            self.drawer, self.mouse
         )
     }
 
@@ -91,6 +97,11 @@ impl Config {
                 "drawer" | "sidebar" => {
                     if let Some(b) = parse_bool(value) {
                         cfg.drawer = b;
+                    }
+                }
+                "mouse" => {
+                    if let Some(b) = parse_bool(value) {
+                        cfg.mouse = b;
                     }
                 }
                 _ => {}
@@ -127,6 +138,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_mouse_option() {
+        assert!(Config::parse("mouse = true").mouse);
+        assert!(!Config::parse("mouse = false").mouse);
+        assert!(!Config::default().mouse);
+    }
+
+    #[test]
     fn unknown_keys_and_junk_are_ignored() {
         let text = "wat = 3\nnonsense line\ndrawer = true\n";
         assert!(Config::parse(text).drawer);
@@ -139,7 +157,7 @@ mod tests {
         // Hermetic: writes to a unique temp file, never the real config dir.
         let path = std::env::temp_dir()
             .join(format!("ctrlvim-cfg-{}-{:p}.toml", std::process::id(), &()));
-        let cfg = Config { drawer: true };
+        let cfg = Config { drawer: true, mouse: true };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
         // A missing file loads defaults.

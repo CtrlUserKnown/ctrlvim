@@ -116,6 +116,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlvim"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ctrlvim-core",
+ "ctrlvim-markdown",
+ "ratatui",
+]
+
+[[package]]
 name = "ctrlvim-api"
 version = "0.1.0"
 dependencies = [
@@ -211,16 +221,6 @@ dependencies = [
  "ctrlvim-types",
  "tree-sitter",
  "tree-sitter-json",
-]
-
-[[package]]
-name = "ctrlvim-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ctrlvim-core",
- "ctrlvim-markdown",
- "ratatui",
 ]
 
 [[package]]

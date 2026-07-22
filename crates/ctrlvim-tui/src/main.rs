@@ -19,9 +19,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use ctrlvim_tui::app::App;
-use ctrlvim_tui::input;
-use ctrlvim_tui::ui::{self, Zones};
+use ctrlvim::app::App;
+use ctrlvim::input;
+use ctrlvim::ui::{self, Zones};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -58,6 +58,9 @@ fn run(terminal: &mut Term, start: Instant) -> io::Result<()> {
                     app.dispatch(action.clone());
                 }
             }
+            // Mouse-wheel scrolling in the editor (opt-in via `mouse` config).
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => app.scroll_editor(3),
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => app.scroll_editor(-3),
             _ => {}
         }
     }

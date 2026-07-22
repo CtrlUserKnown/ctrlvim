@@ -9,7 +9,7 @@ UI: exact Tokyo Night palette, copy, and keybindings, driven by **both keyboard
 and mouse**.
 
 ```sh
-cargo run -p ctrlvim-tui            # launch the TUI (binary: `ctrlvim`)
+cargo run -p ctrlvim-tui            # launch the TUI (binary: `cvi`)
 cargo test -p ctrlvim-tui           # render smoke tests (all screens + fuzz sizes)
 cargo run -p ctrlvim-tui --example snapshot -- grid   # print a text snapshot of a screen
 ```

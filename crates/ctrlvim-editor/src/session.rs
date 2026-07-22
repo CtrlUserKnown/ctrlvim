@@ -429,6 +429,20 @@ impl Session {
                 let m = motion::goto_line_first(&self.editor.cur_buffer().text, self.pending.count);
                 self.apply_motion_or_operator(m);
             }
+            // `gt`/`gT` switch tabs (`{count}gt` jumps to tab N). Emitted as a
+            // host effect since the tab list lives in the frontend.
+            Key::Char('t') => {
+                let effect = match self.pending.count {
+                    Some(n) => ExEffect::Buffer(crate::ex::BufferCmd::Goto(n)),
+                    None => ExEffect::Buffer(crate::ex::BufferCmd::Next),
+                };
+                self.queue_effect(effect);
+                self.pending.clear();
+            }
+            Key::Char('T') => {
+                self.queue_effect(ExEffect::Buffer(crate::ex::BufferCmd::Prev));
+                self.pending.clear();
+            }
             // Case operators await a motion (`guw`) or double (`guu`).
             Key::Char('u') => self.pending.operator = Some(Operator::Lower),
             Key::Char('U') => self.pending.operator = Some(Operator::Upper),
@@ -1825,6 +1839,7 @@ fn default_keymap() -> Keymap {
     km.set_normal("<Space>ff", ":Files<CR>");
     km.set_normal("<Space>w", ":w<CR>");
     km.set_normal("<Space>q", ":wq<CR>");
+    km.set_normal("<Space>d", ":dash<CR>");
     // `<leader>1`..`<leader>9` jump to that tab/buffer (`:b N`).
     for n in 1..=9 {
         km.set_normal(&format!("<Space>{n}"), &format!(":b {n}<CR>"));
@@ -2113,6 +2128,26 @@ mod tests {
         assert_eq!(s.cmdline().as_deref(), Some(":'<,'>"));
         s.feed_str("d<CR>");
         assert_eq!(s.lines(), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn gt_switches_tabs() {
+        use crate::ex::{BufferCmd, ExEffect};
+        let mut s = Session::with_text("x");
+        s.feed_str("gt");
+        assert!(s.take_effects().contains(&ExEffect::Buffer(BufferCmd::Next)));
+        s.feed_str("gT");
+        assert!(s.take_effects().contains(&ExEffect::Buffer(BufferCmd::Prev)));
+        s.feed_str("2gt"); // count → absolute tab
+        assert!(s.take_effects().contains(&ExEffect::Buffer(BufferCmd::Goto(2))));
+    }
+
+    #[test]
+    fn leader_d_opens_dashboard() {
+        use crate::ex::ExEffect;
+        let mut s = Session::with_text("x");
+        s.feed_str(" d"); // <leader>d
+        assert!(s.take_effects().contains(&ExEffect::OpenDashboard));
     }
 
     #[test]
