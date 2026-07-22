@@ -1,20 +1,24 @@
-# ctrlvim-rs
+# ctrlvim
 
-A staged Rust reimplementation of Neovim's editing core, with a [Ratatui]
-frontend (`ctrlvim-tui`) rendering on top of the engine, and existing Neovim Lua
-plugins as the long-term compatibility target. See the roadmap in
-`~/.claude/plans/vivid-humming-elephant.md` for the full plan.
+A Rust reimplementation of Neovim's editing core with a Ratatui frontend.
 
-This tree covers **milestones M0–M9** plus the TUI frontend. Everything here
-compiles on stable Rust and is covered by tests (`cargo test --workspace` — 150
-tests, zero warnings).
+## Features
+
+- **Buffer Engine** — Rope-backed buffers with unified mark tree, undo tree (with `g-`/`g+` branch traversal), and register ring
+- **Modal Editing** — Normal/Insert/Visual/Cmdline modes with motions, operators, and text objects
+- **Lua Runtime** — `mlua`-based Lua embedding with `vim.api.*`, `vim.fn.*`, `vim.keymap`, and `vim.treesitter`
+- **Async I/O** — Tokio-backed event loop with timers and msgpack-RPC codec
+- **Vimscript** — Tree-walking interpreter supporting `let`/`if`/`for`/`while`/`function`
+- **Treesitter** — Parse, query, and node-range extraction via `tree-sitter` crate
+- **Window Management** — Split frame tree with `<C-w>` commands
+- **TUI Frontend** — Ratatui + crossterm dashboard, plugin manager, file browser, and floating overlays
 
 ## Quick start
 
 ```sh
-cargo test --workspace                       # run all tests
-cargo run -p ctrlvim-core --bin ctrlvim-demo    # end-to-end M1–M5 demo (no UI)
-cargo run -p ctrlvim-tui                      # launch the Ratatui dashboard/editor UI
+cargo test --workspace                            # run all tests
+cargo run -p ctrlvim-core --bin ctrlvim-demo       # end-to-end demo (no UI)
+cargo run -p ctrlvim-tui                           # launch the TUI
 ```
 
 ## Workspace layout
@@ -36,46 +40,42 @@ cargo run -p ctrlvim-tui                      # launch the Ratatui dashboard/edi
 
 Dependency direction flows strictly downward; `ctrlvim-async` is a parallel infra branch.
 
-## Milestone status
-
-- **M0 — spikes** ✅ verified `mlua` (vendored Lua 5.4) + `tokio` build here; proc-macro,
-  rope buffer, and `RegistryKey` callback round-trip all proven.
-- **M1 — buffer + motions** ✅ rope `Buffer`, `Editor` with arena handles, `hjkl`/`w`/`b`/`e`/
-  `0`/`^`/`$`/`gg`/`G` motions with counts, char-class word logic.
-- **M2 — marks/undo/registers** ✅ unified marktree with gravity, undo *tree* with `g-`/`g+`
-  branch traversal, register ring (`0`, `1`–`9`, named, `-`, blackhole), operator framework
-  (`d`/`y`/`c`) shared by Normal-motion and Visual selection.
-- **M3 — modal editing** ✅ Normal/Insert/Visual(char+line)/Cmdline modes, `i`/`a`/`I`/`A`/`o`/`O`,
-  `x`, `p`/`P`, `u`/`<C-r>`, minimal `:` commands. *Deferred:* `getchar`/`:map` typeahead,
-  search motions/regex, blockwise visual, options `build.rs` codegen (hand-written for now).
-- **M4 — Lua core** ✅ real `mlua` runtime; `vim.api.*` calls dispatch through the same
-  registry as RPC; `Object`↔Lua conversion (array/dict/function→`LuaRef`); Lua autocmd
-  callbacks fire via the shared `LuaRef` mechanism. *Deferred:* vendoring `runtime/lua/vim/**`,
-  full `vim.fn.*`.
-- **M5 — async I/O** ✅ tokio-backed `EventLoop`+`TimerService`; `vim.uv.new_timer():start()`
-  fires real Lua callbacks; `vim.loop` alias; msgpack-RPC codec + dispatch. *Deferred:*
-  `vim.uv.spawn` (process I/O), socket/stdio channel transports.
-- **M6 — Vimscript + vim.fn** ✅ tree-walking interpreter (scopes `g:`/`l:`/`a:`/`v:`,
-  arithmetic/string/comparison/logical exprs, lists/dicts, `if`/`for`/`while`, user
-  `function`s with recursion), ~40 `vim.fn` builtins, wired as `vim.fn.*`/`vim.call`
-  over the shared editor. *Deferred:* `:execute`, exceptions, autoload, closures, regex.
-- **M7 — treesitter** ✅ `tree-sitter`-crate-backed parse + query + node-range extraction;
-  `vim.treesitter.query`/`root_kind` from Lua; JSON grammar wired for the demo. *Deferred:*
-  full `TSNode`/`TSTree` userdata surface, injections, incremental reparse.
-- **M8 — plugin integration** ✅ `Session` + Lua share one editor; `vim.keymap.set`;
-  a plugin-style Lua script drives api + fn + autocmd + keymap + treesitter end-to-end,
-  with interactive keys hitting the same buffer. *Deferred:* vendoring real
-  `ctrlvim-treesitter`/`lspconfig` (needs `runtime/lua/vim/**` + a live LSP server).
-- **M9 — windows/splits** ✅ split `Frame` tree, `<C-w>s`/`v`/`w`/`q` commands, window
-  cycle/close, `ctrlvim_list_wins`/`ctrlvim_get_current_win`/`ctrlvim_split_window`, and a
-  `layout_rects(w,h)` model query a Ratatui frontend renders from.
-
 ## Design notes
 
-- **No global `curbuf`/`curwin`.** Everything threads through an explicit `Editor`, with
-  `Copy` integer handles instead of raw pointers — a stale handle is a clean `None`.
-- **One callback mechanism.** Autocmds, and (next) keymaps/timers all store an
-  `Object::LuaRef` resolved through `LuaRefStore` (mlua `RegistryKey`) — the Rust twin of
-  `nlua_call_ref`.
-- **Codegen is a proc-macro, not a C-text parser.** `#[ctrlvim_api]` on an ordinary Rust fn
-  emits both dispatch paths; `inventory` auto-collects them at link time.
+- **No global `curbuf`/`curwin`.** Everything threads through an explicit `Editor`, with `Copy` integer handles instead of raw pointers — a stale handle is a clean `None`.
+- **One callback mechanism.** Autocmds, keymaps, and timers all store an `Object::LuaRef` resolved through `LuaRefStore` (mlua `RegistryKey`) — the Rust twin of `nlua_call_ref`.
+- **Codegen is a proc-macro, not a C-text parser.** `#[ctrlvim_api]` on an ordinary Rust fn emits both dispatch paths; `inventory` auto-collects them at link time.
+
+## Changelog
+
+### [0.1.0] - 2026-07-22
+
+#### Added
+- Motion operators (`d`, `y`, `c`), visual mode (char + line), and text objects
+- TUI improvements including floating overlays and mouse support
+
+### [0.1.0] - 2026-07-20
+
+#### Added
+- `ctrlvim-tui` crate with Ratatui + crossterm frontend
+- `ctrlvim-markdown` crate for markdown support
+- Startup dashboard, plugin manager, and file browser UI
+
+#### Fixed
+- `.gitignore` patterns for IDE files and OS artifacts
+
+### [0.1.0] - 2026-07-10
+
+#### Added
+- Initial project structure with all core crates
+- Rope-backed buffer engine with mark tree, undo tree, and registers
+- Modal editing (Normal/Insert/Visual/Cmdline) with motions and operators
+- Lua runtime with `vim.api.*`, `vim.fn.*`, `vim.keymap`, and `vim.treesitter`
+- Tokio async event loop with timers and msgpack-RPC
+- Vimscript interpreter with `let`/`if`/`for`/`while`/`function`
+- Treesitter integration for parse, query, and node ranges
+- Window management with split frames and `<C-w>` commands
+- Proc-macro for API dispatch generation
+
+#### Changed
+- Renamed all `nvim` references to `ctrlvim` across the project
