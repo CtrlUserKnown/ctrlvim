@@ -9,6 +9,7 @@
 
 mod dashboard;
 mod filebuffer;
+mod finder;
 mod overlays;
 mod plugins;
 mod shell;
@@ -19,7 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 use ratatui::Frame;
 
-use crate::app::{Action, App, BufferKind, DashboardSection};
+use crate::app::{Action, App, BufferKind};
 use crate::theme;
 
 /// A rectangular hit target and the action a click on it performs.
@@ -57,7 +58,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     let area = f.area();
 
     // Fill the background.
-    f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+    f.render_widget(Block::default().style(Style::default().bg(theme::bg())), area);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -76,11 +77,17 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     if app.sidebar_visible {
         overlays::explorer(f, app, area, &mut zones);
     }
+    if app.finder.is_some() {
+        finder::screen(f, app, area, &mut zones);
+    }
     if app.help_open {
         overlays::help(f, app, area, &mut zones);
     }
     if app.palette_open {
         overlays::palette(f, app, area, &mut zones);
+    }
+    if app.save_prompt.is_some() {
+        overlays::save_prompt(f, app, area, &mut zones);
     }
 
     zones
@@ -100,32 +107,18 @@ fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     }
 
     // The dashboard header (logo + section tabs) shows only on the Dashboard
-    // buffer; the keybindings sidebar shows whenever the section is Workspace,
-    // independent of which buffer is active (faithful to the final design).
-    let mut region = inner;
+    // buffer.
+    let mut content = inner;
     if matches!(app.active_buffer().kind, BufferKind::Dashboard) {
         let header_h = 4;
-        let header = Rect { height: header_h.min(region.height), ..region };
+        let header = Rect { height: header_h.min(content.height), ..content };
         dashboard::header(f, app, header, zones);
-        region = Rect {
-            y: region.y + header.height,
-            height: region.height.saturating_sub(header.height),
-            ..region
+        content = Rect {
+            y: content.y + header.height,
+            height: content.height.saturating_sub(header.height),
+            ..content
         };
     }
-
-    // Split off the keybindings sidebar when in the Workspace section.
-    let content = if app.section == DashboardSection::Workspace {
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(24), Constraint::Min(0)])
-            .spacing(1)
-            .split(region);
-        dashboard::keybindings_sidebar(f, cols[0]);
-        cols[1]
-    } else {
-        region
-    };
 
     if content.width == 0 || content.height == 0 {
         return;
@@ -133,7 +126,7 @@ fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     match &app.active_buffer().kind {
         BufferKind::Dashboard => dashboard::screen(f, app, content, zones),
         BufferKind::Plugins => plugins::screen(f, app, content),
-        BufferKind::File(idx) => filebuffer::screen(f, app, *idx, content),
+        BufferKind::File => filebuffer::screen(f, app, content),
     }
 }
 
@@ -157,11 +150,11 @@ pub fn titled_panel_with_right(
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::BORDER))
-        .style(Style::default().bg(theme::BG_DARK))
+        .border_style(Style::default().fg(theme::border()))
+        .style(Style::default().bg(theme::bg_dark()))
         .title(Line::from(vec![Span::styled(
             format!("┤ {name} ├"),
-            Style::default().fg(accent).bg(theme::BG_DARK),
+            Style::default().fg(accent).bg(theme::bg_dark()),
         )]));
     if let Some(r) = right {
         block = block.title(r.right_aligned());
@@ -175,7 +168,7 @@ pub fn titled_panel_with_right(
 pub fn icon_chip(letter: char, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {letter} "),
-        Style::default().fg(theme::BG_DARK).bg(color),
+        Style::default().fg(theme::bg_dark()).bg(color),
     )
 }
 
@@ -192,15 +185,15 @@ pub fn selection_bar(selected: bool, accent: Color) -> Span<'static> {
 /// Background style for a row, highlighted when selected.
 pub fn row_style(selected: bool) -> Style {
     if selected {
-        Style::default().bg(theme::BG_HIGHLIGHT)
+        Style::default().bg(theme::bg_highlight())
     } else {
-        Style::default().bg(theme::BG_DARK)
+        Style::default().bg(theme::bg_dark())
     }
 }
 
 /// A small `[x]`/chip keybinding hint badge (bracket variant — the default).
 pub fn hint_badge(key: char) -> Span<'static> {
-    Span::styled(format!("[{key}]"), Style::default().fg(theme::FG_DIM))
+    Span::styled(format!("[{key}]"), Style::default().fg(theme::fg_dim()))
 }
 
 /// Center a `w`×`h` rect within `area`.

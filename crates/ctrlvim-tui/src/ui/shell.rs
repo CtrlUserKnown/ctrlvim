@@ -11,10 +11,10 @@ use crate::theme;
 
 use super::Zones;
 
-/// One tab per open buffer + a right-aligned `CHARVIM · TUI` wordmark.
+/// One tab per open buffer, filling the bar width.
 pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     f.render_widget(
-        Block::default().style(Style::default().bg(theme::BG_DARK)),
+        Block::default().style(Style::default().bg(theme::bg_dark())),
         area,
     );
 
@@ -23,22 +23,30 @@ pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
 
     for (i, buf) in app.buffers.iter().enumerate() {
         let active = i == app.active;
-        let dot = if active { theme::GREEN } else { theme::BORDER };
-        let text_color = if active { theme::FG } else { theme::FG_DIM };
+        let dot = if active { theme::green() } else { theme::border() };
+        let text_color = if active { theme::fg() } else { theme::fg_dim() };
         let weight = if active { Modifier::BOLD } else { Modifier::empty() };
 
         let start = x;
         // " ● label "
         let lead = " ● ";
-        spans.push(Span::styled(lead, Style::default().fg(dot).bg(theme::BG_DARK)));
+        spans.push(Span::styled(lead, Style::default().fg(dot).bg(theme::bg_dark())));
         x += lead.chars().count() as u16;
 
         let label = format!("{} ", buf.label);
         spans.push(Span::styled(
             label.clone(),
-            Style::default().fg(text_color).bg(theme::BG_DARK).add_modifier(weight),
+            Style::default().fg(text_color).bg(theme::bg_dark()).add_modifier(weight),
         ));
         x += label.chars().count() as u16;
+
+        // Unsaved-changes marker (engine holds the live value for the active tab).
+        let dirty = if active { app.active_modified() } else { buf.modified };
+        if dirty {
+            let mark = "+ ";
+            spans.push(Span::styled(mark, Style::default().fg(theme::orange()).bg(theme::bg_dark())));
+            x += mark.chars().count() as u16;
+        }
 
         // Whole tab (except the × glyph) selects the buffer.
         let tab_w = x - start;
@@ -47,23 +55,22 @@ pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         if buf.closable() {
             let close = "× ";
             let cx = x;
-            spans.push(Span::styled(close, Style::default().fg(theme::FG_DIM).bg(theme::BG_DARK)));
+            spans.push(Span::styled(close, Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
             zones.push(Rect { x: cx, y: area.y, width: 2, height: 1 }, Action::CloseBuffer(i));
             x += close.chars().count() as u16;
         }
 
         // Divider between tabs.
-        spans.push(Span::styled("│", Style::default().fg(theme::BORDER_DIM).bg(theme::BG_DARK)));
+        spans.push(Span::styled("│", Style::default().fg(theme::border_dim()).bg(theme::bg_dark())));
         x += 1;
     }
 
-    let wordmark = "CHARVIM · TUI ";
+    // Fill the rest of the bar with the tab-bar background.
     let used = x - area.x;
-    let pad = area.width.saturating_sub(used + wordmark.chars().count() as u16);
+    let pad = area.width.saturating_sub(used);
     if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad as usize), Style::default().bg(theme::BG_DARK)));
+        spans.push(Span::styled(" ".repeat(pad as usize), Style::default().bg(theme::bg_dark())));
     }
-    spans.push(Span::styled(wordmark, Style::default().fg(theme::FG_DIM).bg(theme::BG_DARK)));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -72,61 +79,87 @@ pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
 /// language tag on the right.
 pub fn status_line(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
-        Block::default().style(Style::default().bg(theme::BG_DARK)),
+        Block::default().style(Style::default().bg(theme::bg_dark())),
         area,
     );
+
+    // While the engine's `:` command line is open it owns the whole status
+    // line (the buffer already includes the leading `:` prefix).
+    if let Some(cmd) = app.engine.cmdline() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(cmd, Style::default().fg(theme::fg()).bg(theme::bg_dark())),
+                Span::styled("▏", Style::default().fg(theme::fg()).bg(theme::bg_dark())),
+            ])),
+            area,
+        );
+        return;
+    }
 
     // Mode is engine-owned while a file buffer is focused; COMMAND when the
     // palette is open; NORMAL for the dashboard/plugin shell.
     let (mode_label, mode_color) = if app.palette_open {
-        ("COMMAND", theme::PURPLE)
-    } else if app.active_file().is_some() {
+        ("COMMAND", theme::purple())
+    } else if app.is_file() {
         match app.editor_mode() {
-            "i" => ("INSERT", theme::GREEN),
-            "v" | "V" => ("VISUAL", theme::ORANGE),
-            "\u{16}" => ("V-BLOCK", theme::ORANGE),
-            _ => ("NORMAL", theme::BLUE),
+            "i" => ("INSERT", theme::green()),
+            "v" | "V" => ("VISUAL", theme::orange()),
+            "\u{16}" => ("V-BLOCK", theme::orange()),
+            _ => ("NORMAL", theme::blue()),
         }
     } else {
-        ("NORMAL", theme::BLUE)
+        ("NORMAL", theme::blue())
     };
 
     let buf_label = app.active_buffer().label.clone();
 
     let mut left_spans = vec![Span::styled(
         format!(" {mode_label} "),
-        Style::default().fg(theme::BG_DARK).bg(mode_color).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::bg_dark()).bg(mode_color).add_modifier(Modifier::BOLD),
     )];
     if let Some(g) = &app.project.git {
         left_spans.push(Span::styled(
             format!("  {} ", g.branch),
-            Style::default().fg(theme::CYAN).bg(theme::BG_DARK),
+            Style::default().fg(theme::cyan()).bg(theme::bg_dark()),
         ));
     }
     left_spans.push(Span::styled(
         format!(" {buf_label} "),
-        Style::default().fg(theme::FG_DIM).bg(theme::BG_DARK),
+        Style::default().fg(theme::fg_dim()).bg(theme::bg_dark()),
     ));
+    if app.active_modified() {
+        left_spans.push(Span::styled("[+] ", Style::default().fg(theme::orange()).bg(theme::bg_dark())));
+    }
+    // A pending `<leader>` chord (from the engine's typeahead buffer), then any
+    // transient message (e.g. `:w` ack).
+    let pending = app.engine.pending_display();
+    if !pending.is_empty() {
+        left_spans.push(Span::styled(format!(" {pending}… "), Style::default().fg(theme::purple()).bg(theme::bg_dark())));
+    }
+    if !app.message.is_empty() {
+        left_spans.push(Span::styled(
+            format!(" {} ", app.message),
+            Style::default().fg(theme::fg_muted()).bg(theme::bg_dark()),
+        ));
+    }
     let left = Line::from(left_spans);
 
-    let hints = [
-        (": palette", theme::FG_DIM),
-        ("^B explorer", theme::FG_DIM),
-        ("[ ] tabs", theme::FG_DIM),
-        ("j/k nav", theme::FG_DIM),
-        ("⏎ open", theme::FG_DIM),
-        ("⇥ buffers", theme::FG_DIM),
-        ("? help", theme::FG_DIM),
-        ("rust", theme::FG),
-    ];
+    let mut hints: Vec<(&str, _)> = vec![(": palette", theme::fg_dim())];
+    // The drawer hint only shows when the drawer is enabled in the config.
+    if app.config.drawer {
+        hints.push(("^B drawer", theme::fg_dim()));
+    }
+    hints.push(("^⇥ tabs", theme::fg_dim()));
+    hints.push(("? help", theme::fg_dim()));
+    hints.push(("rust", theme::fg()));
     let mut right_spans: Vec<Span> = Vec::new();
     for (i, (t, c)) in hints.iter().enumerate() {
         if i > 0 {
-            right_spans.push(Span::styled("  ", Style::default().bg(theme::BG_DARK)));
+            right_spans.push(Span::styled("  ", Style::default().bg(theme::bg_dark())));
         }
-        right_spans.push(Span::styled(*t, Style::default().fg(*c).bg(theme::BG_DARK)));
+        right_spans.push(Span::styled(*t, Style::default().fg(*c).bg(theme::bg_dark())));
     }
-    right_spans.push(Span::styled(" ", Style::default().bg(theme::BG_DARK)));
+    right_spans.push(Span::styled(" ", Style::default().bg(theme::bg_dark())));
     let right = Line::from(right_spans).right_aligned();
 
     f.render_widget(Paragraph::new(left.clone()), area);

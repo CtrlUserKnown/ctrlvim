@@ -2,8 +2,7 @@
 //!
 //! Unlike the design prototype, these hold **real** data gathered from the
 //! project the editor is launched in (see [`crate::data`]) rather than static
-//! mock constants. The one exception is [`KEYBINDINGS`], which is in-app
-//! documentation copy, not project data.
+//! mock constants.
 
 use ratatui::style::Color;
 
@@ -40,9 +39,9 @@ pub enum PluginStatus {
 impl PluginStatus {
     pub fn color(self) -> Color {
         match self {
-            PluginStatus::Loaded => theme::GREEN,
-            PluginStatus::Update => theme::ORANGE,
-            PluginStatus::Lazy => theme::FG_DIM,
+            PluginStatus::Loaded => theme::green(),
+            PluginStatus::Update => theme::orange(),
+            PluginStatus::Lazy => theme::fg_dim(),
         }
     }
     pub fn label(self) -> &'static str {
@@ -95,44 +94,29 @@ pub struct Stats {
     pub loc: String,
 }
 
-/// In-app keybinding documentation copy (distinct from the real keymap).
-pub struct Keybind {
-    pub keys: &'static str,
-    pub desc: &'static str,
-}
-
-pub const KEYBINDINGS: &[Keybind] = &[
-    Keybind { keys: "<leader>ff", desc: "Find file" },
-    Keybind { keys: "<leader>fg", desc: "Live grep" },
-    Keybind { keys: "<leader>e",  desc: "Toggle explorer" },
-    Keybind { keys: "gd",         desc: "Go to definition" },
-    Keybind { keys: ":Lazy",      desc: "Plugin manager" },
-    Keybind { keys: "<C-p>",      desc: "Command palette" },
-];
-
 /// Pick a colored icon chip (letter + color) for a file, by extension.
 pub fn icon_for(name: &str) -> (char, Color) {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "rs" => ('R', theme::ORANGE),
-        "toml" => ('T', theme::FG_DIM),
-        "md" | "markdown" => ('M', theme::BLUE),
-        "lua" => ('L', theme::BLUE),
-        "js" | "mjs" | "cjs" => ('J', theme::ORANGE),
-        "ts" | "tsx" => ('T', theme::CYAN),
-        "json" => ('J', theme::ORANGE),
-        "py" => ('P', theme::GREEN),
-        "sh" | "bash" | "zsh" => ('S', theme::GREEN),
-        "yaml" | "yml" => ('Y', theme::PURPLE),
-        "html" => ('H', theme::ORANGE),
-        "css" => ('C', theme::BLUE),
+        "rs" => ('R', theme::orange()),
+        "toml" => ('T', theme::fg_dim()),
+        "md" | "markdown" => ('M', theme::blue()),
+        "lua" => ('L', theme::blue()),
+        "js" | "mjs" | "cjs" => ('J', theme::orange()),
+        "ts" | "tsx" => ('T', theme::cyan()),
+        "json" => ('J', theme::orange()),
+        "py" => ('P', theme::green()),
+        "sh" | "bash" | "zsh" => ('S', theme::green()),
+        "yaml" | "yml" => ('Y', theme::purple()),
+        "html" => ('H', theme::orange()),
+        "css" => ('C', theme::blue()),
         _ => {
             let c = name
                 .chars()
                 .find(|c| c.is_ascii_alphanumeric())
                 .map(|c| c.to_ascii_uppercase())
                 .unwrap_or('•');
-            (c, theme::FG_DIM)
+            (c, theme::fg_dim())
         }
     }
 }

@@ -8,6 +8,7 @@
 //! engine so opening a file loads its contents through the backend.
 
 pub mod app;
+pub mod config;
 pub mod data;
 pub mod input;
 pub mod model;

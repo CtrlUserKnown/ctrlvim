@@ -47,6 +47,19 @@ impl Mode {
     }
 }
 
+/// A normalized visual selection, for a frontend to highlight. `start <= end`
+/// in `(line, col)` order regardless of which way the selection was dragged.
+///
+/// The `col` fields carry the anchor/cursor columns as-is; interpreting them
+/// per [`VisualKind`] (charwise flows across line ends, linewise ignores
+/// columns, blockwise takes the min/max column band) is the renderer's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub kind: VisualKind,
+    pub start: Position,
+    pub end: Position,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

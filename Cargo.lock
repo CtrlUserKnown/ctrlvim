@@ -156,6 +156,7 @@ dependencies = [
  "ctrlvim-options",
  "ctrlvim-text",
  "ctrlvim-types",
+ "ctrlvim-vimscript",
  "mlua",
  "tree-sitter-json",
 ]
@@ -167,6 +168,7 @@ dependencies = [
  "ctrlvim-options",
  "ctrlvim-text",
  "ctrlvim-types",
+ "regex",
 ]
 
 [[package]]

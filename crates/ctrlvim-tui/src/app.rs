@@ -15,11 +15,13 @@
 //! The dashboard's recent-files/git/plugin/LSP data is still static mock data
 //! until the engine grows sources for it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ctrlvim_core::{Ctrlvim, Key};
+use ctrlvim_core::{BufferCmd, Ctrlvim, ExEffect, Key, Selection};
 
+use crate::config::Config;
+use crate::data::{list_dir, FinderEntry};
 use crate::data::Project;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,30 +32,24 @@ pub enum DashboardSection {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
-    Columns,
-    Grid,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PanelId {
-    RecentFiles,
     Git,
-    Plugins,
-    Keybindings,
 }
 
 /// What kind of screen a buffer/tab shows.
 #[derive(Clone, PartialEq, Eq)]
 pub enum BufferKind {
     Dashboard,
-    File(usize), // index into model::FILES
+    File,
     Plugins,
 }
 
 pub struct Buffer {
     pub label: String,
     pub kind: BufferKind,
+    /// Absolute path on disk for a File buffer (used by `:w` and to dedup
+    /// re-opens). `None` for the dashboard / plugin manager.
+    pub path: Option<PathBuf>,
     /// Cached text for a File buffer, so edits survive switching away and back
     /// while the engine facade only holds one working buffer. Empty for
     /// non-file buffers.
@@ -61,19 +57,35 @@ pub struct Buffer {
     /// When this is a markdown File buffer, whether live rendering is on. Only
     /// meaningful for markdown files; auto-enabled when such a file is opened.
     pub render_md: bool,
+    /// Unsaved-changes flag, persisted per buffer across the engine's
+    /// single-buffer facade (the engine owns the live value while active).
+    pub modified: bool,
 }
 
 impl Buffer {
     fn dashboard() -> Self {
-        Buffer { label: "Dashboard".into(), kind: BufferKind::Dashboard, text: Vec::new(), render_md: false }
+        Buffer { label: "Dashboard".into(), kind: BufferKind::Dashboard, path: None, text: Vec::new(), render_md: false, modified: false }
     }
     pub fn closable(&self) -> bool {
         !matches!(self.kind, BufferKind::Dashboard)
     }
     /// True when this buffer's file is markdown (by extension).
     pub fn is_markdown(&self) -> bool {
-        matches!(self.kind, BufferKind::File(_)) && is_markdown_name(&self.label)
+        matches!(self.kind, BufferKind::File) && is_markdown_name(&self.label)
     }
+}
+
+/// The full-screen fuzzy file browser (telescope `file_browser` style): browse
+/// a directory, fuzzy-filter its entries, drill into subdirectories, open files.
+pub struct Finder {
+    /// Directory currently being browsed.
+    pub dir: PathBuf,
+    /// Every entry in `dir` (plus a trailing `../`), unfiltered.
+    pub entries: Vec<FinderEntry>,
+    /// Live search text typed into the File Browser box.
+    pub query: String,
+    /// Selection index into the *filtered* view.
+    pub selected: usize,
 }
 
 /// Whether a file name looks like markdown.
@@ -90,7 +102,6 @@ pub enum Action {
     SelectBuffer(usize),
     CloseBuffer(usize),
     GotoSection(DashboardSection),
-    SetLayout(Layout),
     TogglePanel(PanelId),
     OpenFile(usize),
     OpenPlugins,
@@ -99,11 +110,25 @@ pub enum Action {
     OpenPalette,
     ClosePalette,
     RunPalette(usize),
+    OpenFinder,
+    CloseFinder,
+    RunFinder(usize),
     ToggleSidebar,
     CloseSidebar,
     ToggleHelp,
     CloseHelp,
     ToggleMarkdown,
+    /// Run an Ex command through the engine (e.g. `"w"`, `"q!"`). Carries the
+    /// command text without the leading colon.
+    RunEx(String),
+    /// Switch to the theme at this index in [`theme::ALL`](crate::theme::ALL).
+    SetTheme(usize),
+    /// Start a new file: opens the file browser where a typed name is created.
+    NewFile,
+    /// Flip the "open file drawer on startup" config setting (Settings tab).
+    ToggleStartupDrawer,
+    /// Dismiss the save-as prompt without saving.
+    CloseSavePrompt,
 }
 
 pub struct App {
@@ -117,25 +142,42 @@ pub struct App {
     pub buffers: Vec<Buffer>,
     pub active: usize,
 
-    pub layout: Layout,
     pub section: DashboardSection,
 
     pub sidebar_visible: bool,
-    pub file_index: usize, // selection in FILES, also highlights Recent Files
+    /// While the drawer is open, `/` drops into an inline fuzzy search.
+    pub drawer_search: bool,
+    pub drawer_query: String,
+    pub file_index: usize, // selection in recent files (also highlights Recent Files)
+
+    /// The full-screen fuzzy file browser, present only while open.
+    pub finder: Option<Finder>,
 
     pub palette_open: bool,
     pub palette_query: String,
     pub palette_index: usize,
 
-    pub expand_recent_files: bool,
+    /// The "save as" prompt: the filename being typed while saving an unnamed
+    /// buffer (`Some` while the prompt is open).
+    pub save_prompt: Option<String>,
+
+    /// True after `<leader>` (Space) is pressed in the shell, so the next digit
+    /// jumps to that tab (the editor handles its own leader via the engine).
+    pub leader_pending: bool,
+
+    /// A transient one-line message shown on the status line (e.g. `:w` acks,
+    /// set from engine [`ExEffect::Message`]).
+    pub message: String,
+
     pub expand_git: bool,
-    pub expand_plugins: bool,
-    pub expand_keybindings: bool,
 
     pub lsp_enabled: Vec<bool>,
     pub lsp_index: usize,
 
     pub help_open: bool,
+
+    /// User configuration loaded from `~/.config/ctrlvim/config.toml`.
+    pub config: Config,
 
     pub should_quit: bool,
 }
@@ -151,28 +193,52 @@ impl App {
     pub fn with_root(root: PathBuf, start: Instant) -> Self {
         let project = Project::load(root.clone(), start);
         let lsp_enabled = project.lsp.iter().map(|s| s.installed).collect();
+        // Restore the theme chosen in a previous session (defaults to Terminal,
+        // which follows the host terminal's own palette).
+        if let Some(name) = crate::data::saved_theme() {
+            crate::theme::set_by_name(&name);
+        }
+        let config = Config::load();
         App {
             engine: Ctrlvim::new(),
             project,
             root,
             buffers: vec![Buffer::dashboard()],
             active: 0,
-            layout: Layout::Grid, // grid is the default
             section: DashboardSection::Workspace,
-            sidebar_visible: false,
+            // The drawer opens on startup when the config asks for it.
+            sidebar_visible: config.drawer,
+            drawer_search: false,
+            drawer_query: String::new(),
             file_index: 0,
+            finder: None,
             palette_open: false,
             palette_query: String::new(),
             palette_index: 0,
-            expand_recent_files: false,
+            save_prompt: None,
+            leader_pending: false,
+            message: String::new(),
             expand_git: false,
-            expand_plugins: false,
-            expand_keybindings: false,
             lsp_enabled,
             lsp_index: 0,
             help_open: false,
+            config,
             should_quit: false,
         }
+    }
+
+    /// Toggle the "open file drawer on startup" setting, persist it to the
+    /// config file, and apply it live so the drawer reflects the change now.
+    pub fn toggle_startup_drawer(&mut self) {
+        self.config.drawer = !self.config.drawer;
+        self.config.save();
+        self.sidebar_visible = self.config.drawer;
+        self.drawer_search = false;
+        self.drawer_query.clear();
+        self.message = format!(
+            "file drawer on startup: {}",
+            if self.config.drawer { "on" } else { "off" }
+        );
     }
 
     // --- queries -----------------------------------------------------------
@@ -183,11 +249,9 @@ impl App {
     pub fn is_dashboard(&self) -> bool {
         matches!(self.active_buffer().kind, BufferKind::Dashboard)
     }
-    pub fn active_file(&self) -> Option<usize> {
-        match self.active_buffer().kind {
-            BufferKind::File(i) => Some(i),
-            _ => None,
-        }
+    /// True when the active buffer is an editable file window.
+    pub fn is_file(&self) -> bool {
+        matches!(self.active_buffer().kind, BufferKind::File)
     }
 
     /// The active buffer is a markdown file (whether or not rendering is on).
@@ -210,10 +274,7 @@ impl App {
 
     pub fn panel_expanded(&self, p: PanelId) -> bool {
         match p {
-            PanelId::RecentFiles => self.expand_recent_files,
             PanelId::Git => self.expand_git,
-            PanelId::Plugins => self.expand_plugins,
-            PanelId::Keybindings => self.expand_keybindings,
         }
     }
 
@@ -233,11 +294,6 @@ impl App {
             }
             Action::CloseBuffer(i) => self.close_buffer(i),
             Action::GotoSection(sec) => self.section = sec,
-            Action::SetLayout(l) => {
-                // palette layout actions also snap back to the dashboard
-                self.focus_dashboard();
-                self.layout = l;
-            }
             Action::TogglePanel(p) => self.toggle_panel(p),
             Action::OpenFile(i) => self.open_file(i),
             Action::OpenPlugins => self.open_plugins(),
@@ -252,14 +308,142 @@ impl App {
                 self.palette_query.clear();
                 self.palette_index = 0;
             }
-            Action::ClosePalette => self.palette_open = false,
+            Action::ClosePalette => self.close_palette(),
             Action::RunPalette(i) => self.run_palette(i),
-            Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
-            Action::CloseSidebar => self.sidebar_visible = false,
+            Action::OpenFinder => self.open_finder(),
+            Action::CloseFinder => self.close_finder(),
+            Action::RunFinder(i) => {
+                if let Some(f) = &mut self.finder {
+                    f.selected = i;
+                }
+                self.finder_select();
+            }
+            // The file drawer is only available when enabled in the config.
+            Action::ToggleSidebar => {
+                if self.config.drawer {
+                    self.toggle_sidebar();
+                }
+            }
+            Action::CloseSidebar => self.close_sidebar(),
             Action::ToggleHelp => self.help_open = !self.help_open,
             Action::CloseHelp => self.help_open = false,
             Action::ToggleMarkdown => self.toggle_md_render(),
+            Action::RunEx(cmd) => self.run_ex_command(&cmd),
+            Action::SetTheme(i) => self.set_theme(i),
+            Action::NewFile => self.new_untitled(),
+            Action::ToggleStartupDrawer => self.toggle_startup_drawer(),
+            Action::CloseSavePrompt => self.close_save_prompt(),
         }
+    }
+
+    /// Start editing a fresh, unnamed buffer (like Vim's `:enew`). It gets a
+    /// name only when saved — `:w` opens the [save prompt](Self::open_save_prompt).
+    pub fn new_untitled(&mut self) {
+        self.buffers.push(Buffer {
+            label: "[No Name]".into(),
+            kind: BufferKind::File,
+            path: None,
+            text: vec![String::new()],
+            render_md: false,
+            modified: false,
+        });
+        self.set_active(self.buffers.len() - 1);
+    }
+
+    // --- save-as prompt ----------------------------------------------------
+
+    /// Open the prompt asking for a filename (used when writing an unnamed
+    /// buffer).
+    pub fn open_save_prompt(&mut self) {
+        self.save_prompt = Some(String::new());
+    }
+
+    pub fn close_save_prompt(&mut self) {
+        self.save_prompt = None;
+    }
+
+    pub fn save_prompt_type(&mut self, c: char) {
+        if let Some(name) = &mut self.save_prompt {
+            name.push(c);
+        }
+    }
+
+    pub fn save_prompt_backspace(&mut self) {
+        if let Some(name) = &mut self.save_prompt {
+            name.pop();
+        }
+    }
+
+    /// Confirm the save prompt: write the buffer to the typed name and adopt it.
+    pub fn save_prompt_confirm(&mut self) {
+        let Some(name) = self.save_prompt.take() else { return };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.host_write_as(&name);
+    }
+
+    /// Create the file at `path` (empty, plus any missing parent dirs) if it
+    /// doesn't exist yet, then open it as a buffer. An existing path is just
+    /// opened. This is the shared "make a new file" primitive behind `:e name`,
+    /// the file browser's create action, and the dashboard's New File key.
+    fn create_and_open(&mut self, path: PathBuf) {
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&path, "") {
+                self.message = format!("E212: Can't open file for writing: {e}");
+                return;
+            }
+        }
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.open_path(path, label);
+    }
+
+    /// `:e <name>` / `:new <name>`: create or open `name` (relative to the
+    /// project root unless absolute). An empty name opens the file browser.
+    pub fn new_file(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.open_finder();
+            return;
+        }
+        let path = if Path::new(name).is_absolute() {
+            PathBuf::from(name)
+        } else {
+            self.root.join(name)
+        };
+        self.create_and_open(path);
+    }
+
+    /// Apply the theme at `i` in [`theme::ALL`](crate::theme::ALL) and persist
+    /// the choice so it survives across sessions.
+    pub fn set_theme(&mut self, i: usize) {
+        if let Some(t) = crate::theme::ALL.get(i) {
+            crate::theme::set(*t);
+            crate::data::save_theme(t.name);
+            self.message = format!("theme: {}", t.name);
+        }
+    }
+
+    /// Run an Ex command through the engine, exactly as if it were typed on the
+    /// `:` command line. Keeps the engine authoritative over what commands do
+    /// (and what unknown ones report) — the palette is only a nicer entry point.
+    pub fn run_ex_command(&mut self, cmd: &str) {
+        let cmd = cmd.trim().trim_start_matches(':');
+        if cmd.is_empty() {
+            return;
+        }
+        self.feed_engine(Key::Char(':'));
+        for c in cmd.chars() {
+            self.feed_engine(Key::Char(c));
+        }
+        self.feed_engine(Key::Enter);
     }
 
     pub fn cycle_section(&mut self, dir: i32) {
@@ -280,13 +464,9 @@ impl App {
     }
 
     fn toggle_panel(&mut self, p: PanelId) {
-        let slot = match p {
-            PanelId::RecentFiles => &mut self.expand_recent_files,
-            PanelId::Git => &mut self.expand_git,
-            PanelId::Plugins => &mut self.expand_plugins,
-            PanelId::Keybindings => &mut self.expand_keybindings,
-        };
-        *slot = !*slot;
+        match p {
+            PanelId::Git => self.expand_git = !self.expand_git,
+        }
     }
 
     pub fn move_file_selection(&mut self, dir: i32) {
@@ -314,43 +494,37 @@ impl App {
         }
     }
 
-    fn focus_dashboard(&mut self) {
-        if let Some(i) = self
-            .buffers
-            .iter()
-            .position(|b| matches!(b.kind, BufferKind::Dashboard))
-        {
-            self.set_active(i);
-        }
-    }
-
-    /// Open (or focus) a recent file. New buffers are seeded by reading the
-    /// real file from disk; [`set_active`](Self::set_active) loads that text
-    /// into the engine.
+    /// Open (or focus) one of the dashboard's recent files by list index.
     pub fn open_file(&mut self, file_idx: usize) {
         let Some(f) = self.project.recent_files.get(file_idx) else { return };
         let name = f.name.clone();
         let path = self.root.join(&f.path);
-        match self.buffers.iter().position(|b| b.kind == BufferKind::File(file_idx)) {
-            Some(i) => self.set_active(i),
-            None => {
-                let text = std::fs::read_to_string(&path)
-                    .unwrap_or_default()
-                    .lines()
-                    .map(String::from)
-                    .collect();
-                let render_md = is_markdown_name(&name); // live-render markdown by default
-                self.buffers.push(Buffer { label: name, kind: BufferKind::File(file_idx), text, render_md });
-                self.set_active(self.buffers.len() - 1);
-            }
+        self.open_path(path, name);
+    }
+
+    /// Open (or focus) an arbitrary file by absolute path. New buffers are
+    /// seeded by reading the file from disk; [`set_active`](Self::set_active)
+    /// loads that text into the engine. Re-opening focuses the existing buffer.
+    pub fn open_path(&mut self, path: PathBuf, name: String) {
+        if let Some(i) = self.buffers.iter().position(|b| b.path.as_deref() == Some(path.as_path())) {
+            self.set_active(i);
+            return;
         }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect();
+        let render_md = is_markdown_name(&name); // live-render markdown by default
+        self.buffers.push(Buffer { label: name, kind: BufferKind::File, path: Some(path), text, render_md, modified: false });
+        self.set_active(self.buffers.len() - 1);
     }
 
     pub fn open_plugins(&mut self) {
         if let Some(i) = self.buffers.iter().position(|b| b.kind == BufferKind::Plugins) {
             self.set_active(i);
         } else {
-            self.buffers.push(Buffer { label: "Plugin Manager".into(), kind: BufferKind::Plugins, text: Vec::new(), render_md: false });
+            self.buffers.push(Buffer { label: "Plugin Manager".into(), kind: BufferKind::Plugins, path: None, text: Vec::new(), render_md: false, modified: false });
             self.set_active(self.buffers.len() - 1);
         }
     }
@@ -386,25 +560,298 @@ impl App {
         self.load_active_into_engine();
     }
 
-    /// Save the engine's current text back into the active file buffer's cache.
+    /// Save the engine's current text (and dirty state) back into the active
+    /// file buffer's cache.
     fn snapshot_active(&mut self) {
-        if matches!(self.active_buffer().kind, BufferKind::File(_)) {
+        if matches!(self.active_buffer().kind, BufferKind::File) {
             self.buffers[self.active].text = self.engine.lines();
+            self.buffers[self.active].modified = self.engine.is_modified();
         }
     }
 
-    /// Load the active file buffer's cached text into the engine.
+    /// Load the active file buffer's cached text into the engine, restoring its
+    /// per-buffer dirty state (the engine's single buffer would otherwise reset).
     fn load_active_into_engine(&mut self) {
-        if matches!(self.active_buffer().kind, BufferKind::File(_)) {
+        if matches!(self.active_buffer().kind, BufferKind::File) {
             let text = self.buffers[self.active].text.join("\n");
             let label = self.buffers[self.active].label.clone();
             self.engine.open(&text, Some(&label));
+            self.engine.set_modified(self.buffers[self.active].modified);
         }
     }
 
-    /// Feed one key to the engine's editing session.
+    /// Whether the active buffer has unsaved changes (live value from the
+    /// engine while a file is focused).
+    pub fn active_modified(&self) -> bool {
+        self.is_file() && self.engine.is_modified()
+    }
+
+    /// Feed one key to the engine's editing session, then perform any host
+    /// effects the engine requested (`:w`/`:q`/…).
     pub fn feed_engine(&mut self, key: Key) {
         self.engine.session.feed(key);
+        self.apply_effects();
+    }
+
+    /// Drain and perform the engine's queued [`ExEffect`]s. This is the host
+    /// side of the Ex-command boundary: the UI-less engine decides *what* should
+    /// happen; the frontend does the file I/O, buffer/quit management, and UI.
+    fn apply_effects(&mut self) {
+        for effect in self.engine.take_effects() {
+            match effect {
+                ExEffect::Write { .. } => {
+                    self.host_write();
+                }
+                ExEffect::Quit { .. } => self.host_quit(),
+                ExEffect::WriteQuit { .. } => {
+                    if self.host_write() {
+                        self.host_quit();
+                    }
+                }
+                ExEffect::WriteAs { path, .. } => {
+                    self.host_write_as(&path);
+                }
+                ExEffect::WriteAll => {
+                    let n = self.host_write_all();
+                    self.message = format!("{n} buffer(s) written");
+                }
+                ExEffect::QuitAll { force } => self.host_quit_all(force),
+                ExEffect::WriteQuitAll => {
+                    self.host_write_all();
+                    self.should_quit = true;
+                }
+                // `:close` exits the whole editor, not just the active window.
+                ExEffect::CloseApp => self.should_quit = true,
+                ExEffect::Colorscheme(name) => self.host_colorscheme(name),
+                ExEffect::Buffer(cmd) => self.host_buffer_cmd(cmd),
+                ExEffect::Vimscript(src) => self.host_vimscript(&src),
+                ExEffect::Lua(code) => match self.engine.run_lua(&code) {
+                    Ok(()) => {}
+                    Err(e) => self.message = format!("E5108: {}", first_line(&e)),
+                },
+                ExEffect::Source(path) => self.host_source(&path),
+                ExEffect::OpenBrowser => self.open_finder(),
+                ExEffect::Edit(name) => self.new_file(&name),
+                ExEffect::Message(m) => self.message = m,
+            }
+        }
+    }
+
+    /// Run a line of Vimscript (`:let`/`:echo`/…) and surface `:echo` output or
+    /// an error on the command line.
+    fn host_vimscript(&mut self, src: &str) {
+        match self.engine.run_vimscript(src) {
+            Ok(out) if !out.is_empty() => self.message = out.join(" "),
+            Ok(_) => {}
+            Err(e) => self.message = first_line(&e),
+        }
+    }
+
+    /// `:source {file}` / `:luafile` — read a script (relative to the project
+    /// root unless absolute) and run it as Lua (`.lua`) or Vimscript.
+    fn host_source(&mut self, rel: &str) {
+        let rel = rel.trim();
+        if rel.is_empty() {
+            self.message = "E471: Argument required".into();
+            return;
+        }
+        let path = if Path::new(rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            self.root.join(rel)
+        };
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = format!("E484: Can't open file {rel}: {e}");
+                return;
+            }
+        };
+        if path.extension().and_then(|e| e.to_str()) == Some("lua") {
+            if let Err(e) = self.engine.run_lua(&contents) {
+                self.message = format!("E5108: {}", first_line(&e));
+            }
+        } else {
+            match self.engine.run_vimscript(&contents) {
+                Ok(out) if !out.is_empty() => self.message = out.join(" "),
+                Ok(_) => {}
+                Err(e) => self.message = first_line(&e),
+            }
+        }
+    }
+
+    /// `:colorscheme [name]` — switch the theme (persisting it), or report the
+    /// current one when no name is given.
+    fn host_colorscheme(&mut self, name: Option<String>) {
+        match name {
+            None => self.message = format!("colorscheme {}", crate::theme::current().name),
+            Some(name) => {
+                if let Some((i, _)) = crate::theme::ALL
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| t.name.eq_ignore_ascii_case(&name))
+                {
+                    self.set_theme(i);
+                } else {
+                    self.message = format!("E185: Cannot find color scheme '{name}'");
+                }
+            }
+        }
+    }
+
+    /// Buffer/tab list navigation (`:bnext`, `:b N`, `:bd`, `:only`, `:ls`).
+    fn host_buffer_cmd(&mut self, cmd: BufferCmd) {
+        match cmd {
+            BufferCmd::Next => self.cycle_buffer(1),
+            BufferCmd::Prev => self.cycle_buffer(-1),
+            BufferCmd::First => self.set_active(0),
+            BufferCmd::Last => self.set_active(self.buffers.len().saturating_sub(1)),
+            BufferCmd::Goto(n) => {
+                if n >= 1 && n <= self.buffers.len() {
+                    self.set_active(n - 1);
+                } else {
+                    self.message = format!("E86: Buffer {n} does not exist");
+                }
+            }
+            BufferCmd::Delete(which) => {
+                let idx = which.map(|n| n.saturating_sub(1)).unwrap_or(self.active);
+                self.close_buffer(idx);
+            }
+            BufferCmd::Only => {
+                // Close every closable buffer except the active one.
+                let keep = self.active;
+                let keep_id = self.buffers.get(keep).map(|b| b.label.clone());
+                self.buffers.retain(|b| {
+                    !b.closable() || Some(&b.label) == keep_id.as_ref()
+                });
+                self.active = self
+                    .buffers
+                    .iter()
+                    .position(|b| Some(&b.label) == keep_id.as_ref())
+                    .unwrap_or(0);
+                self.load_active_into_engine();
+            }
+            BufferCmd::List => {
+                let list: Vec<String> = self
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        let mark = if i == self.active { "%" } else { " " };
+                        format!("{}{mark} {}", i + 1, b.label)
+                    })
+                    .collect();
+                self.message = list.join("  ");
+            }
+        }
+    }
+
+    /// `:w {file}` / `:saveas {file}` — write the active buffer's text to a new
+    /// path (relative to the project root unless absolute) and adopt it.
+    fn host_write_as(&mut self, rel: &str) -> bool {
+        if !self.is_file() {
+            self.message = "E382: Cannot write, no file for this buffer".into();
+            return false;
+        }
+        let path = if Path::new(rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            self.root.join(rel)
+        };
+        self.snapshot_active();
+        let mut body = self.buffers[self.active].text.join("\n");
+        body.push('\n');
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match std::fs::write(&path, body) {
+            Ok(()) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                // Adopt the new path/name (like Vim's :saveas).
+                self.buffers[self.active].path = Some(path);
+                self.buffers[self.active].label = name.clone();
+                self.buffers[self.active].modified = false;
+                self.engine.set_modified(false);
+                self.message = format!("\"{name}\" written");
+                true
+            }
+            Err(e) => {
+                self.message = format!("E212: Can't open file for writing: {e}");
+                false
+            }
+        }
+    }
+
+    /// Write every modified file buffer to disk. Returns how many were written.
+    fn host_write_all(&mut self) -> usize {
+        self.snapshot_active();
+        let mut written = 0;
+        for i in 0..self.buffers.len() {
+            if self.buffers[i].kind != BufferKind::File || !self.buffers[i].modified {
+                continue;
+            }
+            let Some(path) = self.buffers[i].path.clone() else { continue };
+            let mut body = self.buffers[i].text.join("\n");
+            body.push('\n');
+            if std::fs::write(&path, body).is_ok() {
+                self.buffers[i].modified = false;
+                if i == self.active {
+                    self.engine.set_modified(false);
+                }
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// `:qa[!]` — quit the whole editor. Refused (unless forced) when any buffer
+    /// has unsaved changes.
+    fn host_quit_all(&mut self, force: bool) {
+        self.snapshot_active();
+        if !force && self.buffers.iter().any(|b| b.modified) {
+            self.message = "E37: No write since last change (add ! to override)".into();
+            return;
+        }
+        self.should_quit = true;
+    }
+
+    /// Write the active file buffer to disk. Returns whether it succeeded and
+    /// sets a status message either way.
+    fn host_write(&mut self) -> bool {
+        if !self.is_file() {
+            self.message = "E382: Cannot write, no file for this buffer".into();
+            return false;
+        }
+        // Sync the engine's live text into the buffer cache, then persist it.
+        self.snapshot_active();
+        let Some(path) = self.buffers[self.active].path.clone() else {
+            // Unnamed buffer (`:enew`/New File): ask for a name, then save.
+            self.open_save_prompt();
+            return false;
+        };
+        let mut body = self.buffers[self.active].text.join("\n");
+        body.push('\n'); // POSIX trailing newline
+        match std::fs::write(&path, body) {
+            Ok(()) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.message = format!("\"{name}\" {}L written", self.buffers[self.active].text.len());
+                true
+            }
+            Err(e) => {
+                self.message = format!("E212: Can't open file for writing: {e}");
+                false
+            }
+        }
+    }
+
+    /// Quit the active window: close the buffer, or quit the app if it's the
+    /// last one (or the dashboard).
+    fn host_quit(&mut self) {
+        if self.is_dashboard() || self.buffers.len() <= 1 {
+            self.should_quit = true;
+        } else {
+            self.close_buffer(self.active);
+        }
     }
 
     /// The engine's cursor as 0-based `(line, col)`.
@@ -423,42 +870,81 @@ impl App {
         self.engine.mode()
     }
 
+    /// The active visual selection to highlight, or `None` outside Visual mode.
+    pub fn editor_selection(&self) -> Option<Selection> {
+        self.engine.selection()
+    }
+
+    /// `hlsearch` match column ranges on `line` (empty when highlighting is off).
+    pub fn editor_search_matches(&self, line: usize) -> Vec<(usize, usize)> {
+        self.engine.search_line_matches(line)
+    }
+
     /// True when a File buffer is focused and no overlay is capturing input —
     /// i.e. keystrokes should drive the editor.
     pub fn editor_focus(&self) -> bool {
-        self.active_file().is_some() && !self.palette_open && !self.help_open && !self.sidebar_visible
+        self.is_file()
+            && !self.palette_open
+            && !self.help_open
+            && !self.sidebar_visible
+            && self.finder.is_none()
+            && self.save_prompt.is_none()
     }
 
     // --- command palette ---------------------------------------------------
 
+    /// The command palette is the unified command line: it lists **commands**
+    /// (never files — file finding is the finder / the `Find File` entry) and
+    /// fuzzy-filters them against the typed query. It opens with `:`.
     pub fn palette_results(&self) -> Vec<PaletteItem> {
-        let q = self.palette_query.to_lowercase();
+        let q = &self.palette_query;
         let mut items: Vec<PaletteItem> = Vec::new();
-        for (i, f) in self.project.recent_files.iter().enumerate() {
+
+        // Engine-defined Ex commands (`:w`, `:q`, …). The catalog and execution
+        // both live in the engine; the palette is only a nicer entry point.
+        for cmd in ctrlvim_core::ex_commands() {
             items.push(PaletteItem {
-                label: f.path.clone(),
-                hint: "open file",
-                icon_color: f.icon_color,
-                icon_letter: f.icon_letter,
-                action: Action::OpenFile(i),
+                label: format!(":{}", cmd.name),
+                hint: cmd.desc,
+                icon_color: crate::theme::green(),
+                icon_letter: ':',
+                action: Action::RunEx(cmd.name.to_string()),
             });
         }
+
+        // Frontend actions.
         if self.active_is_markdown() {
             let (label, letter) = if self.md_render_active() {
                 ("Markdown: Show Raw Source".to_string(), 'M')
             } else {
                 ("Markdown: Live Render".to_string(), 'M')
             };
-            items.push(PaletteItem { label, hint: "action", icon_color: crate::theme::PURPLE, icon_letter: letter, action: Action::ToggleMarkdown });
+            items.push(PaletteItem { label, hint: "toggle markdown render", icon_color: crate::theme::purple(), icon_letter: letter, action: Action::ToggleMarkdown });
         }
-        items.push(PaletteItem { label: "Plugin Manager".into(), hint: "action", icon_color: crate::theme::ORANGE, icon_letter: 'P', action: Action::OpenPlugins });
-        items.push(PaletteItem { label: "Toggle Sidebar".into(), hint: "action", icon_color: crate::theme::CYAN, icon_letter: 'S', action: Action::ToggleSidebar });
-        items.push(PaletteItem { label: "Dashboard Layout: Two Column".into(), hint: "action", icon_color: crate::theme::BLUE, icon_letter: '2', action: Action::SetLayout(Layout::Columns) });
-        items.push(PaletteItem { label: "Dashboard Layout: Grid".into(), hint: "action", icon_color: crate::theme::BLUE, icon_letter: '3', action: Action::SetLayout(Layout::Grid) });
-        if q.is_empty() {
+        items.push(PaletteItem { label: "Find File".into(), hint: "fuzzy file browser", icon_color: crate::theme::blue(), icon_letter: 'F', action: Action::OpenFinder });
+        items.push(PaletteItem { label: "Plugin Manager".into(), hint: "manage plugins", icon_color: crate::theme::orange(), icon_letter: 'P', action: Action::OpenPlugins });
+        if self.config.drawer {
+            items.push(PaletteItem { label: "Toggle Sidebar".into(), hint: "file drawer", icon_color: crate::theme::cyan(), icon_letter: 'S', action: Action::ToggleSidebar });
+        }
+
+        // Theme switching (one entry per registered theme).
+        for (i, t) in crate::theme::ALL.iter().enumerate() {
+            items.push(PaletteItem {
+                label: format!("Theme: {}", t.name),
+                hint: "color theme",
+                icon_color: crate::theme::purple(),
+                icon_letter: 'T',
+                action: Action::SetTheme(i),
+            });
+        }
+
+        if q.trim().is_empty() {
             items
         } else {
-            items.into_iter().filter(|it| it.label.to_lowercase().contains(&q)).collect()
+            items
+                .into_iter()
+                .filter(|it| fuzzy_match(q, &format!("{} {}", it.label, it.hint)))
+                .collect()
         }
     }
 
@@ -484,16 +970,209 @@ impl App {
             let action = item.action.clone();
             self.dispatch(action);
         }
+        self.close_palette();
+    }
+
+    fn close_palette(&mut self) {
         self.palette_open = false;
         self.palette_query.clear();
         self.palette_index = 0;
     }
+
+    /// Confirm the command line (`Enter`). Command-line semantics take priority
+    /// over the fuzzy list: an **exactly** typed command name runs verbatim
+    /// (typing `q` runs `:q`, never the `:wq` that fuzzy-matching would rank
+    /// first). Otherwise the highlighted item runs; and if nothing matched, the
+    /// raw text runs as a freeform Ex command (`:42`, `:$`, unknown → E492).
+    pub fn submit_palette(&mut self) {
+        let q = self.palette_query.trim().to_string();
+        // A recognized Ex command (incl. ranges/`:s`/`:noh`/…) runs verbatim,
+        // so short command names aren't hijacked by a fuzzy palette entry.
+        if !q.is_empty() && ctrlvim_core::is_ex_command(&q) {
+            self.close_palette();
+            self.run_ex_command(&q);
+            return;
+        }
+        // Otherwise pick from the fuzzy list (themes, Find File, …).
+        let results = self.palette_results();
+        if !results.is_empty() {
+            let idx = self.palette_index.min(results.len() - 1);
+            self.run_palette(idx);
+            return;
+        }
+        self.close_palette();
+        if !q.is_empty() {
+            self.run_ex_command(&q);
+        }
+    }
+
+    // --- fuzzy file browser (finder) --------------------------------------
+
+    /// Open the full-screen file browser, rooted at the active file's directory
+    /// (or the project root for non-file buffers).
+    pub fn open_finder(&mut self) {
+        let dir = self
+            .active_buffer()
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone());
+        self.finder = Some(Finder { entries: list_dir(&dir), dir, query: String::new(), selected: 0 });
+    }
+
+    pub fn close_finder(&mut self) {
+        self.finder = None;
+    }
+
+    /// Entry indices (into `finder.entries`) that match the current query, as a
+    /// case-insensitive subsequence of the entry name.
+    pub fn finder_matches(&self) -> Vec<usize> {
+        let Some(f) = &self.finder else { return Vec::new() };
+        f.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| fuzzy_match(&f.query, &e.name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn finder_move(&mut self, dir: i32) {
+        let n = self.finder_matches().len() as i32;
+        if let Some(f) = &mut self.finder {
+            if n > 0 {
+                f.selected = (((f.selected as i32 + dir) % n + n) % n) as usize;
+            }
+        }
+    }
+
+    pub fn finder_type(&mut self, c: char) {
+        if let Some(f) = &mut self.finder {
+            f.query.push(c);
+            f.selected = 0;
+        }
+    }
+
+    pub fn finder_backspace(&mut self) {
+        if let Some(f) = &mut self.finder {
+            f.query.pop();
+            f.selected = 0;
+        }
+    }
+
+    /// Activate the selected entry: drill into a directory, or open a file.
+    /// When the typed name matches nothing, it's treated as a new file to
+    /// create in the current directory (telescope `file_browser` style).
+    pub fn finder_select(&mut self) {
+        let matches = self.finder_matches();
+        let Some(f) = &self.finder else { return };
+        if matches.is_empty() {
+            let name = f.query.trim();
+            if name.is_empty() {
+                return;
+            }
+            let path = f.dir.join(name);
+            self.finder = None;
+            self.create_and_open(path);
+            return;
+        }
+        let Some(&ei) = matches.get(f.selected) else { return };
+        let entry = &f.entries[ei];
+        if entry.is_dir {
+            let dir = entry.path.clone();
+            self.finder = Some(Finder { entries: list_dir(&dir), dir, query: String::new(), selected: 0 });
+        } else {
+            let path = entry.path.clone();
+            let name = entry.name.clone();
+            self.finder = None;
+            self.open_path(path, name);
+        }
+    }
+
+    // --- file drawer (opt-in sidebar) with `/` search ---------------------
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        self.drawer_search = false;
+        self.drawer_query.clear();
+    }
+
+    fn close_sidebar(&mut self) {
+        self.sidebar_visible = false;
+        self.drawer_search = false;
+        self.drawer_query.clear();
+    }
+
+    /// Recent-file indices matching the drawer's `/` search (all when empty).
+    pub fn drawer_matches(&self) -> Vec<usize> {
+        self.project
+            .recent_files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| fuzzy_match(&self.drawer_query, &f.name))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn drawer_start_search(&mut self) {
+        self.drawer_search = true;
+        self.drawer_query.clear();
+    }
+
+    pub fn drawer_type(&mut self, c: char) {
+        self.drawer_query.push(c);
+        self.clamp_file_index_to_drawer();
+    }
+
+    pub fn drawer_backspace(&mut self) {
+        self.drawer_query.pop();
+        self.clamp_file_index_to_drawer();
+    }
+
+    /// Move the selection within the drawer's filtered results.
+    pub fn drawer_move(&mut self, dir: i32) {
+        let matches = self.drawer_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let pos = matches.iter().position(|&i| i == self.file_index).unwrap_or(0) as i32;
+        let n = matches.len() as i32;
+        self.file_index = matches[(((pos + dir) % n + n) % n) as usize];
+    }
+
+    fn clamp_file_index_to_drawer(&mut self) {
+        let matches = self.drawer_matches();
+        if !matches.contains(&self.file_index) {
+            self.file_index = matches.first().copied().unwrap_or(0);
+        }
+    }
+
 }
 
 impl Default for App {
     fn default() -> Self {
         App::new()
     }
+}
+
+/// The first line of a (possibly multi-line) error, for the one-row status bar.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Case-insensitive subsequence match: every char of `query` appears in
+/// `text`, in order. An empty query matches everything.
+pub fn fuzzy_match(query: &str, text: &str) -> bool {
+    let mut hay = text.chars().flat_map(char::to_lowercase);
+    'outer: for qc in query.chars().flat_map(char::to_lowercase) {
+        for hc in hay.by_ref() {
+            if hc == qc {
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
 }
 
 pub struct PaletteItem {

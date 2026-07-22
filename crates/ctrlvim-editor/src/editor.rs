@@ -21,6 +21,9 @@ pub struct BufferState {
     pub name: Option<String>,
     /// Neovim's `b:changedtick`, bumped on every text change.
     pub changedtick: u64,
+    /// The `changedtick` as of the last write; the buffer is "modified"
+    /// (`'modified'`) whenever `changedtick` has moved past it.
+    pub saved_changedtick: u64,
 }
 
 impl BufferState {
@@ -33,7 +36,18 @@ impl BufferState {
             options: BufferOptions::default(),
             name,
             changedtick: 1,
+            saved_changedtick: 1,
         }
+    }
+
+    /// Whether the buffer has unsaved changes (`'modified'`).
+    pub fn modified(&self) -> bool {
+        self.changedtick != self.saved_changedtick
+    }
+
+    /// Mark the current state as the on-disk state (after `:w`).
+    pub fn mark_saved(&mut self) {
+        self.saved_changedtick = self.changedtick;
     }
 }
 

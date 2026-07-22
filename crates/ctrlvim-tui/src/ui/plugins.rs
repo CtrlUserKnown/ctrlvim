@@ -20,7 +20,7 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
     // Header: "Plugin Manager"    "N loaded · M updates available".
     let title = Line::from(Span::styled(
         "Plugin Manager",
-        Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::fg()).add_modifier(Modifier::BOLD),
     ));
     f.render_widget(Paragraph::new(title), Rect { height: 1, ..area });
     let summary = format!(
@@ -28,7 +28,7 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
         app.project.stats.plugins_loaded, updates
     );
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(summary, Style::default().fg(theme::FG_DIM))).right_aligned()),
+        Paragraph::new(Line::from(Span::styled(summary, Style::default().fg(theme::fg_dim()))).right_aligned()),
         Rect { height: 1, ..area },
     );
 
@@ -36,16 +36,16 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "No plugins installed. Drop plugins under ~/.config/ctrlvim/pack/*/start/ to see them here.",
-                Style::default().fg(theme::FG_DIM),
+                Style::default().fg(theme::fg_dim()),
             )))
-            .style(Style::default().bg(theme::BG)),
+            .style(Style::default().bg(theme::bg())),
             Rect { y: area.y + 2, height: 1, ..area },
         );
         return;
     }
 
     let table = Rect { y: area.y + 2, height: area.height.saturating_sub(2), ..area };
-    let inner = super::titled_panel(f, table, "PLUGINS", theme::ORANGE);
+    let inner = super::titled_panel(f, table, "PLUGINS", theme::orange());
     if inner.height == 0 {
         return;
     }
@@ -55,24 +55,24 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
     let repo_w = 26usize;
     let cat_w = 14usize;
     let header = Line::from(vec![
-        Span::styled(format!("{:<name_w$}", "NAME"), Style::default().fg(theme::FG_DIM).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:<repo_w$}", "REPO"), Style::default().fg(theme::FG_DIM).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:<cat_w$}", "CATEGORY"), Style::default().fg(theme::FG_DIM).add_modifier(Modifier::BOLD)),
-        Span::styled("STATUS", Style::default().fg(theme::FG_DIM).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<name_w$}", "NAME"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<repo_w$}", "REPO"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<cat_w$}", "CATEGORY"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
+        Span::styled("STATUS", Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
     ]);
-    f.render_widget(Paragraph::new(header).style(Style::default().bg(theme::BG_DARK)), Rect { height: 1, ..inner });
+    f.render_widget(Paragraph::new(header).style(Style::default().bg(theme::bg_dark())), Rect { height: 1, ..inner });
 
     let mut lines: Vec<Line> = Vec::new();
     for p in plugins {
         let repo = if p.repo.is_empty() { "—" } else { p.repo.as_str() };
         let cat = if p.category.is_empty() { "—" } else { p.category.as_str() };
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<name_w$}", p.name), Style::default().fg(theme::FG)),
-            Span::styled(format!("{repo:<repo_w$}"), Style::default().fg(theme::FG_DIM)),
-            Span::styled(format!("{cat:<cat_w$}"), Style::default().fg(theme::CYAN)),
+            Span::styled(format!("{:<name_w$}", p.name), Style::default().fg(theme::fg())),
+            Span::styled(format!("{repo:<repo_w$}"), Style::default().fg(theme::fg_dim())),
+            Span::styled(format!("{cat:<cat_w$}"), Style::default().fg(theme::cyan())),
             Span::styled(p.status.label(), Style::default().fg(p.status.color())),
         ]));
     }
     let rows = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(theme::BG_DARK)), rows);
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(theme::bg_dark())), rows);
 }

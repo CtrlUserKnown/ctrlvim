@@ -9,7 +9,10 @@
 
 pub use ctrlvim_api::ApiContext;
 pub use ctrlvim_async::{Event, EventLoop};
-pub use ctrlvim_editor::{Editor, Frame, Key, Mode, Session};
+pub use ctrlvim_editor::{
+    ex_commands, is_ex_command, BufferCmd, Editor, ExCommand, ExEffect, Frame, Key, Mode,
+    Selection, Session, VisualKind,
+};
 pub use ctrlvim_lua::Host;
 pub use ctrlvim_types::{BufferId, Object, Position, WindowId};
 
@@ -21,13 +24,57 @@ pub use ctrlvim_types::{BufferId, Object, Position, WindowId};
 /// the command-line `:lua` bridge lands.
 pub struct Ctrlvim {
     pub session: Session,
+    /// Persistent Vimscript state (`g:` variables, `:function` defs).
+    script: ctrlvim_vimscript::ScriptState,
+    /// The Lua host, created on first `:lua`. It owns its own `Editor`; we sync
+    /// the session's buffer text in and out around each run.
+    host: Option<Host>,
 }
 
 impl Ctrlvim {
     pub fn new() -> Self {
         Ctrlvim {
             session: Session::new(),
+            script: ctrlvim_vimscript::ScriptState::default(),
+            host: None,
         }
+    }
+
+    /// Run a line (or file) of Vimscript against the live buffer. Returns any
+    /// `:echo` output. Commits an undo checkpoint if the buffer changed.
+    pub fn run_vimscript(&mut self, src: &str) -> Result<Vec<String>, String> {
+        self.script.output.clear();
+        let before = self.session.editor.cur_buffer().text.lines();
+        let result = {
+            let mut interp = ctrlvim_vimscript::Interp::new(&mut self.script, &mut self.session.editor);
+            interp.run(src).map_err(|e| e.to_string())
+        };
+        if self.session.editor.cur_buffer().text.lines() != before {
+            self.session.checkpoint_undo();
+        }
+        result.map(|()| std::mem::take(&mut self.script.output))
+    }
+
+    /// Run a Lua chunk against the live buffer (syncing text in and out).
+    pub fn run_lua(&mut self, code: &str) -> Result<(), String> {
+        if self.host.is_none() {
+            self.host = Some(Host::new(Editor::new()).map_err(|e| e.to_string())?);
+        }
+        let host = self.host.as_ref().unwrap();
+        let text = self.lines().join("\n");
+        host.with_editor_mut(|ed| ed.load_str(&text, None));
+        let result = host.exec(code).map_err(|e| e.to_string());
+        let new_lines = host.with_editor(|ed| ed.cur_buffer().text.lines());
+        if new_lines != self.session.editor.cur_buffer().text.lines() {
+            let count = self.session.editor.cur_buffer().text.line_count();
+            self.session
+                .editor
+                .cur_buffer_mut()
+                .text
+                .set_lines(0, count, &new_lines);
+            self.session.checkpoint_undo();
+        }
+        result
     }
 
     /// Open a file's contents into the current buffer.
@@ -54,6 +101,43 @@ impl Ctrlvim {
     pub fn mode(&self) -> &'static str {
         self.session.mode_name()
     }
+
+    /// The active visual selection (normalized), or `None` outside Visual mode.
+    pub fn selection(&self) -> Option<Selection> {
+        self.session.selection()
+    }
+
+    /// Char-column `(start, end)` ranges of `hlsearch` matches on `line`.
+    pub fn search_line_matches(&self, line: usize) -> Vec<(usize, usize)> {
+        self.session.search_line_matches(line)
+    }
+
+    /// The in-progress `:` command line to render, or `None` outside Cmdline mode.
+    pub fn cmdline(&self) -> Option<String> {
+        self.session.cmdline()
+    }
+
+    /// A short display of any partially-typed `<leader>` chord (for the status
+    /// line); empty when nothing is pending.
+    pub fn pending_display(&self) -> String {
+        self.session.pending_display()
+    }
+
+    /// Drain the host effects requested by Ex commands (`:w`/`:q`/…) since the
+    /// last call, for the frontend to perform.
+    pub fn take_effects(&mut self) -> Vec<ExEffect> {
+        self.session.take_effects()
+    }
+
+    /// Whether the current buffer has unsaved changes (`'modified'`).
+    pub fn is_modified(&self) -> bool {
+        self.session.is_modified()
+    }
+
+    /// Carry per-buffer dirty state across the single-buffer facade.
+    pub fn set_modified(&mut self, modified: bool) {
+        self.session.set_modified(modified);
+    }
 }
 
 impl Default for Ctrlvim {
@@ -77,3 +161,4 @@ mod tests {
         assert_eq!(ctrlvim.mode(), "n");
     }
 }
+

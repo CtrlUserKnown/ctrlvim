@@ -40,6 +40,7 @@ impl Key {
                         "cr" | "enter" => Some(Key::Enter),
                         "bs" => Some(Key::Backspace),
                         "tab" => Some(Key::Tab),
+                        "space" | "leader" => Some(Key::Char(' ')),
                         _ if tag.len() == 3 && tag.to_ascii_lowercase().starts_with("c-") => {
                             Some(Key::Ctrl(tag.chars().nth(2).unwrap()))
                         }
@@ -73,5 +74,11 @@ mod tests {
     fn parse_ctrl() {
         let keys = Key::parse_sequence("<C-r>u");
         assert_eq!(keys, vec![Key::Ctrl('r'), Key::Char('u')]);
+    }
+
+    #[test]
+    fn parse_space_and_leader() {
+        assert_eq!(Key::parse_sequence("<Space>w"), vec![Key::Char(' '), Key::Char('w')]);
+        assert_eq!(Key::parse_sequence("<leader>e"), vec![Key::Char(' '), Key::Char('e')]);
     }
 }

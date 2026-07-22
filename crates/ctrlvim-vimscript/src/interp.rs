@@ -63,6 +63,8 @@ pub struct FuncDef {
 pub struct ScriptState {
     pub globals: HashMap<String, Object>,
     pub funcs: HashMap<String, FuncDef>,
+    /// Text produced by `:echo`, drained by the frontend for the message area.
+    pub output: Vec<String>,
 }
 
 /// Control-flow result of executing a statement.
@@ -150,11 +152,13 @@ impl<'e> Interp<'e> {
                 Ok(Flow::Normal)
             }
             Stmt::Echo(exprs) => {
-                // Echo is a no-op for output here (no message area); evaluating
-                // still surfaces errors. A frontend can capture messages later.
+                // Evaluate each argument and record the joined text so a frontend
+                // can surface it in the message area.
+                let mut parts = Vec::with_capacity(exprs.len());
                 for e in exprs {
-                    self.eval(e)?;
+                    parts.push(crate::value::to_string(&self.eval(e)?));
                 }
+                self.state.output.push(parts.join(" "));
                 Ok(Flow::Normal)
             }
             Stmt::Return(e) => {

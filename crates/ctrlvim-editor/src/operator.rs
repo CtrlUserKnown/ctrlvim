@@ -21,7 +21,16 @@ pub enum Operator {
     /// Change = delete then enter Insert mode (the caller handles the mode
     /// transition; this applies the delete part).
     Change,
+    /// `>`/`<` — shift the spanned lines' indent right/left (linewise).
+    Indent { right: bool },
+    /// `gu`/`gU`/`g~` (and visual `u`/`U`/`~`) — case transforms.
+    Lower,
+    Upper,
+    ToggleCase,
 }
+
+/// Number of spaces one `>`/`<` shift adds or removes.
+const SHIFTWIDTH: usize = 4;
 
 /// A resolved region to operate on, plus how to treat it.
 #[derive(Debug, Clone, Copy)]
@@ -69,10 +78,88 @@ pub fn apply_operator(
     span: OperatorSpan,
     reg: Option<char>,
 ) -> OperatorOutcome {
+    // Indent and case transforms don't yank/delete; handle them separately.
+    match op {
+        Operator::Indent { right } => return apply_indent(editor, span, right),
+        Operator::Lower | Operator::Upper | Operator::ToggleCase => return apply_case(editor, op, span),
+        _ => {}
+    }
     match span.kind {
         MotionKind::Linewise => apply_linewise(editor, op, span, reg),
         MotionKind::CharExclusive => apply_charwise(editor, op, span, false, reg),
         MotionKind::CharInclusive => apply_charwise(editor, op, span, true, reg),
+    }
+}
+
+/// `>`/`<` — add or remove one shiftwidth of leading spaces on each line.
+fn apply_indent(editor: &mut Editor, span: OperatorSpan, right: bool) -> OperatorOutcome {
+    let buf = &editor.cur_buffer().text;
+    let last = buf.line_count().saturating_sub(1);
+    let (l0, l1) = (span.start.line.min(last), span.end.line.min(last));
+    let new: Vec<String> = (l0..=l1)
+        .map(|i| {
+            let line = buf.line(i).unwrap_or_default();
+            if line.is_empty() {
+                return line;
+            }
+            if right {
+                format!("{}{}", " ".repeat(SHIFTWIDTH), line)
+            } else {
+                let strip = line.chars().take(SHIFTWIDTH).take_while(|c| *c == ' ').count();
+                line[strip..].to_string()
+            }
+        })
+        .collect();
+    replace_lines(editor, l0, l1 + 1, &new);
+    let cursor = crate::motion::first_non_blank(&editor.cur_buffer().text, Position::new(l0, 0)).target;
+    commit_undo(editor, cursor);
+    OperatorOutcome { cursor, enter_insert: false }
+}
+
+/// `gu`/`gU`/`g~` — transform the case of the spanned characters in place.
+fn apply_case(editor: &mut Editor, op: Operator, span: OperatorSpan) -> OperatorOutcome {
+    let transform = |c: char| match op {
+        Operator::Lower => c.to_lowercase().next().unwrap_or(c),
+        Operator::Upper => c.to_uppercase().next().unwrap_or(c),
+        _ => {
+            if c.is_uppercase() {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                c.to_uppercase().next().unwrap_or(c)
+            }
+        }
+    };
+    let buf = &editor.cur_buffer().text;
+    let last = buf.line_count().saturating_sub(1);
+    match span.kind {
+        MotionKind::Linewise => {
+            let (l0, l1) = (span.start.line.min(last), span.end.line.min(last));
+            let new: Vec<String> = (l0..=l1)
+                .map(|i| buf.line(i).unwrap_or_default().chars().map(transform).collect())
+                .collect();
+            replace_lines(editor, l0, l1 + 1, &new);
+            commit_undo(editor, Position::new(l0, 0));
+            OperatorOutcome { cursor: Position::new(l0, 0), enter_insert: false }
+        }
+        kind => {
+            // Charwise: single line only (multi-line case is rare; extend later).
+            let inclusive = matches!(kind, MotionKind::CharInclusive);
+            let line = buf.line(span.start.line).unwrap_or_default();
+            let chars: Vec<char> = line.chars().collect();
+            let s = span.start.col.min(chars.len());
+            let mut e = span.end.col.min(chars.len());
+            if inclusive {
+                e = (e + 1).min(chars.len());
+            }
+            let new_line: String = chars
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| if i >= s && i < e { transform(c) } else { c })
+                .collect();
+            replace_lines(editor, span.start.line, span.start.line + 1, &[new_line]);
+            commit_undo(editor, span.start);
+            OperatorOutcome { cursor: span.start, enter_insert: false }
+        }
     }
 }
 
@@ -187,7 +274,9 @@ fn extract_charwise(buf: &ctrlvim_text::Buffer, start: Position, end: Position) 
 fn route_to_register(editor: &mut Editor, op: Operator, reg: Option<char>, yreg: YankReg) {
     match op {
         Operator::Yank => editor.registers.yank(reg, yreg),
-        Operator::Delete | Operator::Change => editor.registers.delete(reg, yreg),
+        // Only Delete/Change reach here; the transform operators are handled
+        // before any register routing.
+        _ => editor.registers.delete(reg, yreg),
     }
 }
 

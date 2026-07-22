@@ -299,12 +299,153 @@ fn word_end_once(buf: &Buffer, pos: Position, big: bool) -> Position {
     }
 }
 
+/// `f`/`F`/`t`/`T` — find `target` on the current line. `forward` picks the
+/// direction; `till` (t/T) stops one column short of the target. Forward finds
+/// are inclusive, backward finds are exclusive, which makes `df)`/`dF(` delete
+/// the right span through [`crate::operator::OperatorSpan::from_motion`].
+/// Returns `None` when the char (or enough of them) isn't found.
+pub fn find_char(
+    buf: &Buffer,
+    pos: Position,
+    target: char,
+    count: usize,
+    forward: bool,
+    till: bool,
+) -> Option<MotionResult> {
+    let chars = line_chars(buf, pos.line);
+    let n = chars.len() as isize;
+    let mut col = pos.col as isize;
+    let mut remaining = count.max(1);
+    let target_col = loop {
+        col += if forward { 1 } else { -1 };
+        if col < 0 || col >= n {
+            return None;
+        }
+        if chars[col as usize] == target {
+            remaining -= 1;
+            if remaining == 0 {
+                break col as usize;
+            }
+        }
+    };
+    let final_col = if till {
+        if forward { target_col.saturating_sub(1) } else { target_col + 1 }
+    } else {
+        target_col
+    };
+    let kind = if forward { MotionKind::CharInclusive } else { MotionKind::CharExclusive };
+    Some(MotionResult { target: Position::new(pos.line, final_col), kind })
+}
+
+/// `%` — jump to the bracket matching the first `()[]{}` at or after the cursor
+/// on the current line. Inclusive. `None` when there's no bracket / no match.
+pub fn match_pair(buf: &Buffer, pos: Position) -> Option<MotionResult> {
+    const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+    let chars = line_chars(buf, pos.line);
+    // Find the first bracket at or after the cursor on this line.
+    let (bcol, &bracket) = chars.iter().enumerate().skip(pos.col).find(|(_, c)| {
+        PAIRS.iter().any(|(o, cl)| **c == *o || **c == *cl)
+    })?;
+    let (open, close, forward) = PAIRS
+        .iter()
+        .find_map(|&(o, cl)| {
+            if bracket == o {
+                Some((o, cl, true))
+            } else if bracket == cl {
+                Some((o, cl, false))
+            } else {
+                None
+            }
+        })?;
+
+    let total = buf.line_count();
+    let mut depth = 0i32;
+    let (mut line, mut col) = (pos.line, bcol);
+    loop {
+        let cur = line_chars(buf, line);
+        if col < cur.len() {
+            let c = cur[col];
+            if c == open {
+                depth += if forward { 1 } else { -1 };
+            } else if c == close {
+                depth += if forward { -1 } else { 1 };
+            }
+            if depth == 0 {
+                return Some(MotionResult {
+                    target: Position::new(line, col),
+                    kind: MotionKind::CharInclusive,
+                });
+            }
+        }
+        if forward {
+            col += 1;
+            if col >= cur.len() {
+                line += 1;
+                col = 0;
+                if line >= total {
+                    return None;
+                }
+            }
+        } else {
+            if col == 0 {
+                if line == 0 {
+                    return None;
+                }
+                line -= 1;
+                col = line_chars(buf, line).len().saturating_sub(1);
+            } else {
+                col -= 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn buf(lines: &[&str]) -> Buffer {
         Buffer::from_lines(lines)
+    }
+
+    #[test]
+    fn find_char_forward_and_till() {
+        let b = buf(&["foo.bar.baz"]);
+        // f. -> first dot at col 3
+        assert_eq!(find_char(&b, Position::new(0, 0), '.', 1, true, false).unwrap().target.col, 3);
+        // 2f. -> second dot at col 7
+        assert_eq!(find_char(&b, Position::new(0, 0), '.', 2, true, false).unwrap().target.col, 7);
+        // t. -> one before the first dot
+        assert_eq!(find_char(&b, Position::new(0, 0), '.', 1, true, true).unwrap().target.col, 2);
+        // missing char
+        assert!(find_char(&b, Position::new(0, 0), 'z', 5, true, false).is_none());
+    }
+
+    #[test]
+    fn find_char_backward() {
+        let b = buf(&["foo.bar"]);
+        // F. from end -> the dot, exclusive
+        let r = find_char(&b, Position::new(0, 6), '.', 1, false, false).unwrap();
+        assert_eq!(r.target.col, 3);
+        assert_eq!(r.kind, MotionKind::CharExclusive);
+    }
+
+    #[test]
+    fn match_pair_same_line_and_nested() {
+        let b = buf(&["a(b(c)d)e"]);
+        // From the first '(' (col 1) -> matching ')' at col 7.
+        assert_eq!(match_pair(&b, Position::new(0, 1)).unwrap().target.col, 7);
+        // From the inner ')' (col 5) backward -> inner '(' at col 3.
+        assert_eq!(match_pair(&b, Position::new(0, 5)).unwrap().target.col, 3);
+        // Cursor before a bracket skips forward to it.
+        assert_eq!(match_pair(&b, Position::new(0, 0)).unwrap().target.col, 7);
+    }
+
+    #[test]
+    fn match_pair_across_lines() {
+        let b = buf(&["foo(", "  bar", ")"]);
+        let r = match_pair(&b, Position::new(0, 3)).unwrap();
+        assert_eq!((r.target.line, r.target.col), (2, 0));
     }
 
     #[test]

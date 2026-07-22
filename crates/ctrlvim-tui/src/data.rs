@@ -7,9 +7,12 @@
 //! that don't exist yield truthful empty state rather than mock data.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime};
+
+use ratatui::style::Color;
 
 use crate::model::{
     icon_for, FileEntry, GitStatus, LspServer, Plugin, PluginStatus, SessionEntry, Stats,
@@ -134,6 +137,134 @@ fn count_loc(root: &Path, scanned: &[Scanned]) -> usize {
         .sum()
 }
 
+// --- file browser listing --------------------------------------------------
+
+/// One row in the fuzzy file browser: name, disk metadata, and an icon.
+#[derive(Clone)]
+pub struct FinderEntry {
+    /// Display name; directories keep a trailing `/`.
+    pub name: String,
+    /// Absolute path (for directories, the directory to descend into).
+    pub path: PathBuf,
+    pub is_dir: bool,
+    /// `ls -l`-style permission bits, e.g. `drwxr-xr-x`.
+    pub perms: String,
+    /// Human size, e.g. `6.6K` (empty for the `../` row).
+    pub size: String,
+    /// Modified time, e.g. `Jul 06 13:24` (empty for the `../` row).
+    pub mtime: String,
+    pub icon_letter: char,
+    pub icon_color: Color,
+}
+
+/// List `dir` for the browser: directories first, then files (each group
+/// case-insensitively sorted), with a trailing `../` to ascend.
+pub fn list_dir(dir: &Path) -> Vec<FinderEntry> {
+    let (mut dirs, mut files): (Vec<FinderEntry>, Vec<FinderEntry>) = (Vec::new(), Vec::new());
+    if let Ok(read) = fs::read_dir(dir) {
+        for entry in read.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            let is_dir = meta.is_dir();
+            let raw = entry.file_name().to_string_lossy().into_owned();
+            let (icon_letter, icon_color) =
+                if is_dir { ('/', crate::theme::blue()) } else { icon_for(&raw) };
+            let e = FinderEntry {
+                name: if is_dir { format!("{raw}/") } else { raw },
+                path: entry.path(),
+                is_dir,
+                perms: perms_string(meta.permissions().mode(), is_dir),
+                size: human_size(meta.len()),
+                mtime: fmt_mtime(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+                icon_letter,
+                icon_color,
+            };
+            if is_dir { dirs.push(e) } else { files.push(e) }
+        }
+    }
+    let by_name = |a: &FinderEntry, b: &FinderEntry| {
+        a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+    };
+    dirs.sort_by(by_name);
+    files.sort_by(by_name);
+    dirs.append(&mut files);
+    // `../` pinned at the bottom, unless we're already at the filesystem root.
+    if let Some(parent) = dir.parent() {
+        dirs.push(FinderEntry {
+            name: "../".into(),
+            perms: fs::metadata(parent)
+                .map(|m| perms_string(m.permissions().mode(), true))
+                .unwrap_or_else(|_| "drwxr-xr-x".into()),
+            path: parent.to_path_buf(),
+            is_dir: true,
+            size: String::new(),
+            mtime: String::new(),
+            icon_letter: '/',
+            icon_color: crate::theme::blue(),
+        });
+    }
+    dirs
+}
+
+/// Render Unix mode bits as a `drwxr-xr-x` string.
+fn perms_string(mode: u32, is_dir: bool) -> String {
+    let mut s = String::with_capacity(10);
+    s.push(if is_dir { 'd' } else { '-' });
+    const BITS: [(u32, char); 9] = [
+        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
+        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
+        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+    ];
+    for (bit, ch) in BITS {
+        s.push(if mode & bit != 0 { ch } else { '-' });
+    }
+    s
+}
+
+/// Human-readable byte size: `< 1024` shown raw, otherwise `6.6K` / `10K` / `1.2M`.
+fn human_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return bytes.to_string();
+    }
+    const UNITS: [&str; 4] = ["K", "M", "G", "T"];
+    let mut v = bytes as f64 / 1024.0;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if v < 10.0 {
+        format!("{v:.1}{}", UNITS[u])
+    } else {
+        format!("{v:.0}{}", UNITS[u])
+    }
+}
+
+/// Format a modification time as `Mon DD HH:MM` (UTC — good enough for a list).
+fn fmt_mtime(t: SystemTime) -> String {
+    let secs = t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    let (days, tod) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (hour, min) = (tod / 3600, (tod % 3600) / 60);
+    let (_y, m, d) = civil_from_days(days);
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!("{} {:02} {:02}:{:02}", MON[(m - 1) as usize], d, hour, min)
+}
+
+/// Howard Hinnant's civil-from-days: `z` days since 1970-01-01 → (year, month, day).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 // --- git -------------------------------------------------------------------
 
 fn load_git(root: &Path) -> Option<GitStatus> {
@@ -198,13 +329,24 @@ fn load_git(root: &Path) -> Option<GitStatus> {
 // --- lsp / plugins / sessions ---------------------------------------------
 
 fn detect_lsp() -> Vec<LspServer> {
-    // (display name, filetypes, candidate binaries on PATH)
+    // Language servers are named after their nvim-lspconfig identifiers so the
+    // same config vocabulary carries over; build linkers are surfaced as extra
+    // rows (filetypes = "linker"). (name, filetypes, candidate binaries on PATH)
     let known: &[(&str, &str, &[&str])] = &[
-        ("rust-analyzer", "rust", &["rust-analyzer"]),
+        ("rust_analyzer", "rust", &["rust-analyzer"]),
         ("taplo", "toml", &["taplo"]),
         ("lua_ls", "lua", &["lua-language-server", "lua_ls"]),
         ("marksman", "markdown", &["marksman"]),
-        ("tsserver", "ts, tsx, js, jsx", &["typescript-language-server", "tsserver"]),
+        ("ts_ls", "ts, tsx, js, jsx", &["typescript-language-server", "tsserver"]),
+        ("jdtls", "java (maven/gradle)", &["jdtls"]),
+        ("lemminx", "xml (pom.xml)", &["lemminx"]),
+        ("mesonlsp", "meson", &["mesonlsp", "Swift-MesonLSP"]),
+        // Build linkers.
+        ("mold", "linker", &["mold", "ld.mold"]),
+        ("lld", "linker", &["ld.lld", "lld"]),
+        ("wild", "linker", &["wild"]),
+        ("gold", "linker", &["ld.gold", "gold"]),
+        ("ld.bfd", "linker", &["ld.bfd", "ld"]),
     ];
     known
         .iter()
@@ -309,11 +451,35 @@ fn git_remote(dir: &Path) -> Option<String> {
     (!short.is_empty()).then_some(short)
 }
 
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| home().map(|h| h.join(".config")))
+}
+
+/// Path of the file the chosen theme name is persisted to.
+fn theme_store() -> Option<PathBuf> {
+    state_dir().map(|s| s.join("ctrlvim").join("theme"))
+}
+
+/// The theme name saved from a previous session, if any.
+pub fn saved_theme() -> Option<String> {
+    let path = theme_store()?;
+    let name = std::fs::read_to_string(path).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Persist the chosen theme name so the next launch restores it. Best-effort:
+/// failures (no state dir, unwritable) are silently ignored.
+pub fn save_theme(name: &str) {
+    if let Some(path) = theme_store() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, name);
+    }
 }
 
 fn state_dir() -> Option<PathBuf> {
