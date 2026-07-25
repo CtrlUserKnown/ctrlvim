@@ -25,8 +25,28 @@ cargo run -p ctrlvim-tui --example snapshot -- grid   # print a text snapshot of
   it into the engine and the buffer is edited for real — motions, operators,
   and insert mode all run in `ctrlvim-core`, with the cursor and mode driven by
   the backend.
+- **Tree-sitter syntax highlighting** for filetypes the engine ships a grammar
+  for (Rust, JSON). `ctrlvim-core::syntax` returns per-line spans classed as
+  keyword/type/string/…; `theme::syn_style` dresses them in the active theme, so
+  highlighting follows a `:colorscheme` change. Only the visible rows are
+  highlighted, cached until the buffer or viewport changes.
 - Floating **file explorer** (`Ctrl+B`), **command palette** (`:`), and
   **help** (`?`) overlays, dismissable with `Esc` or a click outside.
+- **Tags**: `Ctrl-]` jumps to the definition under the cursor, `Ctrl-T` returns,
+  and `:tag`/`:tnext`/`:tprev`/`:tags` walk the matches. Generate the table with
+  `ctags -R .`; a regenerated file is picked up automatically (the load checks
+  its mtime), and pattern addresses still resolve after the definition moves.
+- **Folds**: `zf{motion}` / `:{range}fold` to create, `za`/`zo`/`zc`, `zR`/`zM`,
+  `zj`/`zk`, `zd`/`zE`, `zi`, and `:set foldmethod=indent`. A closed fold draws a
+  `+--  9 lines: …` summary row; `j`/`k` and scrolling step over it.
+- **Quickfix pane** along the bottom (`:copen`), filled by `:vimgrep /pat/ glob`
+  (in-process) or `:make` / `:grep` (spawned, streaming into the list as they
+  run). `:cnext`/`:cprev`/`:cc` jump; rows are clickable; `j`/`k`/`Enter` work
+  in the pane when no file buffer has focus.
+- **File icons** on every file row (recent files, drawer, explorer): a Nerd Font
+  glyph per filetype, or the lettered chip when no Nerd Font is installed.
+  `icons = "auto" | "nerd" | "text"` in `config.toml` (or the Settings row /
+  `i`) overrides the detection; `CTRLVIM_NERD_FONT=1|0` forces it for `auto`.
 
 ## Keymap
 
@@ -49,6 +69,7 @@ anywhere.
 | `app` | `App` state + `Action` enum; the port of the design prototype's component, plus the owned `ctrlvim_core::Ctrlvim` engine |
 | `input` | keyboard handling: editor-focus routes to the engine, shell keymap otherwise |
 | `model` | domain types + the design's static mock data + file seed text |
+| `icons` | Nerd Font detection + the per-filetype icon table's glyph/text modes |
 | `theme` | Tokyo Night palette constants |
 | `ui/*` | rendering: shell (tab bar/status line), dashboard, plugins, file editor, overlays |
 

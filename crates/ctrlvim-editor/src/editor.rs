@@ -6,6 +6,8 @@
 //! arenas indexed by `Copy` handles, so a stale handle is a clean `None` rather
 //! than a dangling pointer.
 
+use crate::quickfix::QuickfixList;
+use crate::tags::{TagMatches, TagStack, TagTable};
 use crate::window::{Frame, Window};
 use ctrlvim_options::{BufferOptions, GlobalOptions, OptionContext};
 use ctrlvim_text::{Buffer, MarkStore, Registers, UndoTree};
@@ -60,6 +62,16 @@ pub struct Editor {
     pub layout: Frame,
     pub registers: Registers,
     pub global_options: GlobalOptions,
+    /// The quickfix list (`:make`, `:grep`, `:vimgrep`). One global list, as in
+    /// Vim; per-window location lists are a later variant of the same type.
+    pub quickfix: QuickfixList,
+    /// The loaded tags file, filled by the host (`Ctrl-]`, `:tag`).
+    pub tags: TagTable,
+    /// Where `Ctrl-]` jumped from, for `Ctrl-T`.
+    pub tagstack: TagStack,
+    /// The definitions of the name most recently looked up, so `:tnext` /
+    /// `:tprev` can walk an overloaded name.
+    pub tag_matches: Option<TagMatches>,
 }
 
 impl Editor {
@@ -74,6 +86,10 @@ impl Editor {
             layout: Frame::Leaf(WindowId(0)),
             registers: Registers::new(),
             global_options: GlobalOptions::default(),
+            quickfix: QuickfixList::new(),
+            tags: TagTable::new(),
+            tagstack: TagStack::new(),
+            tag_matches: None,
         }
     }
 

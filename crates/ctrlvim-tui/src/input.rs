@@ -238,6 +238,18 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // The quickfix pane owns j/k/Enter while it's open and no file buffer has
+    // focus. From inside a file buffer the keys belong to the editor, so `:cn`
+    // / `:cp` are the way to walk the list there — as in Vim.
+    if app.quickfix_open && !app.editor_focus() {
+        match (key.code, c) {
+            (KeyCode::Down, _) | (_, Some('j')) => { app.move_quickfix_selection(1); return; }
+            (KeyCode::Up, _) | (_, Some('k')) => { app.move_quickfix_selection(-1); return; }
+            (KeyCode::Enter, _) => { app.quickfix_select(app.quickfix_index); return; }
+            _ => {}
+        }
+    }
+
     let on_dashboard = app.is_dashboard();
 
     if on_dashboard && (c == Some('[') || c == Some(']')) {
@@ -246,9 +258,9 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
     }
     if on_dashboard {
         match c {
-            Some('w') => { app.section = DashboardSection::Workspace; return; }
-            Some('s') => { app.section = DashboardSection::Settings; return; }
-            Some('a') => { app.section = DashboardSection::About; return; }
+            Some('1') => { app.section = DashboardSection::Workspace; return; }
+            Some('2') => { app.section = DashboardSection::Settings; return; }
+            Some('3') => { app.section = DashboardSection::About; return; }
             _ => {}
         }
     }
@@ -272,6 +284,7 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         match (key.code, c) {
             (_, Some('d')) => { app.dispatch(Action::ToggleStartupDrawer); return; }
             (_, Some('m')) => { app.dispatch(Action::ToggleMouse); return; }
+            (_, Some('i')) => { app.dispatch(Action::CycleIconMode); return; }
             (KeyCode::Down, _) | (_, Some('j')) => { app.move_settings(1); return; }
             (KeyCode::Up, _) | (_, Some('k')) => { app.move_settings(-1); return; }
             (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {

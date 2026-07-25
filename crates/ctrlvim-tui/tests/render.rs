@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ctrlvim::app::{Action, App, DashboardSection, PanelId};
-use ctrlvim::{input, ui};
+use ctrlvim::{icons, input, ui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -48,6 +48,32 @@ fn render(app: &App, w: u16, h: u16) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Render and keep the cell grid, for assertions about *styling* rather than
+/// text (syntax highlighting, selections).
+fn render_cells(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(w, h);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| {
+        ui::draw(f, app);
+    })
+    .unwrap();
+    term.backend().buffer().clone()
+}
+
+/// The foreground color the cell holding `needle` was drawn with, searching the
+/// rendered grid row by row (the offset within `needle` lets a test pick a
+/// specific character of the match).
+fn fg_of(buf: &ratatui::buffer::Buffer, needle: &str, offset: u16) -> ratatui::style::Color {
+    for y in 0..buf.area.height {
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        if let Some(byte) = row.find(needle) {
+            let col = row[..byte].chars().count() as u16 + offset;
+            return buf[(col, y)].fg;
+        }
+    }
+    panic!("{needle:?} never rendered");
 }
 
 fn contains_all(hay: &str, needles: &[&str]) {
@@ -110,6 +136,22 @@ fn recent_files_reflect_the_real_directory() {
     let out = render(&app, 130, 44);
     // Both real files show up in the Recent Files panel.
     contains_all(&out, &["alpha.rs", "zeta.md"]);
+}
+
+#[test]
+fn file_icons_use_glyphs_or_fall_back_to_a_letter() {
+    let mut app = temp_project(&[("alpha.rs", "a\n"), ("zeta.md", "z\n")]);
+
+    // With a Nerd Font, the chip is the glyph for the file type.
+    app.config.icons = icons::IconMode::Nerd;
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["\u{e7a8}", "\u{e73e}"]); // rust, markdown
+
+    // Without one, it falls back to a letter in the same colored box.
+    app.config.icons = icons::IconMode::Text;
+    let out = render(&app, 130, 44);
+    contains_all(&out, &[" R  alpha.rs", " M  zeta.md"]);
+    assert!(!out.contains('\u{e7a8}'), "no glyphs when falling back to text");
 }
 
 #[test]
@@ -449,6 +491,398 @@ fn markdown_files_live_render_by_default() {
 }
 
 #[test]
+fn rust_buffers_are_syntax_highlighted_by_the_engine() {
+    let src = "// a note\nfn main() {\n    let s = \"hi\";\n}\n";
+    let mut app = temp_project(&[("main.rs", src)]);
+    app.open_file(0);
+    let buf = render_cells(&app, 100, 24);
+
+    // Each class is drawn in the theme's own palette, so the assertions are
+    // against the theme rather than hard-coded colors.
+    // Offset 3, not 0: the cursor sits on the first cell and inverts it.
+    assert_eq!(fg_of(&buf, "// a note", 3), ctrlvim::theme::fg_dim(), "comment");
+    assert_eq!(fg_of(&buf, "fn main", 0), ctrlvim::theme::purple(), "`fn` keyword");
+    assert_eq!(fg_of(&buf, "fn main", 3), ctrlvim::theme::blue(), "function name");
+    assert_eq!(fg_of(&buf, "\"hi\"", 0), ctrlvim::theme::green(), "string");
+    // The status line reports the filetype the highlighter actually used.
+    assert!(render(&app, 100, 24).contains("rust"));
+}
+
+#[test]
+fn unsupported_filetypes_render_plain() {
+    let mut app = temp_project(&[("notes.txt", "fn main() {}\n")]);
+    app.open_file(0);
+    assert!(app.editor_filetype().is_none(), "no grammar for .txt");
+    let buf = render_cells(&app, 100, 24);
+    // The same `fn` that is a keyword in Rust stays default-colored here
+    // (offset 1: the cursor inverts the first cell).
+    assert_eq!(fg_of(&buf, "fn main", 1), ctrlvim::theme::fg());
+}
+
+#[test]
+fn highlights_follow_edits() {
+    let mut app = temp_project(&[("main.rs", "let x = 1;\n")]);
+    app.open_file(0);
+    // Type a comment marker at the start of the line: the whole line becomes a
+    // comment, which only holds if the cache was invalidated by the edit.
+    key(&mut app, 'i');
+    typ(&mut app, "// ");
+    let buf = render_cells(&app, 100, 24);
+    assert_eq!(fg_of(&buf, "// let x", 4), ctrlvim::theme::fg_dim(), "now a comment");
+}
+
+// --- tags ------------------------------------------------------------------
+
+/// A project with two source files and a `tags` file pointing into them, the
+/// way `ctags -R .` would leave it.
+fn tagged_project() -> App {
+    let tags = "\
+!_TAG_FILE_FORMAT\t2\t/extended format/
+Helper\tlib.rs\t/^pub struct Helper {$/;\"\ts
+helper\tlib.rs\t/^pub fn helper() {}$/;\"\tf
+helper\talt.rs\t2;\"\tf
+";
+    let mut app = temp_project(&[
+        ("main.rs", "fn main() {\n    helper();\n}\n"),
+        ("lib.rs", "// lib\npub struct Helper {\n}\npub fn helper() {}\n"),
+        ("alt.rs", "// alt\npub fn helper() {}\n"),
+        ("tags", tags),
+    ]);
+    // main.rs is the file the cursor starts in.
+    let idx = app
+        .project
+        .recent_files
+        .iter()
+        .position(|f| f.name == "main.rs")
+        .expect("main.rs in the project");
+    app.open_file(idx);
+    app
+}
+
+/// `Ctrl-]` as the terminal delivers it.
+fn ctrl_key(app: &mut App, c: char) {
+    input::handle_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+}
+
+#[test]
+fn ctrl_bracket_jumps_to_the_definition() {
+    let mut app = tagged_project();
+    // Put the cursor on `helper` in `    helper();`.
+    key(&mut app, 'j');
+    typ(&mut app, "fh");
+    ctrl_key(&mut app, ']');
+
+    assert_eq!(app.active_buffer().label, "lib.rs", "jumped to the defining file");
+    assert_eq!(app.editor_cursor().0, 3, "onto the `pub fn helper` line");
+}
+
+#[test]
+fn ctrl_t_returns_to_where_the_jump_started() {
+    let mut app = tagged_project();
+    key(&mut app, 'j');
+    typ(&mut app, "fh");
+    ctrl_key(&mut app, ']');
+    assert_eq!(app.active_buffer().label, "lib.rs");
+
+    ctrl_key(&mut app, 't');
+    assert_eq!(app.active_buffer().label, "main.rs", "back to the original file");
+    assert_eq!(app.editor_cursor().0, 1, "and the original line");
+}
+
+#[test]
+fn a_pattern_address_finds_a_definition_that_moved() {
+    let mut app = tagged_project();
+    // Insert a line at the top of lib.rs so the definition shifts down.
+    let lib = app.root.join("lib.rs");
+    let text = std::fs::read_to_string(&lib).unwrap();
+    std::fs::write(&lib, format!("// added\n{}", text)).unwrap();
+
+    key(&mut app, 'j');
+    typ(&mut app, "fh");
+    ctrl_key(&mut app, ']');
+    assert_eq!(app.active_buffer().label, "lib.rs");
+    assert_eq!(app.editor_cursor().0, 4, "the pattern tracked the shifted line");
+}
+
+#[test]
+fn an_unknown_identifier_reports_rather_than_jumping() {
+    let mut app = tagged_project();
+    typ(&mut app, "fm"); // `main`, which is not in the tags file
+    ctrl_key(&mut app, ']');
+    assert_eq!(app.active_buffer().label, "main.rs", "stayed put");
+    assert!(app.message.contains("E426"), "got {:?}", app.message);
+}
+
+#[test]
+fn tnext_walks_a_name_with_two_definitions() {
+    let mut app = tagged_project();
+    key(&mut app, 'j');
+    typ(&mut app, "fh");
+    ctrl_key(&mut app, ']');
+    assert_eq!(app.active_buffer().label, "lib.rs");
+    assert!(app.message.contains("1 of 2"), "got {:?}", app.message);
+
+    typ(&mut app, ":tnext");
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.active_buffer().label, "alt.rs", "second definition");
+    assert!(app.message.contains("2 of 2"), "got {:?}", app.message);
+}
+
+#[test]
+fn a_regenerated_tags_file_is_picked_up_without_a_reload() {
+    let mut app = tagged_project();
+    // Rewrite the tags file to point `helper` somewhere else entirely.
+    std::fs::write(
+        app.root.join("tags"),
+        "helper\talt.rs\t/^pub fn helper() {}$/;\"\tf\n",
+    )
+    .unwrap();
+    // Ensure the mtime differs even on a coarse-grained filesystem.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    let _ = filetime_set(&app.root.join("tags"), later);
+
+    key(&mut app, 'j');
+    typ(&mut app, "fh");
+    ctrl_key(&mut app, ']');
+    assert_eq!(app.active_buffer().label, "alt.rs", "used the new tags file");
+}
+
+/// Nudge a file's mtime forward (no external crate; best-effort).
+fn filetime_set(path: &std::path::Path, when: std::time::SystemTime) -> std::io::Result<()> {
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    file.set_modified(when)
+}
+
+#[test]
+fn tags_with_no_tags_file_reports_clearly() {
+    let mut app = temp_project(&[("main.rs", "fn main() { helper(); }\n")]);
+    app.open_file(0);
+    typ(&mut app, "fh");
+    ctrl_key(&mut app, ']');
+    assert!(app.message.contains("E433"), "got {:?}", app.message);
+}
+
+// --- folds -----------------------------------------------------------------
+
+/// A file buffer of `fn` blocks, opened and ready for `z` commands.
+fn foldable_project() -> App {
+    let src = "fn one() {\n    a;\n    b;\n}\nfn two() {\n    c;\n}\nlast\n";
+    let mut app = temp_project(&[("main.rs", src)]);
+    app.open_file(0);
+    app
+}
+
+#[test]
+fn a_closed_fold_draws_one_summary_row_and_hides_the_rest() {
+    let mut app = foldable_project();
+    typ(&mut app, "zf3j"); // fold lines 1..=4 (0-based 0..=3)
+    let out = render(&app, 100, 30);
+    contains_all(&out, &["4 lines: fn one() {"]);
+    assert!(!out.contains("    a;"), "the fold's body is hidden:\n{out}");
+    // Lines after the fold are still there, moved up.
+    contains_all(&out, &["fn two() {", "last"]);
+}
+
+#[test]
+fn opening_the_fold_brings_the_lines_back() {
+    let mut app = foldable_project();
+    typ(&mut app, "zf3j");
+    assert!(!render(&app, 100, 30).contains("    a;"));
+    typ(&mut app, "zo");
+    let out = render(&app, 100, 30);
+    assert!(out.contains("    a;"));
+    assert!(!out.contains("4 lines:"), "no summary row once open:\n{out}");
+}
+
+#[test]
+fn line_numbers_stay_with_their_lines_across_a_fold() {
+    let mut app = foldable_project();
+    typ(&mut app, "zf3j");
+    let out = render(&app, 100, 30);
+    // The row after the summary is buffer line 5, and keeps its own number —
+    // the gutter numbers buffer lines, not screen rows.
+    let row = out
+        .lines()
+        .find(|l| l.contains("fn two()"))
+        .expect("fn two() should render");
+    assert!(row.trim_start().starts_with('5'), "expected line number 5 in {row:?}");
+}
+
+#[test]
+fn the_cursor_never_lands_inside_a_closed_fold() {
+    let mut app = foldable_project();
+    typ(&mut app, "zf3j");
+    assert_eq!(app.editor_cursor().0, 0);
+    key(&mut app, 'j');
+    assert_eq!(app.editor_cursor().0, 4, "one press clears the whole fold");
+    // And the rendered cursor is on a row that exists.
+    let out = render(&app, 100, 30);
+    assert!(out.contains("fn two() {"));
+}
+
+#[test]
+fn syntax_highlighting_follows_the_lines_a_fold_shifts() {
+    let mut app = foldable_project();
+    app.config.icons = icons::IconMode::Text; // keep the chip out of the way
+    typ(&mut app, "zf3j");
+    let buf = render_cells(&app, 100, 30);
+    // `fn` on the *shifted* row is still a keyword: the highlight span lookup
+    // must index by buffer line, not screen row.
+    assert_eq!(fg_of(&buf, "fn two", 0), ctrlvim::theme::purple());
+}
+
+#[test]
+fn folds_survive_scrolling_past_them() {
+    // A buffer taller than the viewport, with a fold above the visible area.
+    let mut src = String::from("fn head() {\n    x;\n    y;\n}\n");
+    for i in 0..60 {
+        src.push_str(&format!("line {i}\n"));
+    }
+    let mut app = temp_project(&[("big.rs", &src)]);
+    app.open_file(0);
+    typ(&mut app, "zf3j"); // fold the first 4 lines
+    typ(&mut app, "G"); // jump to the end
+    let out = render(&app, 100, 20);
+    assert!(out.contains("line 59"), "the end of the buffer is visible:\n{out}");
+    assert!(!out.contains("4 lines: fn head"), "the fold scrolled off the top");
+}
+
+#[test]
+fn set_foldmethod_indent_folds_without_zf() {
+    let mut app = foldable_project();
+    typ(&mut app, ":set shiftwidth=4");
+    press(&mut app, KeyCode::Enter);
+    typ(&mut app, ":set foldmethod=indent");
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.folds().is_empty(), "indent derived some folds");
+    // Derived folds start open, so nothing is hidden until zM.
+    assert!(render(&app, 100, 30).contains("    a;"));
+    typ(&mut app, "zM");
+    let out = render(&app, 100, 30);
+    assert!(!out.contains("    a;"), "zM closed them:\n{out}");
+}
+
+// --- quickfix --------------------------------------------------------------
+
+/// Run `:vimgrep` over a temp project the way a user would type it.
+fn vimgrep(app: &mut App, cmd: &str) {
+    typ(app, cmd);
+    press(app, KeyCode::Enter);
+}
+
+#[test]
+fn vimgrep_fills_the_quickfix_list_and_opens_the_pane() {
+    let mut app = temp_project(&[
+        ("a.rs", "fn one() {}\nlet x = 1;\n"),
+        ("b.rs", "fn two() {}\n"),
+        ("notes.txt", "fn in a text file\n"),
+    ]);
+    app.open_file(0);
+    vimgrep(&mut app, ":vimgrep /fn / *.rs");
+
+    let qf = app.engine.session.quickfix();
+    assert_eq!(qf.len(), 2, "two Rust hits; the .txt is excluded by the glob");
+    assert!(app.quickfix_open, "a non-empty result opens the pane");
+
+    let out = render(&app, 120, 40);
+    contains_all(&out, &["a.rs:1", "b.rs:1", "fn one() {}", "entries"]);
+}
+
+#[test]
+fn vimgrep_with_no_matches_reports_instead_of_opening() {
+    let mut app = temp_project(&[("a.rs", "fn one() {}\n")]);
+    app.open_file(0);
+    vimgrep(&mut app, ":vimgrep /nonexistent/");
+    assert!(app.engine.session.quickfix().is_empty());
+    assert!(!app.quickfix_open, "an empty result must not open an empty pane");
+    assert!(app.message.contains("no matches"), "got {:?}", app.message);
+}
+
+#[test]
+fn an_invalid_pattern_reports_rather_than_panicking() {
+    let mut app = temp_project(&[("a.rs", "x\n")]);
+    app.open_file(0);
+    vimgrep(&mut app, ":vimgrep /[unclosed/");
+    assert!(app.message.contains("E486"), "got {:?}", app.message);
+}
+
+#[test]
+fn cnext_walks_the_list_and_opens_the_right_file_and_line() {
+    let mut app = temp_project(&[("a.rs", "one\nTARGET here\n"), ("b.rs", "TARGET again\n")]);
+    app.open_file(0);
+    vimgrep(&mut app, ":vimgrep /TARGET/");
+    assert_eq!(app.engine.session.quickfix().len(), 2);
+
+    // The first entry is selected but not jumped to until :cc/:cnext.
+    vimgrep(&mut app, ":cc 1");
+    let first = app.active_buffer().label.clone();
+    assert_eq!(app.editor_cursor().0, 1, "a.rs match is on line 2 (0-based 1)");
+
+    vimgrep(&mut app, ":cnext");
+    assert_ne!(app.active_buffer().label, first, "moved to the other file");
+    assert_eq!(app.editor_cursor().0, 0, "b.rs match is on line 1");
+}
+
+#[test]
+fn quickfix_rows_are_clickable() {
+    let mut app = temp_project(&[("a.rs", "hit one\nhit two\n")]);
+    app.open_file(0);
+    vimgrep(&mut app, ":vimgrep /hit/");
+
+    let backend = TestBackend::new(120, 40);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut zones = ui::Zones::default();
+    term.draw(|f| zones = ui::draw(f, &app)).unwrap();
+
+    // Find the zone for the second entry and dispatch it, as a click would.
+    let hit = (0..40)
+        .flat_map(|y| (0..120).map(move |x| (x, y)))
+        .find_map(|(x, y)| match zones.hit(x, y) {
+            Some(Action::QuickfixSelect(1)) => Some(()),
+            _ => None,
+        });
+    assert!(hit.is_some(), "the second quickfix row registered no click zone");
+
+    app.dispatch(Action::QuickfixSelect(1));
+    assert_eq!(app.editor_cursor().0, 1, "clicking the row jumped to its line");
+}
+
+#[test]
+fn closing_the_pane_gives_the_space_back_to_the_editor() {
+    let mut app = temp_project(&[("a.rs", "hit\n")]);
+    app.open_file(0);
+    vimgrep(&mut app, ":vimgrep /hit/");
+    // `a.rs:1` is a pane row — the status message mentions the file but never
+    // in `path:line` form.
+    assert!(render(&app, 120, 40).contains("a.rs:1"));
+    vimgrep(&mut app, ":cclose");
+    assert!(!app.quickfix_open);
+    assert!(!render(&app, 120, 40).contains("a.rs:1"));
+}
+
+#[test]
+fn globs_select_files_the_way_vimgrep_expects() {
+    use ctrlvim::app::glob_match;
+    assert!(glob_match("src/main.rs", "*.rs"), "a bare pattern matches the file name");
+    assert!(glob_match("a/b/c/deep.rs", "**/*.rs"));
+    assert!(glob_match("src/main.rs", "src/*.rs"));
+    assert!(!glob_match("tests/main.rs", "src/*.rs"));
+    assert!(!glob_match("src/a/b.rs", "src/*.rs"), "a single * stays inside one segment");
+    assert!(glob_match("src/a/b.rs", "src/**/*.rs"));
+    assert!(glob_match("src/main.rs", "**/*.rs"), "**/ also matches zero directories");
+    assert!(glob_match("anything", ""), "an empty glob matches everything");
+}
+
+#[test]
+fn markdown_rendering_wins_over_syntax_highlighting() {
+    // Both decorate a buffer; markdown's live render owns the styling when on.
+    let mut app = temp_project(&[("doc.md", DOC)]);
+    app.open_file(0);
+    assert!(app.md_render_active());
+    assert!(app.editor_highlights(&app.editor_lines(), 0, 10).is_empty());
+}
+
+#[test]
 fn markdown_toggle_shows_raw_source() {
     let mut app = temp_project(&[("doc.md", DOC)]);
     app.open_file(0);
@@ -691,7 +1125,9 @@ fn settings_navigation_spans_options_and_lsp() {
     app.move_settings(1);
     assert_eq!(app.settings_index, 1); // mouse option
     app.move_settings(1);
-    assert_eq!(app.settings_index, 2, "j continues into the LSP list");
+    assert_eq!(app.settings_index, 2); // file-icons option
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 3, "j continues into the LSP list");
     // Toggling the focused LSP flips its enabled state (no disk write).
     let before = app.lsp_enabled[0];
     app.settings_toggle();

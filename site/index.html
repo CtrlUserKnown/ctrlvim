@@ -5,237 +5,334 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ctrlvim — Neovim's Core, Rewritten in Rust</title>
   <meta name="description" content="A Rust reimplementation of Neovim's editing core with a Ratatui terminal frontend. Rope-backed buffers, modal editing, Lua runtime, and more.">
+  <meta name="color-scheme" content="dark">
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⌨</text></svg>">
 </head>
 <body>
 
-  <nav class="topbar">
-    <div class="container topbar-inner">
-      <a href="#" class="logo">ctrlvim</a>
-      <div class="topbar-links">
-        <a href="#features">Features</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#quickstart">Quick Start</a>
-        <a href="https://github.com/CtrlUserKnown/ctrlvim" class="github-link">GitHub</a>
+<div id="editor">
+
+  <!-- ── tabline ─────────────────────────────────────────────── -->
+  <div class="tabline" id="tabline" role="tablist" aria-label="Buffers"></div>
+
+  <!-- ── window ──────────────────────────────────────────────── -->
+  <div class="viewport" id="viewport" tabindex="-1">
+
+    <!-- ══ 1: README.md ══════════════════════════════════════ -->
+    <section class="buf active" data-name="README.md" data-ft="markdown" data-icon="" id="buf-readme">
+      <div class="l"><span class="h1"># ctrlvim</span></div>
+      <div class="l"></div>
+      <div class="art" aria-label="ctrlvim">
+        <div class="l"><span class="lg"> ██████╗████████╗██████╗ ██╗     ██╗   ██╗██╗███╗   ███╗</span></div>
+        <div class="l"><span class="lg">██╔════╝╚══██╔══╝██╔══██╗██║     ██║   ██║██║████╗ ████║</span></div>
+        <div class="l"><span class="lg">██║        ██║   ██████╔╝██║     ██║   ██║██║██╔████╔██║</span></div>
+        <div class="l"><span class="lg">██║        ██║   ██╔══██╗██║     ╚██╗ ██╔╝██║██║╚██╔╝██║</span></div>
+        <div class="l"><span class="lg">╚██████╗   ██║   ██║  ██║███████╗ ╚████╔╝ ██║██║ ╚═╝ ██║</span></div>
+        <div class="l"><span class="lg"> ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝  ╚═══╝  ╚═╝╚═╝     ╚═╝</span></div>
       </div>
+      <div class="l"></div>
+      <div class="l"><span class="quote">&gt; Neovim's core, rewritten in Rust. Same modes, same motions, zero C.</span></div>
+      <div class="l"></div>
+      <div class="l">ctrlvim is a from-scratch Rust reimplementation of Neovim's editing</div>
+      <div class="l">engine — rope buffers, the mode state machine, the ex-command layer,</div>
+      <div class="l">a Lua runtime — with a Ratatui-powered terminal frontend on top.</div>
+      <div class="l"></div>
+      <div class="box">
+        <div class="l"><span class="dim">╭─────────────────────────────────────────────╮</span></div>
+        <div class="l"><span class="dim">│</span> <span class="green">13 crates</span> <span class="dim">·</span> <span class="green">176 tests</span> <span class="dim">·</span> <span class="green">zero C</span> <span class="dim">·</span> <span class="green">Apache-2.0</span> <span class="dim">│</span></div>
+        <div class="l"><span class="dim">╰─────────────────────────────────────────────╯</span></div>
+      </div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Run it</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="dim">$</span> git clone <span class="s">https://github.com/CtrlUserKnown/ctrlvim.git</span></div>
+      <div class="l">  <span class="dim">$</span> cd ctrlvim</div>
+      <div class="l">  <span class="dim">$</span> cargo run -p ctrlvim-tui</div>
+      <div class="l"></div>
+      <div class="l">  <span class="dim">   Compiling</span> ctrlvim v0.1.0</div>
+      <div class="l">  <span class="dim">    Finished</span> `release` profile [optimized] target(s)</div>
+      <div class="l">  <span class="green">     Running</span> `target/release/cvi`</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Navigating this page</span></div>
+      <div class="l"></div>
+      <div class="l">This site is the editor. It answers to the same keys ctrlvim does:</div>
+      <div class="l"></div>
+      <div class="l">  <span class="key">:</span>         open the command palette</div>
+      <div class="l">  <span class="key">j</span> <span class="dim">/</span> <span class="key">k</span>     move the cursor down / up</div>
+      <div class="l">  <span class="key">gt</span> <span class="dim">/</span> <span class="key">gT</span>   next / previous buffer <span class="dim">(or press 1–5)</span></div>
+      <div class="l">  <span class="key">/</span>         search this buffer, <span class="key">n</span> <span class="dim">/</span> <span class="key">N</span> to cycle hits</div>
+      <div class="l">  <span class="key">?</span>         the full keymap</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Links</span></div>
+      <div class="l"></div>
+      <div class="l">  <a href="https://github.com/CtrlUserKnown/ctrlvim">github.com/CtrlUserKnown/ctrlvim</a> <span class="dim">— source, issues, releases</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c">Early-stage but functional. Contributions and issues welcome.</span></div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 2: features.rs ════════════════════════════════════ -->
+    <section class="buf" data-name="features.rs" data-ft="rust" data-icon="" id="buf-features">
+      <div class="l"><span class="c">//! What's in the box — all of it implemented today.</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="k">pub const</span> <span class="cn">FEATURES</span><span class="op">:</span> <span class="op">&amp;[</span><span class="t">Feature</span><span class="op">] =</span> <span class="op">&amp;[</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Buffer engine"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Rope-backed buffers with a unified mark tree, an undo</span></div>
+      <div class="l">               <span class="s">tree with branch traversal (g- / g+), register ring."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Modal editing"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Normal, Insert, Visual and Cmdline modes with full</span></div>
+      <div class="l">               <span class="s">motions, operators and text objects."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Ex-commands"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Ranges, :s and :g, :set, :map, :command, :let, :echo,</span></div>
+      <div class="l">               <span class="s">:lua, :source — search with hlsearch and :noh."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Lua runtime"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"mlua-based Lua 5.4 with vim.api.*, vim.fn.*,</span></div>
+      <div class="l">               <span class="s">vim.keymap and vim.treesitter bridges."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Syntax highlighting"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"tree-sitter 0.26 highlighting with cached query</span></div>
+      <div class="l">               <span class="s">compilation and viewport windowing."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Async I/O"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Tokio event loop with timers, jobs and a</span></div>
+      <div class="l">               <span class="s">msgpack-RPC codec for plugins and UIs."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Windows &amp; tabs"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Split frame tree driven by &lt;C-w&gt;, plus gt / gT</span></div>
+      <div class="l">               <span class="s">tab switching."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Vimscript"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Tree-walking interpreter: let, if, for, while,</span></div>
+      <div class="l">               <span class="s">function — the essentials."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"TUI frontend"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Ratatui dashboard, file browser, fuzzy finder,</span></div>
+      <div class="l">               <span class="s">floating overlays, 7 themes, mouse support."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Live markdown"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Toggleable in-buffer markdown rendering, no</span></div>
+      <div class="l">               <span class="s">separate preview window."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="op">];</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c">// Next up: incremental parsing, an inline completion popup,</span></div>
+      <div class="l"><span class="c">// and a native Rust LSP engine.</span></div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 3: architecture.md ════════════════════════════════ -->
+    <section class="buf" data-name="architecture.md" data-ft="markdown" data-icon="" id="buf-arch">
+      <div class="l"><span class="h1"># Workspace architecture</span></div>
+      <div class="l"></div>
+      <div class="l">13 crates, strict dependency direction, no global mutable state.</div>
+      <div class="l"></div>
+      <div class="art">
+        <div class="l"><span class="dim">  types ─▶ text ─▶ options ─▶ editor ─▶ vimscript ─▶ api ─▶ lua ─▶ core ─▶ tui</span></div>
+      </div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Crates</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-types</span>       dynamic <span class="t">Object</span>, arena handles, <span class="t">Position</span>/<span class="t">Range</span>, errors</div>
+      <div class="l">                      <span class="dim">└ replaces  object / typval, handles</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-text</span>        rope-backed <span class="t">Buffer</span>, <span class="t">MarkStore</span>, <span class="t">UndoTree</span>, <span class="t">Registers</span></div>
+      <div class="l">                      <span class="dim">└ replaces  memline.c mark.c undo.c register.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-options</span>     three-tier global / buffer / window overrides</div>
+      <div class="l">                      <span class="dim">└ replaces  option.c + options.lua</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-editor</span>      motions, operators, <span class="t">Mode</span> machine, <span class="t">Session</span> dispatch</div>
+      <div class="l">                      <span class="dim">└ replaces  normal.c ops.c textobject.c edit.c state.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-vimscript</span>   minimal Vimscript interpreter with builtins</div>
+      <div class="l">                      <span class="dim">└ replaces  eval.c + eval/*.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-treesitter</span>  parse, query, node ranges, highlight spans</div>
+      <div class="l">                      <span class="dim">└ replaces  lua/treesitter.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-api</span>         <span class="t">ApiContext</span>, <span class="a">#[ctrlvim_api]</span> functions, autocmd store</div>
+      <div class="l">                      <span class="dim">└ replaces  src/nvim/api/*.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-lua</span>         mlua embedding, <span class="t">Object</span> ↔ Lua converter, vim.* bridges</div>
+      <div class="l">                      <span class="dim">└ replaces  executor.c converter.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-async</span>       Tokio event loop, timers, jobs, msgpack-RPC codec</div>
+      <div class="l">                      <span class="dim">└ replaces  event/*.c msgpack_rpc/*.c</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-core</span>        the <span class="t">Ctrlvim</span> facade, scripting bridge, demo binary</div>
+      <div class="l">                      <span class="dim">└ replaces  startup wiring</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="cy">ctrlvim-tui</span>         Ratatui + crossterm frontend</div>
+      <div class="l">                      <span class="dim">└ replaces  (the UI, split out)</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Design principles</span></div>
+      <div class="l"></div>
+      <div class="box">
+        <div class="l"><span class="dim">╭──────────────────────────────────────────────────────────────────╮</span></div>
+        <div class="l"><span class="dim">│</span> <span class="fg">No global state.</span> Everything threads through an explicit Editor   <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> with copyable integer handles — a stale handle is a clean None.  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span>                                                                  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> <span class="fg">One callback mechanism.</span> Autocmds, keymaps and timers all store   <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> an Object::LuaRef resolved through the same registry.            <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span>                                                                  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> <span class="fg">Codegen via proc-macro.</span> #[ctrlvim_api] on a Rust fn emits both   <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> Lua and RPC dispatch — no C-text parser needed.                  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span>                                                                  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> <span class="fg">Engine first.</span> Editor logic lives in the engine behind a host-    <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> effect boundary; the TUI only draws and forwards keys.           <span class="dim">│</span></div>
+        <div class="l"><span class="dim">╰──────────────────────────────────────────────────────────────────╯</span></div>
+      </div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 4: quickstart.sh ══════════════════════════════════ -->
+    <section class="buf" data-name="quickstart.sh" data-ft="bash" data-icon="" id="buf-quickstart">
+      <div class="l"><span class="c">#!/usr/bin/env bash</span></div>
+      <div class="l"><span class="c"># Requires Rust 1.80+. Clone, test, run.</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># 1. get the source</span></div>
+      <div class="l"><span class="dim">$</span> git clone <span class="s">https://github.com/CtrlUserKnown/ctrlvim.git</span></div>
+      <div class="l"><span class="dim">$</span> cd ctrlvim</div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># 2. prove it works — 176 tests across the workspace</span></div>
+      <div class="l"><span class="dim">$</span> cargo test --workspace</div>
+      <div class="l">  <span class="green">test result: ok. 176 passed; 0 failed</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># 3. launch the terminal UI</span></div>
+      <div class="l"><span class="dim">$</span> cargo run -p ctrlvim-tui</div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># 3b. or drive the engine headlessly</span></div>
+      <div class="l"><span class="dim">$</span> cargo run -p ctrlvim-core --bin demo</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## First five minutes</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="key">:</span>              one unified command palette — every ex-command</div>
+      <div class="l">  <span class="key">:dash</span>          jump back to the dashboard <span class="dim">(or &lt;leader&gt;d)</span></div>
+      <div class="l">  <span class="key">:colorscheme</span>   7 themes, persisted to your config</div>
+      <div class="l">  <span class="key">:set number</span>    options are the real three-tier option store</div>
+      <div class="l">  <span class="key">gt</span> <span class="dim">/</span> <span class="key">gT</span>       walk the tabline</div>
+      <div class="l">  <span class="key">?</span>              in-app help</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Config</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="dim">~/.config/ctrlvim/config.toml</span> — written by the TUI Settings pane,</div>
+      <div class="l">so a toggle in the UI is the same thing as an edit on disk.</div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># tip: the whole workspace builds clean on stable</span></div>
+      <div class="l"><span class="dim">$</span> cargo clippy --workspace --all-targets</div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 5: keymaps.txt ════════════════════════════════════ -->
+    <section class="buf" data-name="keymaps.txt" data-ft="help" data-icon="" id="buf-keymaps">
+      <div class="l"><span class="h1">*ctrlvim-site-keymaps*</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">MOTION</span></div>
+      <div class="l">  <span class="key">j</span> <span class="key">k</span> <span class="dim">or</span> <span class="key">↓</span> <span class="key">↑</span>      cursor down / up</div>
+      <div class="l">  <span class="key">gg</span> <span class="dim">/</span> <span class="key">G</span>           first / last line</div>
+      <div class="l">  <span class="key">{</span> <span class="dim">/</span> <span class="key">}</span>             previous / next paragraph</div>
+      <div class="l">  <span class="key">^D</span> <span class="dim">/</span> <span class="key">^U</span>          half page down / up</div>
+      <div class="l">  <span class="key">^F</span> <span class="dim">/</span> <span class="key">^B</span>          full page down / up</div>
+      <div class="l">  <span class="key">zz</span> <span class="key">zt</span> <span class="key">zb</span>        centre / top / bottom the cursor line</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">BUFFERS</span></div>
+      <div class="l">  <span class="key">gt</span> <span class="dim">/</span> <span class="key">gT</span>          next / previous buffer</div>
+      <div class="l">  <span class="key">:bn</span> <span class="dim">/</span> <span class="key">:bp</span>         next / previous buffer</div>
+      <div class="l">  <span class="key">1</span> <span class="dim">…</span> <span class="key">5</span>             jump straight to a buffer</div>
+      <div class="l">  <span class="key">:e</span> <span class="dim">&lt;name&gt;</span>         edit a buffer by name</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">COMMAND LINE</span></div>
+      <div class="l">  <span class="key">:</span>                 open the palette — fuzzy filter, then <span class="key">⏎</span></div>
+      <div class="l">  <span class="key">^N</span> <span class="dim">/</span> <span class="key">^P</span>          next / previous candidate</div>
+      <div class="l">  <span class="key">⇥</span>                 complete the selected command</div>
+      <div class="l">  <span class="key">Esc</span>               dismiss</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">SEARCH</span></div>
+      <div class="l">  <span class="key">/</span> <span class="dim">&lt;pattern&gt;</span>       search the current buffer</div>
+      <div class="l">  <span class="key">n</span> <span class="dim">/</span> <span class="key">N</span>             next / previous match</div>
+      <div class="l">  <span class="key">:noh</span>              clear the highlight</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">OPTIONS</span></div>
+      <div class="l">  <span class="key">:set number</span>       <span class="dim">/</span> <span class="key">:set nonumber</span></div>
+      <div class="l">  <span class="key">:set relativenumber</span></div>
+      <div class="l">  <span class="key">:colorscheme</span> <span class="dim">…</span>    tokyonight, catppuccin, noir-cat,</div>
+      <div class="l">                    rose-pine, gruvbox, habamax</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">OTHER</span></div>
+      <div class="l">  <span class="key">⏎</span> <span class="dim">or</span> <span class="key">gx</span>          follow the link on the cursor line</div>
+      <div class="l">  <span class="key">?</span>                 toggle this help as an overlay</div>
+      <div class="l">  <span class="key">:q</span>                …try it</div>
+      <div class="l"></div>
+      <div class="l"><span class="c">These are the site's keys. The editor itself speaks the real thing:</span></div>
+      <div class="l"><span class="c">operators, text objects, registers, marks, macros, splits.</span></div>
+      <div class="l"></div>
+    </section>
+
+  </div><!-- /viewport -->
+
+  <!-- ── statusline ──────────────────────────────────────────── -->
+  <div class="statusline" id="statusline">
+    <span class="mode" id="mode">NORMAL</span>
+    <span class="branch"> main</span>
+    <span class="fname" id="fname">README.md</span>
+    <span class="pending" id="pending"></span>
+    <span class="msg" id="msg"></span>
+    <span class="sl-right">
+      <span class="hint">: palette</span>
+      <span class="hint">gt tabs</span>
+      <span class="hint">? help</span>
+      <span class="ft" id="ft">markdown</span>
+      <span class="pos" id="pos">1:1</span>
+      <span class="pct" id="pct">Top</span>
+    </span>
+  </div>
+
+  <!-- ── command line ────────────────────────────────────────── -->
+  <div class="cmdline" id="cmdline" hidden>
+    <span class="prompt" id="prompt">:</span><input id="cmdinput" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-label="Command line"><span class="blockcaret" id="blockcaret"></span>
+  </div>
+
+  <!-- ── palette (floats above the cmdline) ──────────────────── -->
+  <div class="palette" id="palette" hidden role="listbox" aria-label="Command palette"></div>
+
+  <!-- ── help overlay ────────────────────────────────────────── -->
+  <div class="overlay" id="help" hidden role="dialog" aria-label="Keymap help">
+    <div class="float">
+      <div class="float-title"> keymaps <span class="dim">— press ? or Esc to close</span></div>
+      <div class="float-body" id="help-body"></div>
     </div>
-  </nav>
+  </div>
 
-  <header class="hero">
-    <div class="container">
-      <div class="hero-badge">Rust · Terminal · Vim</div>
-      <h1>Neovim's Core,<br><span class="accent">Rewritten in Rust.</span></h1>
-      <p class="hero-sub">
-        ctrlvim is a from-scratch Rust reimplementation of Neovim's editing engine
-        with a Ratatui-powered terminal frontend. Same modes, same motions, zero C.
-      </p>
-      <div class="hero-actions">
-        <a href="#quickstart" class="btn btn-primary">Get Started</a>
-        <a href="https://github.com/CtrlUserKnown/ctrlvim" class="btn btn-outline">View on GitHub</a>
-      </div>
-      <div class="hero-code">
-        <pre><code><span class="dim">$</span> cargo run -p ctrlvim-tui
-<span class="dim">   Compiling</span> ctrlvim v0.1.0
-<span class="dim">    Finished</span> `release` profile [optimized] target(s)
-<span class="accent">     Running</span> `target/release/cvi`</code></pre>
-      </div>
-    </div>
-  </header>
+  <!-- touch affordance -->
+  <button class="fab" id="fab" aria-label="Open command palette">:</button>
 
-  <section id="features" class="section">
-    <div class="container">
-      <h2 class="section-title">Built from the Ground Up</h2>
-      <p class="section-sub">Every layer is Rust — from the rope data structure to the terminal renderer.</p>
+</div><!-- /editor -->
 
-      <div class="features-grid">
-        <div class="feature-card">
-          <div class="feature-icon">⟨⟩</div>
-          <h3>Buffer Engine</h3>
-          <p>Rope-backed buffers with a unified mark tree, undo tree with branch traversal (<code>g-</code>/<code>g+</code>), and a register ring.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">⌨</div>
-          <h3>Modal Editing</h3>
-          <p>Normal, Insert, Visual, and Cmdline modes with full motions, operators, and text objects — just like Neovim.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">◆</div>
-          <h3>Lua Runtime</h3>
-          <p><code>mlua</code>-based Lua 5.4 embedding with <code>vim.api.*</code>, <code>vim.fn.*</code>, <code>vim.keymap</code>, and <code>vim.treesitter</code>.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">⚡</div>
-          <h3>Async I/O</h3>
-          <p>Tokio-backed event loop with timers and msgpack-RPC codec for plugin and UI communication.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">⊞</div>
-          <h3>Window Management</h3>
-          <p>Split frame tree with <code>&lt;C-w&gt;</code> commands. Horizontal and vertical splits, just as you'd expect.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">◈</div>
-          <h3>TUI Frontend</h3>
-          <p>Ratatui + crossterm dashboard, plugin manager, file browser, floating overlays, and mouse support.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">≡</div>
-          <h3>Vimscript</h3>
-          <p>Tree-walking interpreter supporting <code>let</code>, <code>if</code>, <code>for</code>, <code>while</code>, and <code>function</code> — the essentials.</p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">⌬</div>
-          <h3>Treesitter</h3>
-          <p>Parse, query, and node-range extraction via the <code>tree-sitter</code> crate for syntax-aware editing.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="architecture" class="section section-dark">
-    <div class="container">
-      <h2 class="section-title">Workspace Architecture</h2>
-      <p class="section-sub">13 crates, strict dependency direction, no global mutable state.</p>
-
-      <div class="arch-table-wrap">
-        <table class="arch-table">
-          <thead>
-            <tr>
-              <th>crate</th>
-              <th>replaces (Neovim C)</th>
-              <th>what it does</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><code>ctrlvim-types</code></td>
-              <td>Object / typval, handles</td>
-              <td>Dynamic <code>Object</code>, arena handles, <code>Position</code>/<code>Range</code>, errors</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-text</code></td>
-              <td>memline.c, mark.c, undo.c, register.c</td>
-              <td>Rope-backed Buffer, MarkStore, UndoTree, Registers</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-options</code></td>
-              <td>option.c + options.lua</td>
-              <td>Three-tier (global/buffer/window) option overrides</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-editor</code></td>
-              <td>normal.c, ops.c, textobject.c, edit.c, state.c</td>
-              <td>Motions, operators, Mode state machine, Session dispatch</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-vimscript</code></td>
-              <td>eval.c + eval/*.c</td>
-              <td>Minimal Vimscript interpreter with builtins</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-treesitter</code></td>
-              <td>lua/treesitter.c</td>
-              <td>Parse, query, node ranges via tree-sitter</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-api</code></td>
-              <td>src/ctrlvim/api/*.c</td>
-              <td>ApiContext, <code>#[ctrlvim_api]</code> functions, autocmd store</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-lua</code></td>
-              <td>executor.c + converter.c</td>
-              <td>mlua embedding, Object ↔ Lua converter, vim.* bridges</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-async</code></td>
-              <td>event/*.c, msgpack_rpc/*.c</td>
-              <td>Tokio event loop, timers, msgpack-RPC codec</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-core</code></td>
-              <td>startup wiring</td>
-              <td>Ctrlvim facade + demo binary</td>
-            </tr>
-            <tr>
-              <td><code>ctrlvim-tui</code></td>
-              <td>(the UI, split out)</td>
-              <td>Ratatui + crossterm frontend</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div class="design-notes">
-        <h3>Design Principles</h3>
-        <div class="notes-grid">
-          <div class="note-card">
-            <strong>No global state.</strong>
-            Everything threads through an explicit <code>Editor</code> with copy-able integer handles — a stale handle is a clean <code>None</code>.
-          </div>
-          <div class="note-card">
-            <strong>One callback mechanism.</strong>
-            Autocmds, keymaps, and timers all store an <code>Object::LuaRef</code> resolved through the same registry.
-          </div>
-          <div class="note-card">
-            <strong>Codegen via proc-macro.</strong>
-            <code>#[ctrlvim_api]</code> on a Rust fn emits both Lua and RPC dispatch — no C-text parser needed.
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="quickstart" class="section">
-    <div class="container">
-      <h2 class="section-title">Quick Start</h2>
-      <p class="section-sub">Requires Rust 1.80+. Clone, build, run.</p>
-
-      <div class="steps">
-        <div class="step">
-          <div class="step-num">1</div>
-          <div class="step-content">
-            <h4>Clone the repository</h4>
-            <pre><code><span class="dim">$</span> git clone https://github.com/CtrlUserKnown/ctrlvim.git
-<span class="dim">$</span> cd ctrlvim</code></pre>
-          </div>
-        </div>
-        <div class="step">
-          <div class="step-num">2</div>
-          <div class="step-content">
-            <h4>Run the tests</h4>
-            <pre><code><span class="dim">$</span> cargo test --workspace</code></pre>
-          </div>
-        </div>
-        <div class="step">
-          <div class="step-num">3</div>
-          <div class="step-content">
-            <h4>Launch the TUI</h4>
-            <pre><code><span class="dim">$</span> cargo run -p ctrlvim-tui</code></pre>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section section-cta">
-    <div class="container">
-      <h2>Ready to try something different?</h2>
-      <p>ctrlvim is early-stage but functional. Contributions, issues, and feedback welcome.</p>
-      <div class="hero-actions">
-        <a href="https://github.com/CtrlUserKnown/ctrlvim" class="btn btn-primary">Star on GitHub</a>
-        <a href="https://github.com/CtrlUserKnown/ctrlvim/issues" class="btn btn-outline">Open an Issue</a>
-      </div>
-    </div>
-  </section>
-
-  <footer class="footer">
-    <div class="container footer-inner">
-      <span>ctrlvim &middot; Apache-2.0 &middot; Rust</span>
-      <a href="https://github.com/CtrlUserKnown/ctrlvim">Source on GitHub</a>
-    </div>
-  </footer>
-
+<script src="app.js"></script>
 </body>
 </html>

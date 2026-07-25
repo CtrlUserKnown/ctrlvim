@@ -60,7 +60,7 @@ impl Host {
 
     /// Register a treesitter grammar under a language name, so
     /// `vim.treesitter.query(name, ...)` can use it. The embedder supplies the
-    /// grammar (`tree_sitter_json::language()`, etc.).
+    /// grammar (`tree_sitter_json::LANGUAGE.into()`, etc.).
     pub fn register_ts_language(&self, name: &str, language: ctrlvim_treesitter::Language) {
         self.ts.borrow_mut().add(name, language);
     }
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn vim_treesitter_query_from_lua() {
         let host = host_with("x");
-        host.register_ts_language("json", tree_sitter_json::language());
+        host.register_ts_language("json", tree_sitter_json::LANGUAGE.into());
         host.exec(
             r#"
             local caps = vim.treesitter.query('json', '{"n": 42}', '(number) @num')
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn plugin_integration_end_to_end() {
         let host = host_with("{\"greeting\": \"hi\", \"count\": 3}");
-        host.register_ts_language("json", tree_sitter_json::language());
+        host.register_ts_language("json", tree_sitter_json::LANGUAGE.into());
 
         // A plugin's init: it registers an autocmd + a keymap, and defines a
         // command function that inspects the buffer via api/fn/treesitter.

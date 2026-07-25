@@ -6,7 +6,13 @@
 //! ranges. Grammars are registered by name into a [`LanguageRegistry`] the
 //! embedder populates (so this crate needn't hard-depend on every grammar).
 
+pub mod highlight;
+
+pub use highlight::{highlight_lines, HlKind, HlSpan, Highlighter};
+
 use std::collections::HashMap;
+
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 /// Re-exported so embedders (`ctrlvim-lua`) can register grammars without taking a
@@ -61,7 +67,10 @@ impl SyntaxTree {
         let mut cursor = QueryCursor::new();
         let src = self.source.as_bytes();
         let mut out = Vec::new();
-        for m in cursor.matches(&query, self.tree.root_node(), src) {
+        // `matches` is a streaming iterator since tree-sitter 0.25, so this is a
+        // `while let` rather than a `for`.
+        let mut matches = cursor.matches(&query, self.tree.root_node(), src);
+        while let Some(m) = matches.next() {
             for cap in m.captures {
                 let node = cap.node;
                 let start = node.start_position();
@@ -123,7 +132,7 @@ mod tests {
     use super::*;
 
     fn json_lang() -> Language {
-        tree_sitter_json::language()
+        tree_sitter_json::LANGUAGE.into()
     }
 
     #[test]

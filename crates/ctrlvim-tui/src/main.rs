@@ -46,9 +46,13 @@ fn run(terminal: &mut Term, start: Instant) -> io::Result<()> {
         })?;
 
         // Block for the next event (with a poll so resize repaints promptly).
+        // The timeout is also where background job output is picked up, so a
+        // long `:make` streams into the quickfix list without blocking keys.
         if !event::poll(Duration::from_millis(250))? {
+            app.poll_jobs();
             continue;
         }
+        app.poll_jobs();
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 input::handle_key(&mut app, key);

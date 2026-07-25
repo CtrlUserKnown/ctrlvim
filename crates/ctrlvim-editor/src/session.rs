@@ -6,7 +6,7 @@
 //! and reads back cursor/mode/buffer state to render.
 
 use crate::editor::Editor;
-use crate::ex::{parse_ex, ExEffect, ExParsed};
+use crate::ex::{parse_ex, ExEffect, ExParsed, QuickfixCmd, TagCmd};
 use crate::input::Key;
 use crate::keymap::{Keymap, KeymapMatch};
 use crate::mode::{Mode, Selection, VisualKind};
@@ -16,7 +16,7 @@ use crate::range::{self, Addr, Address, RangeSpec};
 use crate::textobject;
 use ctrlvim_text::{MotionType, YankReg};
 use ctrlvim_types::Position;
-use regex::Regex;
+use crate::pattern::{compile as compile_pattern, compile_opts as compile_pattern_opts};
 
 /// Pending command-accumulation state (`cmdarg_T`/`oparg_T` in C).
 #[derive(Default)]
@@ -30,6 +30,8 @@ struct Pending {
     await_register: bool,
     /// True after `<C-w>` (awaiting a window command).
     ctrl_w: bool,
+    /// True after `z` (awaiting a fold/scroll command).
+    z_prefix: bool,
     /// After `f`/`F`/`t`/`T`: `(forward, till)`, awaiting the target char.
     await_find: Option<(bool, bool)>,
     /// True after `r`, awaiting the replacement char.
@@ -145,7 +147,13 @@ impl Session {
             self.recording.push(key);
         }
 
+        let ticks_before = self.editor.cur_buffer().changedtick;
         self.route(key);
+        // Computed folds (`foldmethod=indent`) follow the text, so re-derive
+        // them whenever it changed. No-op under the default `manual`.
+        if self.editor.cur_buffer().changedtick != ticks_before {
+            self.refresh_folds();
+        }
 
         // Command finished at a resting boundary and changed the buffer → it's
         // the new "last change" (but a `.` command must not overwrite itself).
@@ -177,6 +185,7 @@ impl Session {
             && p.register.is_none()
             && !p.g_prefix
             && !p.ctrl_w
+            && !p.z_prefix
             && !p.await_register
             && p.await_find.is_none()
             && !p.await_replace
@@ -259,6 +268,15 @@ impl Session {
         if self.pending.ctrl_w {
             self.pending.ctrl_w = false;
             self.handle_window_command(key);
+            return;
+        }
+
+        // `z`-prefixed fold commands (`zf`, `za`, `zR`, …).
+        if self.pending.z_prefix {
+            self.pending.z_prefix = false;
+            if !self.fold_key(key) {
+                self.pending.clear();
+            }
             return;
         }
 
@@ -349,6 +367,18 @@ impl Session {
             Key::Ctrl('r') => self.redo(),
             // Window commands.
             Key::Ctrl('w') => self.pending.ctrl_w = true,
+            // Fold commands (`zf`, `za`, `zo`, `zR`, …).
+            Key::Char('z') => self.pending.z_prefix = true,
+            // Tags: `<C-]>` jumps to the definition under the cursor, `<C-t>`
+            // returns.
+            Key::Ctrl(']') => {
+                self.tag_lookup(None);
+                self.pending.clear();
+            }
+            Key::Ctrl('t') => {
+                self.tag_pop();
+                self.pending.clear();
+            }
             Key::Esc => self.pending.clear(),
             // Motions (may complete a pending operator).
             other => self.motion_key(other),
@@ -461,8 +491,10 @@ impl Session {
         Some(match key {
             Key::Char('h') | Key::Backspace => motion::left(buf, cur, count),
             Key::Char('l') | Key::Char(' ') => motion::right(buf, cur, count),
-            Key::Char('j') => motion::down(buf, cur, count),
-            Key::Char('k') => motion::up(buf, cur, count),
+            // Vertical motion is fold-aware: a closed fold is one step, not one
+            // step per line inside it.
+            Key::Char('j') => motion::vertical_folded(buf, self.folds(), cur, count, 1),
+            Key::Char('k') => motion::vertical_folded(buf, self.folds(), cur, count, -1),
             Key::Char('0') => motion::line_start(buf, cur),
             Key::Char('^') => motion::first_non_blank(buf, cur),
             Key::Char('$') => motion::line_end(buf, cur),
@@ -473,6 +505,9 @@ impl Session {
             Key::Char('e') => motion::word_end(buf, cur, count, false),
             Key::Char('E') => motion::word_end(buf, cur, count, true),
             Key::Char('G') => motion::goto_line_last(buf, self.pending.count),
+            // Paragraph motions (`Shift+]` / `Shift+[`).
+            Key::Char('}') => motion::paragraph(buf, cur, count, true),
+            Key::Char('{') => motion::paragraph(buf, cur, count, false),
             _ => return None,
         })
     }
@@ -491,7 +526,18 @@ impl Session {
     fn apply_motion_or_operator(&mut self, m: MotionResult) {
         if let Some(op) = self.pending.operator.take() {
             let cursor = self.editor.cursor();
-            let span = OperatorSpan::from_motion(cursor, m.target, m.kind);
+            // `zf{motion}` folds the swept lines instead of editing them.
+            if op == Operator::Fold {
+                let (start, end) = if cursor.line <= m.target.line {
+                    (cursor.line, m.target.line)
+                } else {
+                    (m.target.line, cursor.line)
+                };
+                self.create_fold(start, end);
+                self.pending.clear();
+                return;
+            }
+            let span = OperatorSpan::from_motion(&self.editor.cur_buffer().text, cursor, m.target, m.kind);
             let reg = self.pending.register;
             let outcome = apply_operator(&mut self.editor, op, span, reg);
             self.editor.set_cursor(outcome.cursor);
@@ -868,7 +914,7 @@ impl Session {
             // Visual char selection is inclusive of the cursor character.
             _ => MotionKind::CharInclusive,
         };
-        let span = OperatorSpan::from_motion(anchor, cursor, motion_kind);
+        let span = OperatorSpan::from_motion(&self.editor.cur_buffer().text, anchor, cursor, motion_kind);
         let reg = self.pending.register;
         let outcome = apply_operator(&mut self.editor, op, span, reg);
         self.editor.set_cursor(outcome.cursor);
@@ -940,6 +986,14 @@ impl Session {
             return;
         }
 
+        if self.run_quickfix_command(&name, &arg) {
+            return;
+        }
+
+        if self.run_tag_command(&name, &arg) {
+            return;
+        }
+
         // Non-range commands (file/quit/buffer/options/…).
         match parse_ex(&rest) {
             ExParsed::GotoLine(line) => {
@@ -970,6 +1024,405 @@ impl Session {
         }
     }
 
+    /// Dispatch a quickfix command (`:copen`, `:cnext`, `:make`, …), returning
+    /// whether it was one.
+    ///
+    /// Navigation happens here because the engine owns the list; the resulting
+    /// jump, and anything needing the filesystem or a process, goes out as an
+    /// [`ExEffect::Quickfix`] for the host.
+    fn run_quickfix_command(&mut self, name: &str, arg: &str) -> bool {
+        let count = arg.trim().parse::<usize>().ok();
+        match name {
+            "copen" | "cope" | "cw" | "cwindow" => {
+                self.queue_effect(ExEffect::Quickfix(QuickfixCmd::Open));
+            }
+            "cclose" | "ccl" => self.queue_effect(ExEffect::Quickfix(QuickfixCmd::Close)),
+            "cnext" | "cn" => self.quickfix_step(count.unwrap_or(1) as isize),
+            "cprevious" | "cprev" | "cp" | "cN" => {
+                self.quickfix_step(-(count.unwrap_or(1) as isize))
+            }
+            "cfirst" | "cfir" | "crewind" | "cr" => self.quickfix_end(false),
+            "clast" | "cla" => self.quickfix_end(true),
+            "cc" => {
+                // `:cc N` is 1-based on the command line, 0-based in the list.
+                let target = count.map(|n| n.saturating_sub(1));
+                let jump = match target {
+                    Some(i) => self.editor.quickfix.goto(i).cloned(),
+                    None => self.editor.quickfix.current().cloned(),
+                };
+                self.quickfix_jump(jump);
+            }
+            "clist" | "cl" => {
+                let qf = &self.editor.quickfix;
+                let msg = if qf.is_empty() {
+                    "E42: no errors".to_string()
+                } else {
+                    format!("{} entries: {}", qf.len(), qf.title())
+                };
+                self.queue_effect(ExEffect::Message(msg));
+            }
+            "vimgrep" | "vim" | "vimg" => match parse_vimgrep(arg) {
+                Some((pattern, glob)) => {
+                    self.queue_effect(ExEffect::Quickfix(QuickfixCmd::Grep { pattern, glob }))
+                }
+                None => self.queue_effect(ExEffect::Message(
+                    "E682: usage: :vimgrep /pattern/ [glob]".into(),
+                )),
+            },
+            "make" => self.queue_effect(ExEffect::Quickfix(QuickfixCmd::Run {
+                program: "cargo".into(),
+                args: {
+                    let mut args = vec!["build".to_string()];
+                    args.extend(arg.split_whitespace().map(str::to_string));
+                    args
+                },
+                title: ":make".into(),
+            })),
+            "grep" | "gr" => {
+                let words: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
+                if words.is_empty() {
+                    self.queue_effect(ExEffect::Message("E683: usage: :grep {pattern}".into()));
+                } else {
+                    let mut args = vec!["-rn".to_string()];
+                    args.extend(words);
+                    self.queue_effect(ExEffect::Quickfix(QuickfixCmd::Run {
+                        program: "grep".into(),
+                        args,
+                        title: format!(":grep {}", arg.trim()),
+                    }));
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `:cnext`/`:cprev` — move within the list and jump, or report why not.
+    fn quickfix_step(&mut self, by: isize) {
+        let item = self.editor.quickfix.advance(by).cloned();
+        self.quickfix_jump(item);
+    }
+
+    /// `:cfirst`/`:clast`.
+    fn quickfix_end(&mut self, last: bool) {
+        let item = self.editor.quickfix.goto_end(last).cloned();
+        self.quickfix_jump(item);
+    }
+
+    /// Turn a selected entry into a host jump, or an empty-list message.
+    fn quickfix_jump(&mut self, item: Option<crate::quickfix::QfItem>) {
+        let effect = match item {
+            Some(item) => ExEffect::Quickfix(QuickfixCmd::Jump {
+                path: item.path.to_string_lossy().into_owned(),
+                line: item.line,
+                col: item.col,
+            }),
+            None => ExEffect::Message("E42: no errors".into()),
+        };
+        self.queue_effect(effect);
+    }
+
+    // --- tags ---
+
+    /// Install a parsed tags file (the host reads it; see [`ExEffect::Tag`]).
+    pub fn set_tags(&mut self, table: crate::tags::TagTable) {
+        self.editor.tags = table;
+    }
+
+    pub fn tags(&self) -> &crate::tags::TagTable {
+        &self.editor.tags
+    }
+
+    pub fn tagstack(&self) -> &crate::tags::TagStack {
+        &self.editor.tagstack
+    }
+
+    /// The identifier under the cursor — what `Ctrl-]` looks up.
+    ///
+    /// Keyword characters are alphanumerics and `_`, and the word extends both
+    /// ways from the cursor, so the cursor may sit anywhere inside it.
+    pub fn word_at_cursor(&self) -> Option<String> {
+        let cursor = self.editor.cursor();
+        let line = self.editor.cur_buffer().text.line(cursor.line)?;
+        let chars: Vec<char> = line.chars().collect();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        if chars.is_empty() {
+            return None;
+        }
+        let at = cursor.col.min(chars.len() - 1);
+        if !is_word(chars[at]) {
+            return None;
+        }
+        let start = chars[..at].iter().rposition(|&c| !is_word(c)).map_or(0, |i| i + 1);
+        let end = chars[at..]
+            .iter()
+            .position(|&c| !is_word(c))
+            .map_or(chars.len(), |i| at + i);
+        Some(chars[start..end].iter().collect())
+    }
+
+    /// Record the current position on the tagstack and select `name`'s first
+    /// definition. Called by the host once it has the tags file loaded.
+    ///
+    /// Returns the tag to jump to, or `None` when the name isn't in the table
+    /// (the host reports `E426`).
+    pub fn select_tag(&mut self, name: &str, from_path: &str) -> Option<crate::tags::Tag> {
+        let matches = self.editor.tags.find(name).to_vec();
+        if matches.is_empty() {
+            return None;
+        }
+        let cursor = self.editor.cursor();
+        self.editor.tagstack.push(crate::tags::TagStackEntry {
+            name: name.to_string(),
+            path: from_path.to_string(),
+            line: cursor.line,
+            col: cursor.col,
+        });
+        let first = matches[0].clone();
+        self.editor.tag_matches = Some(crate::tags::TagMatches {
+            name: name.to_string(),
+            matches,
+            current: 0,
+        });
+        Some(first)
+    }
+
+    /// How many definitions the last lookup found (for the `tag 1 of 3` note).
+    pub fn tag_match_count(&self) -> usize {
+        self.editor.tag_matches.as_ref().map_or(0, |m| m.matches.len())
+    }
+
+    /// `:tnext` / `:tprev` — move within the current match list, reporting at
+    /// the ends rather than re-jumping to the same definition.
+    fn tag_step(&mut self, by: isize) {
+        let moved = self
+            .editor
+            .tag_matches
+            .as_mut()
+            .map(|m| (m.advance(by).cloned(), m.current + 1, m.matches.len()));
+        self.tag_jump(moved);
+    }
+
+    /// `:tfirst` / `:tlast` — land on that end of the match list, which always
+    /// works when there is one.
+    fn tag_end(&mut self, last: bool) {
+        let moved = self
+            .editor
+            .tag_matches
+            .as_mut()
+            .map(|m| (m.goto_end(last).cloned(), m.current + 1, m.matches.len()));
+        self.tag_jump(moved);
+    }
+
+    /// Emit the jump for a match-list move, or the reason there wasn't one.
+    fn tag_jump(&mut self, moved: Option<(Option<crate::tags::Tag>, usize, usize)>) {
+        match moved {
+            Some((Some(tag), index, total)) => {
+                self.queue_effect(ExEffect::Tag(TagCmd::Jump {
+                    path: tag.path,
+                    address: tag.address,
+                }));
+                self.queue_effect(ExEffect::Message(format!("tag {index} of {total}")));
+            }
+            Some((None, _, _)) => {
+                self.queue_effect(ExEffect::Message("E425: no more matching tags".into()))
+            }
+            None => self.queue_effect(ExEffect::Message("E73: tag stack empty".into())),
+        }
+    }
+
+    /// `Ctrl-T` — return to where the last `Ctrl-]` jumped from.
+    fn tag_pop(&mut self) {
+        match self.editor.tagstack.pop() {
+            Some(entry) => self.queue_effect(ExEffect::Tag(TagCmd::Return {
+                path: entry.path,
+                line: entry.line,
+                col: entry.col,
+            })),
+            None => self.queue_effect(ExEffect::Message("E73: tag stack empty".into())),
+        }
+    }
+
+    /// Ask the host to look a name up (it refreshes the tags file first).
+    fn tag_lookup(&mut self, name: Option<String>) {
+        let name = name.or_else(|| self.word_at_cursor());
+        match name {
+            Some(name) if !name.is_empty() => {
+                self.queue_effect(ExEffect::Tag(TagCmd::Lookup { name }))
+            }
+            _ => self.queue_effect(ExEffect::Message("E349: no identifier under cursor".into())),
+        }
+    }
+
+    /// Dispatch a tag command (`:tag`, `:tnext`, `:tags`, …). Returns whether
+    /// it was one.
+    fn run_tag_command(&mut self, name: &str, arg: &str) -> bool {
+        let arg = arg.trim();
+        match name {
+            "ta" | "tag" => self.tag_lookup((!arg.is_empty()).then(|| arg.to_string())),
+            "tn" | "tnext" => self.tag_step(1),
+            "tp" | "tprevious" | "tprev" | "tN" => self.tag_step(-1),
+            "tf" | "tfirst" | "tr" | "trewind" => self.tag_end(false),
+            "tl" | "tlast" => self.tag_end(true),
+            "po" | "pop" => self.tag_pop(),
+            "ts" | "tselect" | "tj" | "tjump" => {
+                // With one match these behave like `:tag`; the selection UI is
+                // not built, so report the alternatives instead of prompting.
+                let target = if arg.is_empty() { self.word_at_cursor() } else { Some(arg.to_string()) };
+                match target {
+                    Some(name) => {
+                        let matches = self.editor.tags.find(&name);
+                        if matches.len() > 1 {
+                            let list: Vec<String> = matches
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| format!("{}: {}", i + 1, t.path))
+                                .collect();
+                            let msg = format!("{} matches — {}", matches.len(), list.join("  "));
+                            self.queue_effect(ExEffect::Message(msg));
+                        }
+                        self.tag_lookup(Some(name));
+                    }
+                    None => self.queue_effect(ExEffect::Message(
+                        "E349: no identifier under cursor".into(),
+                    )),
+                }
+            }
+            "tags" => {
+                let stack = self.editor.tagstack.entries();
+                let msg = if stack.is_empty() {
+                    "tag stack empty".to_string()
+                } else {
+                    let items: Vec<String> = stack
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| format!("{} {} {}:{}", i + 1, e.name, e.path, e.line + 1))
+                        .collect();
+                    items.join("  ")
+                };
+                self.queue_effect(ExEffect::Message(msg));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    // --- folds ---
+
+    /// The current window's folds.
+    pub fn folds(&self) -> &crate::fold::Folds {
+        &self.editor.window(self.editor.current_window_id()).unwrap().folds
+    }
+
+    fn folds_mut(&mut self) -> &mut crate::fold::Folds {
+        let id = self.editor.current_window_id();
+        &mut self.editor.window_mut(id).unwrap().folds
+    }
+
+    /// Handle the `z` fold commands. Returns whether the key was one of them.
+    ///
+    /// `zf` is an operator (it awaits a motion, `zfj` / `zf}`); the rest act on
+    /// the fold under the cursor immediately.
+    fn fold_key(&mut self, key: Key) -> bool {
+        let line = self.editor.cursor().line;
+        match key {
+            // `zf{motion}` — the motion decides the range, so this waits.
+            Key::Char('f') => {
+                self.pending.operator = Some(Operator::Fold);
+                return true;
+            }
+            Key::Char('a') => {
+                self.folds_mut().set_closed_at(line, None);
+            }
+            Key::Char('o') => {
+                self.folds_mut().set_closed_at(line, Some(false));
+            }
+            Key::Char('c') => {
+                self.folds_mut().set_closed_at(line, Some(true));
+            }
+            Key::Char('R') => self.folds_mut().set_all_closed(false),
+            Key::Char('M') => self.folds_mut().set_all_closed(true),
+            Key::Char('d') => self.folds_mut().delete_at(line),
+            Key::Char('E') => self.folds_mut().clear(),
+            Key::Char('i') => {
+                let on = self.folds().enabled;
+                self.folds_mut().enabled = !on;
+            }
+            // `zj`/`zk` — move to the start/end of the next/previous fold.
+            Key::Char('j') | Key::Char('k') => {
+                let forward = matches!(key, Key::Char('j'));
+                if let Some(target) = self.next_fold_edge(line, forward) {
+                    self.editor.set_cursor(Position::new(target, 0));
+                }
+            }
+            _ => return false,
+        }
+        // A fold may have closed under the cursor; keep the cursor on a line
+        // that is actually visible.
+        self.snap_cursor_out_of_fold();
+        true
+    }
+
+    /// The nearest fold boundary after/before `line`, for `zj`/`zk`.
+    fn next_fold_edge(&self, line: usize, forward: bool) -> Option<usize> {
+        let folds = self.folds();
+        if forward {
+            folds.all().iter().map(|f| f.start).filter(|&s| s > line).min()
+        } else {
+            folds.all().iter().map(|f| f.end).filter(|&e| e < line).max()
+        }
+    }
+
+    /// Move the cursor to a visible line if a fold just swallowed it — Vim puts
+    /// the cursor on the fold's first line when you close one around it.
+    fn snap_cursor_out_of_fold(&mut self) {
+        let cursor = self.editor.cursor();
+        if let Some(fold) = self.folds().closed_at(cursor.line) {
+            if fold.start != cursor.line {
+                let start = fold.start;
+                self.editor.set_cursor(Position::new(start, cursor.col));
+            }
+        }
+    }
+
+    /// Create a fold over a line range (`zf{motion}`, `:fold`).
+    pub fn create_fold(&mut self, start: usize, end: usize) {
+        self.folds_mut().create(start, end);
+        self.snap_cursor_out_of_fold();
+    }
+
+    /// Re-derive folds when `'foldmethod'` computes them. Called after edits;
+    /// a no-op for `manual`.
+    pub fn refresh_folds(&mut self) {
+        let method = self.editor.options().foldmethod();
+        if method == ctrlvim_options::FoldMethod::Manual {
+            return;
+        }
+        let shiftwidth = self.editor.options().shiftwidth().max(1) as usize;
+        let enabled = self.editor.options().foldenable();
+        let lines = self.editor.cur_buffer().text.lines();
+        let folds = self.folds_mut();
+        folds.enabled = enabled;
+        folds.recompute(method, &lines, shiftwidth);
+    }
+
+    /// Replace the quickfix list — called by the host once it has walked files
+    /// (`:vimgrep`) or collected a program's output (`:make`, `:grep`).
+    pub fn set_quickfix(&mut self, items: Vec<crate::quickfix::QfItem>, title: impl Into<String>) {
+        self.editor.quickfix.set(items, title);
+    }
+
+    /// The quickfix list, for the host to render.
+    pub fn quickfix(&self) -> &crate::quickfix::QuickfixList {
+        &self.editor.quickfix
+    }
+
+    /// Select entry `index` (0-based) and return the jump for the host — what
+    /// clicking a row in the quickfix pane does.
+    pub fn quickfix_select(&mut self, index: usize) -> Option<crate::quickfix::QfItem> {
+        self.editor.quickfix.goto(index).cloned()
+    }
+
     /// Dispatch a range-aware command, returning whether it was one. Each picks
     /// its default range (current line, or the whole file for `:g`/`:sort`).
     fn run_range_command(&mut self, name: &str, arg: &str, spec: &RangeSpec) -> bool {
@@ -997,6 +1450,25 @@ impl Session {
             "y" | "ya" | "yank" => {
                 let r = self.range_or_current(spec);
                 self.ex_yank(r);
+            }
+            // `:{range}fold` and the fold open/close commands, which take a
+            // range like every other Ex command (`:1,20fold`, `:%foldclose`).
+            "fo" | "fold" => {
+                let (start, end) = self.range_or_current(spec);
+                self.create_fold(start, end);
+            }
+            "foldo" | "foldopen" => {
+                let (start, end) = self.range_or_current(spec);
+                for line in start..=end {
+                    self.folds_mut().set_closed_at(line, Some(false));
+                }
+            }
+            "foldc" | "foldclose" => {
+                let (start, end) = self.range_or_current(spec);
+                for line in start..=end {
+                    self.folds_mut().set_closed_at(line, Some(true));
+                }
+                self.snap_cursor_out_of_fold();
             }
             "m" | "mo" | "move" => {
                 let r = self.range_or_current(spec);
@@ -1480,8 +1952,10 @@ impl Session {
     /// first unknown option as an error message (like Neovim's `E518`).
     fn apply_set(&mut self, items: Vec<crate::ex::SetItem>) {
         use crate::ex::SetItem;
-        let opts = &mut self.editor.global_options;
         for item in items {
+            // Each arm re-borrows rather than holding `global_options` across
+            // the loop, since the fold options also touch window state.
+            let opts = &mut self.editor.global_options;
             match item {
                 SetItem::Number(v) => opts.number = v,
                 SetItem::Wrap(v) => opts.wrap = v,
@@ -1489,6 +1963,12 @@ impl Session {
                 SetItem::Tabstop(n) => opts.tabstop = n.max(1),
                 SetItem::Shiftwidth(n) => opts.shiftwidth = n.max(0),
                 SetItem::Scrolloff(n) => opts.scrolloff = n.max(0),
+                SetItem::Foldcolumn(n) => opts.foldcolumn = n.clamp(0, 9),
+                SetItem::Foldenable(v) => {
+                    opts.foldenable = v;
+                    self.folds_mut().enabled = v;
+                }
+                SetItem::Foldmethod(m) => opts.foldmethod = m,
                 SetItem::Unknown(name) => {
                     self.effects.push(ExEffect::Message(format!(
                         "E518: Unknown option: {name}"
@@ -1496,6 +1976,10 @@ impl Session {
                 }
             }
         }
+        // Several of these feed `foldmethod=indent` (the method itself, but
+        // also `shiftwidth`, which decides what counts as one level), so
+        // re-derive once at the end rather than per option. No-op for `manual`.
+        self.refresh_folds();
     }
 
     /// Queue an Ex effect, applying the modified-buffer semantics the engine
@@ -1623,6 +2107,16 @@ impl Session {
         self.editor.cursor()
     }
 
+    /// Put the cursor at `line`/`col`, clamped into the buffer — for the host
+    /// jumping to a position it got from outside the editor (a quickfix entry,
+    /// a tag, an LSP location).
+    pub fn set_cursor_clamped(&mut self, line: usize, col: usize) {
+        let buf = &self.editor.cur_buffer().text;
+        let line = line.min(buf.line_count().saturating_sub(1));
+        let pos = motion::clamp_normal(buf, Position::new(line, col));
+        self.editor.set_cursor(pos);
+    }
+
     pub fn lines(&self) -> Vec<String> {
         self.editor.cur_buffer().text.lines()
     }
@@ -1746,53 +2240,32 @@ fn split_global(args: &str) -> Option<(String, String)> {
     Some((pat, String::new()))
 }
 
-/// Compile a Vim pattern into a [`Regex`].
-fn compile_pattern(pat: &str) -> Result<Regex, regex::Error> {
-    compile_pattern_opts(pat, false)
-}
-
-/// Compile a Vim pattern into a [`Regex`], optionally case-insensitive.
-fn compile_pattern_opts(pat: &str, ignorecase: bool) -> Result<Regex, regex::Error> {
-    let translated = vim_to_regex(pat);
-    let src = if ignorecase { format!("(?i){translated}") } else { translated };
-    Regex::new(&src)
-}
-
-/// Translate a Vim "magic" regex into Rust `regex` syntax. In Vim magic mode the
-/// grouping/quantifier metacharacters are backslash-escaped (`\(`, `\+`, `\|`,
-/// `\{`), the reverse of PCRE — so this flips that, and maps `\<`/`\>` to `\b`.
-fn vim_to_regex(pat: &str) -> String {
-    let mut out = String::new();
-    let mut chars = pat.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('(') => out.push('('),
-                Some(')') => out.push(')'),
-                Some('+') => out.push('+'),
-                Some('?') | Some('=') => out.push('?'),
-                Some('|') => out.push('|'),
-                Some('{') => out.push('{'),
-                Some('}') => out.push('}'),
-                Some('<') | Some('>') => out.push_str("\\b"),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            match c {
-                // Literal in Vim magic mode → escape for PCRE.
-                '(' | ')' | '+' | '?' | '|' | '{' | '}' => {
-                    out.push('\\');
-                    out.push(c);
-                }
-                _ => out.push(c),
-            }
+/// Parse `:vimgrep /pattern/ [glob]` into its pattern and file glob. The
+/// delimiter is whatever character opens the pattern (Vim allows any), and the
+/// glob is optional (defaulting to the whole project).
+fn parse_vimgrep(arg: &str) -> Option<(String, Option<String>)> {
+    let arg = arg.trim();
+    let mut chars = arg.chars();
+    let delim = chars.next()?;
+    if delim.is_alphanumeric() || delim.is_whitespace() {
+        // Bare word form: `:vimgrep foo *.rs`.
+        let (pattern, rest) = match arg.split_once(char::is_whitespace) {
+            Some((p, r)) => (p.to_string(), r.trim()),
+            None => (arg.to_string(), ""),
+        };
+        if pattern.is_empty() {
+            return None;
         }
+        return Some((pattern, (!rest.is_empty()).then(|| rest.to_string())));
     }
-    out
+    let rest = &arg[delim.len_utf8()..];
+    let end = rest.find(delim)?;
+    let pattern = rest[..end].to_string();
+    if pattern.is_empty() {
+        return None;
+    }
+    let glob = rest[end + delim.len_utf8()..].trim();
+    Some((pattern, (!glob.is_empty()).then(|| glob.to_string())))
 }
 
 /// Translate a Vim `:s` replacement into a Rust `regex` replacement string:
@@ -2142,6 +2615,477 @@ mod tests {
         assert!(s.take_effects().contains(&ExEffect::Buffer(BufferCmd::Goto(2))));
     }
 
+    /// Fill the list the way the host does after walking files.
+    fn seeded_quickfix() -> Session {
+        use crate::quickfix::{QfItem, QfKind};
+        let mut s = Session::with_text("x");
+        let items = (0..3)
+            .map(|i| QfItem {
+                path: format!("src/f{i}.rs").into(),
+                line: i * 10,
+                col: i,
+                text: format!("hit {i}"),
+                kind: QfKind::Match,
+            })
+            .collect();
+        s.set_quickfix(items, ":vimgrep /hit/");
+        s
+    }
+
+    #[test]
+    fn quickfix_navigation_emits_jumps() {
+        let mut s = seeded_quickfix();
+        s.feed_str(":cnext<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Jump {
+            path: "src/f1.rs".into(),
+            line: 10,
+            col: 1,
+        })));
+        // `:cc N` is 1-based on the command line.
+        s.feed_str(":cc 3<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Jump {
+            path: "src/f2.rs".into(),
+            line: 20,
+            col: 2,
+        })));
+        s.feed_str(":cfirst<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Jump {
+            path: "src/f0.rs".into(),
+            line: 0,
+            col: 0,
+        })));
+    }
+
+    #[test]
+    fn quickfix_navigation_on_an_empty_list_reports_it() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":cnext<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Message("E42: no errors".into())));
+    }
+
+    #[test]
+    fn quickfix_open_and_close_are_host_effects() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":copen<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Open)));
+        s.feed_str(":cclose<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Close)));
+    }
+
+    #[test]
+    fn vimgrep_asks_the_host_to_walk_files() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":vimgrep /fn main/ **/*.rs<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Grep {
+            pattern: "fn main".into(),
+            glob: Some("**/*.rs".into()),
+        })));
+        // Without a glob the whole project is searched.
+        s.feed_str(":vimgrep /todo/<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Quickfix(QuickfixCmd::Grep {
+            pattern: "todo".into(),
+            glob: None,
+        })));
+    }
+
+    #[test]
+    fn make_and_grep_ask_the_host_to_run_a_program() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":make<CR>");
+        let effects = s.take_effects();
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            ExEffect::Quickfix(QuickfixCmd::Run { program, .. }) if program == "cargo"
+        )));
+        s.feed_str(":grep todo<CR>");
+        let effects = s.take_effects();
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            ExEffect::Quickfix(QuickfixCmd::Run { program, args, .. })
+                if program == "grep" && args == &["-rn".to_string(), "todo".to_string()]
+        )));
+    }
+
+    #[test]
+    fn parses_vimgrep_argument_forms() {
+        assert_eq!(
+            parse_vimgrep("/fn \\<main\\>/ src/**"),
+            Some(("fn \\<main\\>".into(), Some("src/**".into())))
+        );
+        // Any delimiter, as in Vim.
+        assert_eq!(parse_vimgrep("#a/b#"), Some(("a/b".into(), None)));
+        // Bare word form.
+        assert_eq!(parse_vimgrep("todo *.rs"), Some(("todo".into(), Some("*.rs".into()))));
+        // Unterminated or empty patterns are rejected, not guessed at.
+        assert_eq!(parse_vimgrep("/unclosed"), None);
+        assert_eq!(parse_vimgrep("//"), None);
+        assert_eq!(parse_vimgrep(""), None);
+    }
+
+    /// Three paragraphs separated by single empty lines.
+    fn paragraphs() -> Session {
+        //  0:one 1:two | 2:blank | 3:three 4:four | 5:blank | 6:five
+        Session::with_text("one\ntwo\n\nthree\nfour\n\nfive")
+    }
+
+    #[test]
+    fn brace_moves_between_paragraphs() {
+        let mut s = paragraphs();
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 2, "to the blank line after the paragraph");
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 5);
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 6, "no boundary left, so the end of the buffer");
+        s.feed_str("{");
+        assert_eq!(s.cursor().line, 5);
+        s.feed_str("{");
+        assert_eq!(s.cursor().line, 2);
+        s.feed_str("{");
+        assert_eq!(s.cursor().line, 0, "and back to the start");
+    }
+
+    #[test]
+    fn a_count_moves_that_many_paragraphs() {
+        let mut s = paragraphs();
+        s.feed_str("2}");
+        assert_eq!(s.cursor().line, 5);
+        s.feed_str("2{");
+        assert_eq!(s.cursor().line, 0);
+        // More than there are stops at the edge rather than refusing.
+        s.feed_str("9}");
+        assert_eq!(s.cursor().line, 6);
+    }
+
+    #[test]
+    fn consecutive_blank_lines_are_one_boundary() {
+        // Vim skips a run of blanks rather than stopping on each.
+        let mut s = Session::with_text("one\n\n\n\ntwo\n\nthree");
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 1, "the first blank of the run");
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 5, "skipped the rest of the run and `two`");
+    }
+
+    #[test]
+    fn a_whitespace_only_line_is_not_a_paragraph_boundary() {
+        let mut s = Session::with_text("one\n   \ntwo\n\nthree");
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 3, "the spaces-only line does not count");
+    }
+
+    #[test]
+    fn d_brace_deletes_to_the_paragraph_boundary() {
+        let mut s = paragraphs();
+        s.feed_str("d}");
+        // Exclusive: the blank boundary line survives.
+        assert_eq!(s.lines(), vec!["", "three", "four", "", "five"]);
+    }
+
+    #[test]
+    fn d_brace_on_the_last_paragraph_deletes_through_the_end() {
+        let mut s = paragraphs();
+        s.feed_str("G"); // last line, `five`
+        s.feed_str("d}");
+        assert_eq!(s.lines(), vec!["one", "two", "", "three", "four", "", ""]);
+    }
+
+    #[test]
+    fn d_brace_from_mid_line_keeps_the_boundary_line() {
+        // `:help exclusive` rule 1: the end moves back to the end of the
+        // previous line, so the blank line is left behind rather than joined.
+        let mut s = Session::with_text("one\ntwo\n\nthree");
+        s.feed_str("ld}");
+        assert_eq!(s.lines(), vec!["o", "", "three"]);
+    }
+
+    #[test]
+    fn dw_on_a_lines_last_word_does_not_join_the_next_line() {
+        // The classic exclusive-motion case: without `:help exclusive` this
+        // deletes the newline too and pulls `gamma` up.
+        let mut s = Session::with_text("alpha beta\ngamma");
+        s.feed_str("$dw");
+        assert_eq!(s.lines(), vec!["alpha bet", "gamma"]);
+        // From the start of the last word, the whole word goes but the line
+        // break survives.
+        let mut s = Session::with_text("alpha beta\ngamma");
+        s.feed_str("wdw");
+        assert_eq!(s.lines(), vec!["alpha ", "gamma"]);
+    }
+
+    #[test]
+    fn visual_brace_extends_the_selection() {
+        let mut s = paragraphs();
+        s.feed_str("v}");
+        let sel = s.selection().expect("visual selection");
+        assert_eq!(sel.start.line, 0);
+        assert_eq!(sel.end.line, 2, "extends to the paragraph boundary");
+    }
+
+    #[test]
+    fn brace_motions_on_a_single_line_buffer_do_not_move() {
+        let mut s = Session::with_text("only");
+        s.feed_str("}");
+        assert_eq!(s.cursor().line, 0);
+        s.feed_str("{");
+        assert_eq!(s.cursor().line, 0);
+    }
+
+    /// A session with a loaded tags table and a buffer that mentions them.
+    fn tagged() -> Session {
+        let mut s = Session::with_text("use editor::Editor;\nfn call() { helper(); }\n");
+        s.set_tags(crate::tags::TagTable::parse(
+            "Editor\tsrc/editor.rs\t/^pub struct Editor {$/;\"\ts\n\
+             helper\tsrc/a.rs\t10;\"\tf\n\
+             helper\tsrc/b.rs\t20;\"\tf\n",
+        ));
+        s
+    }
+
+    #[test]
+    fn ctrl_bracket_looks_up_the_word_under_the_cursor() {
+        let mut s = tagged();
+        s.feed_str("fE"); // onto `Editor`
+        s.feed(Key::Ctrl(']'));
+        assert!(s.take_effects().contains(&ExEffect::Tag(TagCmd::Lookup {
+            name: "Editor".into()
+        })));
+    }
+
+    #[test]
+    fn the_word_under_the_cursor_extends_both_ways() {
+        let mut s = tagged();
+        s.feed_str("fd"); // middle of `editor`
+        assert_eq!(s.word_at_cursor().as_deref(), Some("editor"));
+        s.feed_str("0");
+        assert_eq!(s.word_at_cursor().as_deref(), Some("use"));
+        // On punctuation there is no identifier.
+        s.feed_str("$");
+        assert_eq!(s.word_at_cursor(), None);
+    }
+
+    #[test]
+    fn a_lookup_with_no_identifier_reports_it() {
+        let mut s = Session::with_text("   ");
+        s.feed(Key::Ctrl(']'));
+        assert!(s
+            .take_effects()
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m.contains("E349"))));
+    }
+
+    #[test]
+    fn select_tag_pushes_the_stack_and_returns_the_first_match() {
+        let mut s = tagged();
+        s.feed_str("j"); // line 1
+        let tag = s.select_tag("helper", "src/main.rs").expect("helper is in the table");
+        assert_eq!(tag.path, "src/a.rs");
+        assert_eq!(s.tag_match_count(), 2, "both definitions are remembered");
+        let top = &s.tagstack().entries()[0];
+        assert_eq!((top.name.as_str(), top.path.as_str(), top.line), ("helper", "src/main.rs", 1));
+        // An unknown name selects nothing and leaves the stack alone.
+        assert!(s.select_tag("nope", "src/main.rs").is_none());
+        assert_eq!(s.tagstack().entries().len(), 1);
+    }
+
+    #[test]
+    fn ctrl_t_returns_to_the_pushed_position() {
+        let mut s = tagged();
+        s.feed_str("j");
+        s.select_tag("helper", "src/main.rs");
+        s.take_effects();
+        s.feed(Key::Ctrl('t'));
+        assert!(s.take_effects().contains(&ExEffect::Tag(TagCmd::Return {
+            path: "src/main.rs".into(),
+            line: 1,
+            col: 0,
+        })));
+        // Popping an empty stack reports rather than jumping somewhere random.
+        s.feed(Key::Ctrl('t'));
+        assert!(s
+            .take_effects()
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m.contains("E73"))));
+    }
+
+    #[test]
+    fn tnext_walks_the_definitions_of_an_overloaded_name() {
+        let mut s = tagged();
+        s.select_tag("helper", "src/main.rs");
+        s.take_effects();
+        s.feed_str(":tnext<CR>");
+        let effects = s.take_effects();
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            ExEffect::Tag(TagCmd::Jump { path, .. }) if path == "src/b.rs"
+        )));
+        assert!(effects
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m == "tag 2 of 2")));
+        // Past the end it reports instead of wrapping.
+        s.feed_str(":tnext<CR>");
+        assert!(s
+            .take_effects()
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m.contains("E425"))));
+    }
+
+    #[test]
+    fn ex_tag_takes_an_explicit_name() {
+        let mut s = tagged();
+        s.feed_str(":tag Editor<CR>");
+        assert!(s.take_effects().contains(&ExEffect::Tag(TagCmd::Lookup {
+            name: "Editor".into()
+        })));
+    }
+
+    #[test]
+    fn ex_tags_lists_the_stack() {
+        let mut s = tagged();
+        s.feed_str(":tags<CR>");
+        assert!(s
+            .take_effects()
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m.contains("empty"))));
+        s.select_tag("helper", "src/main.rs");
+        s.take_effects();
+        s.feed_str(":tags<CR>");
+        assert!(s
+            .take_effects()
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m.contains("helper") && m.contains("src/main.rs"))));
+    }
+
+    /// Ten lines, `0`..`9`, cursor at the top.
+    fn numbered() -> Session {
+        Session::with_text("0\n1\n2\n3\n4\n5\n6\n7\n8\n9")
+    }
+
+    #[test]
+    fn zf_folds_the_lines_a_motion_sweeps() {
+        let mut s = numbered();
+        s.feed_str("jj"); // line 2
+        s.feed_str("zf3j"); // fold lines 2..=5
+        let folds = s.folds().all();
+        assert_eq!(folds.len(), 1);
+        assert_eq!((folds[0].start, folds[0].end), (2, 5));
+        assert!(folds[0].closed, "a new fold starts closed, as in Vim");
+        // The text is untouched — `zf` is not an edit.
+        assert_eq!(s.lines().len(), 10);
+    }
+
+    #[test]
+    fn j_and_k_step_over_a_closed_fold() {
+        let mut s = numbered();
+        s.feed_str("jjzf3j"); // fold 2..=5, cursor on its first line
+        assert_eq!(s.cursor().line, 2);
+        s.feed_str("j");
+        assert_eq!(s.cursor().line, 6, "one press clears the whole fold");
+        s.feed_str("k");
+        assert_eq!(s.cursor().line, 2, "and back onto its head, not inside it");
+        // A count still counts *visible* lines.
+        s.feed_str("2j");
+        assert_eq!(s.cursor().line, 7);
+    }
+
+    #[test]
+    fn opening_a_fold_restores_normal_movement() {
+        let mut s = numbered();
+        s.feed_str("jjzf3j");
+        s.feed_str("zo");
+        s.feed_str("j");
+        assert_eq!(s.cursor().line, 3, "inside the open fold");
+        s.feed_str("zc"); // close it again from inside
+        assert_eq!(s.cursor().line, 2, "the cursor snaps to the fold's head");
+    }
+
+    #[test]
+    fn za_toggles_and_zr_zm_act_on_everything() {
+        let mut s = numbered();
+        s.feed_str("jjzf3j");
+        s.feed_str("za");
+        assert!(!s.folds().all()[0].closed);
+        s.feed_str("za");
+        assert!(s.folds().all()[0].closed);
+        s.feed_str("zR");
+        assert!(s.folds().all().iter().all(|f| !f.closed));
+        s.feed_str("zM");
+        assert!(s.folds().all().iter().all(|f| f.closed));
+    }
+
+    #[test]
+    fn zd_deletes_a_fold_and_ze_clears_them_all() {
+        let mut s = numbered();
+        s.feed_str("zf2j"); // 0..=2
+        s.feed_str("Gzfk"); // another near the end
+        assert_eq!(s.folds().all().len(), 2);
+        s.feed_str("gg");
+        s.feed_str("zd");
+        assert_eq!(s.folds().all().len(), 1);
+        s.feed_str("zE");
+        assert!(s.folds().is_empty());
+    }
+
+    #[test]
+    fn zi_disables_folding_without_losing_folds() {
+        let mut s = numbered();
+        s.feed_str("jjzf3j");
+        s.feed_str("zi");
+        assert!(!s.folds().enabled);
+        s.feed_str("j");
+        assert_eq!(s.cursor().line, 3, "movement ignores folds while disabled");
+        s.feed_str("zi");
+        assert!(s.folds().enabled);
+        assert_eq!(s.folds().all().len(), 1, "the fold survived");
+    }
+
+    #[test]
+    fn ex_fold_commands_take_a_range() {
+        let mut s = numbered();
+        s.feed_str(":2,5fold<CR>");
+        let folds = s.folds().all();
+        assert_eq!((folds[0].start, folds[0].end), (1, 4), "1-based range, 0-based lines");
+        s.feed_str(":2foldopen<CR>");
+        assert!(!s.folds().all()[0].closed);
+        s.feed_str(":2foldclose<CR>");
+        assert!(s.folds().all()[0].closed);
+    }
+
+    #[test]
+    fn set_foldmethod_indent_derives_folds() {
+        let mut s = Session::with_text("fn a() {\n    one;\n    two;\n}\nfn b() {}");
+        assert!(s.folds().is_empty());
+        s.feed_str(":set foldmethod=indent<CR>");
+        s.feed_str(":set shiftwidth=4<CR>");
+        let ranges: Vec<(usize, usize)> = s.folds().all().iter().map(|f| (f.start, f.end)).collect();
+        assert!(ranges.contains(&(0, 2)), "the indented body folds: {ranges:?}");
+        // An unknown fold method is reported rather than silently ignored.
+        s.feed_str(":set foldmethod=nonsense<CR>");
+        assert!(s
+            .take_effects()
+            .iter()
+            .any(|e| matches!(e, ExEffect::Message(m) if m.contains("E518"))));
+    }
+
+    #[test]
+    fn zj_and_zk_move_between_folds() {
+        let mut s = numbered();
+        s.feed_str("jjzf2j"); // fold 2..=4
+        s.feed_str("zR"); // open it, so the boundaries are reachable
+        s.feed_str("G"); // last line
+        s.feed_str("zk");
+        assert_eq!(s.cursor().line, 4, "to the end of the previous fold");
+        s.feed_str("gg");
+        s.feed_str("zj");
+        assert_eq!(s.cursor().line, 2, "to the start of the next fold");
+        // With the fold closed, landing "inside" it puts the cursor on its
+        // head — a closed fold counts as one line.
+        s.feed_str("zM");
+        s.feed_str("G");
+        s.feed_str("zk");
+        assert_eq!(s.cursor().line, 2);
+    }
+
     #[test]
     fn leader_d_opens_dashboard() {
         use crate::ex::ExEffect;
@@ -2373,4 +3317,3 @@ mod tests {
         assert_eq!(rects[0].3 + rects[1].3, 80);
     }
 }
-

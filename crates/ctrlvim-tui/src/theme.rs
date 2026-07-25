@@ -12,6 +12,7 @@
 
 use std::sync::RwLock;
 
+use ctrlvim_core::HlKind;
 use ctrlvim_markdown::MdKind;
 use ratatui::style::{Color, Modifier, Style};
 
@@ -327,6 +328,30 @@ pub fn md_style(kind: MdKind) -> Style {
         MdKind::Link => s.fg(cyan()).add_modifier(Modifier::UNDERLINED),
         MdKind::Rule => s.fg(border()),
         MdKind::Marker => s.fg(fg_dim()),
+    }
+}
+
+/// Style for a tree-sitter highlight class, in the active theme's palette.
+///
+/// The classes reuse the palette the rest of the UI already uses (keywords take
+/// the same purple as the git branch, types the same cyan as filetypes), so a
+/// highlighted buffer looks like part of the theme rather than a second one.
+pub fn syn_style(kind: HlKind) -> Style {
+    let s = Style::default();
+    match kind {
+        HlKind::Keyword => s.fg(purple()),
+        HlKind::Function => s.fg(blue()),
+        HlKind::Macro => s.fg(blue()).add_modifier(Modifier::ITALIC),
+        HlKind::Type => s.fg(cyan()),
+        HlKind::Constant => s.fg(orange()),
+        HlKind::Number => s.fg(orange()),
+        HlKind::String => s.fg(green()),
+        HlKind::Comment => s.fg(fg_dim()).add_modifier(Modifier::ITALIC),
+        HlKind::Attribute => s.fg(orange()),
+        HlKind::Operator => s.fg(cyan()),
+        HlKind::Punctuation => s.fg(fg_muted()),
+        HlKind::Property => s.fg(blue()),
+        HlKind::Variable => s.fg(fg()),
     }
 }
 

@@ -12,6 +12,7 @@ mod filebuffer;
 mod finder;
 mod overlays;
 mod plugins;
+mod quickfix;
 mod shell;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -120,6 +121,10 @@ fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         };
     }
 
+    // The quickfix pane takes a strip off the bottom, leaving the rest to the
+    // buffer — the same way Vim's quickfix window splits the frame.
+    let (content, qf_pane) = quickfix::split(app, content);
+
     if content.width == 0 || content.height == 0 {
         return;
     }
@@ -127,6 +132,9 @@ fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         BufferKind::Dashboard => dashboard::screen(f, app, content, zones),
         BufferKind::Plugins => plugins::screen(f, app, content),
         BufferKind::File => filebuffer::screen(f, app, content),
+    }
+    if let Some(pane) = qf_pane {
+        quickfix::screen(f, app, pane, zones);
     }
 }
 
@@ -170,6 +178,11 @@ pub fn icon_chip(letter: char, color: Color) -> Span<'static> {
         format!(" {letter} "),
         Style::default().fg(theme::bg_dark()).bg(color),
     )
+}
+
+/// The chip for a file entry: a Nerd Font glyph, or its letter fallback.
+pub fn file_chip(icon: &crate::model::FileIcon, mode: crate::icons::IconMode) -> Span<'static> {
+    icon_chip(icon.label(mode), icon.color)
 }
 
 /// Prefix span for a selected row: a `▎` accent bar (or two spaces when not

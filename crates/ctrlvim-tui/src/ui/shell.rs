@@ -151,7 +151,11 @@ pub fn status_line(f: &mut Frame, app: &App, area: Rect) {
     }
     hints.push(("^⇥ tabs", theme::fg_dim()));
     hints.push(("? help", theme::fg_dim()));
-    hints.push(("rust", theme::fg()));
+    // The language tag reports the buffer's real filetype — the one the
+    // tree-sitter highlighter is using — and is blank when there isn't one.
+    if let Some(ft) = app.editor_filetype() {
+        hints.push((ft.name(), theme::fg()));
+    }
     let mut right_spans: Vec<Span> = Vec::new();
     for (i, (t, c)) in hints.iter().enumerate() {
         if i > 0 {

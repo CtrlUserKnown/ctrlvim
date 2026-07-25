@@ -8,6 +8,8 @@
 use ctrlvim_options::WindowOptions;
 use ctrlvim_types::{BufferId, Position, WindowId};
 
+use crate::fold::Folds;
+
 /// A window: a viewport onto a buffer. This is pure model state.
 pub struct Window {
     pub buffer: BufferId,
@@ -25,6 +27,8 @@ pub struct Window {
     /// Viewport width in columns.
     pub width: usize,
     pub options: WindowOptions,
+    /// Folds are per-window in Vim: two splits on one buffer fold separately.
+    pub folds: Folds,
 }
 
 impl Window {
@@ -38,24 +42,37 @@ impl Window {
             height: 24,
             width: 80,
             options: WindowOptions::default(),
+            folds: Folds::new(),
         }
     }
 
     /// Scroll so the cursor stays within `scrolloff` of the viewport edges,
     /// adjusting `topline`. Returns the (possibly unchanged) topline. This is
     /// the model-side of `update_topline`, with no drawing.
+    ///
+    /// The arithmetic is in **screen rows**, not buffer lines: a closed fold
+    /// occupies one row however many lines it holds, so a viewport of `height`
+    /// rows can span far more lines than that. `topline` itself stays a buffer
+    /// line (Vim's `w_topline`).
     pub fn scroll_to_cursor(&mut self, scrolloff: usize, line_count: usize) -> usize {
         let so = scrolloff.min(self.height.saturating_sub(1) / 2);
-        let cursor_line = self.cursor.line;
+        let cursor_row = self.folds.screen_line_of(self.cursor.line);
+        let top_row = self.folds.screen_line_of(self.topline);
+
         // Cursor above viewport (+ scrolloff).
-        if cursor_line < self.topline + so {
-            self.topline = cursor_line.saturating_sub(so);
+        if cursor_row < top_row + so {
+            let target = cursor_row.saturating_sub(so);
+            self.topline = self.folds.buffer_line_of(target, line_count);
         }
         // Cursor below viewport (- scrolloff).
-        let bottom = self.topline + self.height.saturating_sub(1);
-        if cursor_line + so > bottom {
-            let new_top = cursor_line + so + 1 - self.height;
-            self.topline = new_top.min(line_count.saturating_sub(1));
+        let top_row = self.folds.screen_line_of(self.topline);
+        let bottom_row = top_row + self.height.saturating_sub(1);
+        if cursor_row + so > bottom_row {
+            let target = cursor_row + so + 1 - self.height;
+            self.topline = self
+                .folds
+                .buffer_line_of(target, line_count)
+                .min(line_count.saturating_sub(1));
         }
         self.topline
     }
@@ -202,5 +219,40 @@ mod tests {
         w.cursor = Position::new(50, 0);
         w.scroll_to_cursor(0, 100);
         assert!(w.topline <= 50 && 50 <= w.topline + 9);
+    }
+
+    #[test]
+    fn scrolling_counts_a_closed_fold_as_one_row() {
+        let mut w = Window::new(BufferId(0));
+        w.height = 10;
+        // Fold 40 lines away between the top and the cursor: the viewport now
+        // reaches much further down the buffer than its 10 rows suggest.
+        w.folds.create(5, 45);
+        w.cursor = Position::new(50, 0);
+        w.scroll_to_cursor(0, 100);
+
+        let top_row = w.folds.screen_line_of(w.topline);
+        let cursor_row = w.folds.screen_line_of(50);
+        assert!(
+            (top_row..top_row + w.height).contains(&cursor_row),
+            "cursor row {cursor_row} outside rows {top_row}..{}",
+            top_row + w.height
+        );
+        // Lines 0..=4, the fold's single row, then 46..=50 is 11 rows — one more
+        // than the viewport — so it scrolls by exactly one row. A line-based
+        // calculation would instead have scrolled all the way to line 41.
+        assert_eq!(w.topline, 1);
+    }
+
+    #[test]
+    fn scrolling_up_into_a_fold_lands_on_a_visible_line() {
+        let mut w = Window::new(BufferId(0));
+        w.height = 5;
+        w.folds.create(10, 30);
+        w.cursor = Position::new(35, 0);
+        w.scroll_to_cursor(0, 100);
+        // Whatever topline it picked must itself be visible, not a hidden line
+        // inside the closed fold.
+        assert!(!w.folds.is_hidden(w.topline), "topline {} is hidden", w.topline);
     }
 }

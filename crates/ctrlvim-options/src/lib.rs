@@ -12,6 +12,33 @@
 //! file can later replace the field definitions here without changing callers;
 //! the resolution logic ([`Options::resolve`]-style getters) stays identical.
 
+/// Where a window's folds come from (`'foldmethod'`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FoldMethod {
+    /// Folds exist only where the user made them (`zf`). Neovim's default.
+    #[default]
+    Manual,
+    /// Folds are derived from indentation.
+    Indent,
+}
+
+impl FoldMethod {
+    pub fn parse(s: &str) -> Option<FoldMethod> {
+        match s {
+            "manual" => Some(FoldMethod::Manual),
+            "indent" => Some(FoldMethod::Indent),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FoldMethod::Manual => "manual",
+            FoldMethod::Indent => "indent",
+        }
+    }
+}
+
 /// Global option values (the fallback layer).
 #[derive(Debug, Clone)]
 pub struct GlobalOptions {
@@ -22,6 +49,9 @@ pub struct GlobalOptions {
     pub wrap: bool,
     pub scrolloff: i64,
     pub iskeyword: String,
+    pub foldenable: bool,
+    pub foldmethod: FoldMethod,
+    pub foldcolumn: i64,
 }
 
 impl Default for GlobalOptions {
@@ -35,6 +65,9 @@ impl Default for GlobalOptions {
             wrap: true,
             scrolloff: 0,
             iskeyword: "@,48-57,_,192-255".to_string(),
+            foldenable: true,
+            foldmethod: FoldMethod::Manual,
+            foldcolumn: 0,
         }
     }
 }
@@ -54,6 +87,9 @@ pub struct WindowOptions {
     pub number: Option<bool>,
     pub wrap: Option<bool>,
     pub scrolloff: Option<i64>,
+    pub foldenable: Option<bool>,
+    pub foldmethod: Option<FoldMethod>,
+    pub foldcolumn: Option<i64>,
 }
 
 /// Resolves an effective option value from the global + local layers. Held by
@@ -97,6 +133,15 @@ impl OptionContext<'_> {
     }
     pub fn scrolloff(&self) -> i64 {
         self.window.scrolloff.unwrap_or(self.global.scrolloff)
+    }
+    pub fn foldenable(&self) -> bool {
+        self.window.foldenable.unwrap_or(self.global.foldenable)
+    }
+    pub fn foldmethod(&self) -> FoldMethod {
+        self.window.foldmethod.unwrap_or(self.global.foldmethod)
+    }
+    pub fn foldcolumn(&self) -> i64 {
+        self.window.foldcolumn.unwrap_or(self.global.foldcolumn)
     }
 }
 

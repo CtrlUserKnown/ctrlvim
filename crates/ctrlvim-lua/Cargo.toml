@@ -14,4 +14,4 @@ ctrlvim-treesitter.workspace = true
 mlua.workspace = true
 
 [dev-dependencies]
-tree-sitter-json = "0.21"
+tree-sitter-json = "0.24"

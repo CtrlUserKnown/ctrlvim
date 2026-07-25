@@ -102,6 +102,97 @@ pub fn up(_buf: &Buffer, pos: Position, count: usize) -> MotionResult {
     }
 }
 
+/// `j`/`k` with folds applied: each step moves one *visible* line, so a closed
+/// fold is crossed in a single press rather than `count` presses through its
+/// hidden body. `dir` is +1 for `j`, -1 for `k`.
+///
+/// With no closed folds this is exactly [`down`]/[`up`].
+pub fn vertical_folded(
+    buf: &Buffer,
+    folds: &crate::fold::Folds,
+    pos: Position,
+    count: usize,
+    dir: isize,
+) -> MotionResult {
+    let line_count = buf.line_count();
+    let mut line = pos.line;
+    for _ in 0..count.max(1) {
+        match folds.next_visible(line, dir, line_count) {
+            Some(next) => line = next,
+            // At the edge of the buffer: stop, as `j` does on the last line.
+            None => break,
+        }
+    }
+    MotionResult {
+        target: Position::new(line, pos.col),
+        kind: MotionKind::Linewise,
+    }
+}
+
+/// `}` (forward) / `{` (backward) — move a paragraph, distilled from
+/// `textobject.c`'s `findpar()`.
+///
+/// A paragraph boundary is an **empty** line; a whitespace-only line is not one,
+/// matching Vim. A run of consecutive empty lines counts as a single boundary,
+/// so repeating `}` through a double-spaced file doesn't stop twice — that's
+/// what the "skipped past content" state tracks.
+///
+/// Exclusive, so `d}` deletes up to but not including the boundary line. Running
+/// off either end lands on the buffer's edge rather than refusing to move: at
+/// the end that's the last line's *end*, so `d}` on the final paragraph deletes
+/// through the last line.
+pub fn paragraph(buf: &Buffer, pos: Position, count: usize, forward: bool) -> MotionResult {
+    let n = buf.line_count();
+    let mut line = pos.line;
+    let mut at_edge = false;
+    for _ in 0..count.max(1) {
+        match next_paragraph(buf, line, forward, n) {
+            Some(next) => line = next,
+            None => {
+                line = if forward { n.saturating_sub(1) } else { 0 };
+                at_edge = true;
+                break;
+            }
+        }
+    }
+    // Landing on the buffer's end means "everything to the end"; anywhere else
+    // the boundary line itself is excluded, which column 0 expresses.
+    let col = if at_edge && forward { line_chars(buf, line).len() } else { 0 };
+    MotionResult {
+        target: Position::new(line, col),
+        kind: MotionKind::CharExclusive,
+    }
+}
+
+/// One paragraph step, or `None` when the buffer edge comes first.
+fn next_paragraph(buf: &Buffer, from: usize, forward: bool, n: usize) -> Option<usize> {
+    let empty = |line: usize| buf.line(line).unwrap_or_default().is_empty();
+    // Starting on content means the very next empty line is a boundary;
+    // starting *on* a boundary means skipping its run first.
+    let mut skipped_content = !empty(from);
+    let mut line = from;
+    loop {
+        if forward {
+            if line + 1 >= n {
+                return None;
+            }
+            line += 1;
+        } else {
+            if line == 0 {
+                return None;
+            }
+            line -= 1;
+        }
+        if empty(line) {
+            if skipped_content {
+                return Some(line);
+            }
+        } else {
+            skipped_content = true;
+        }
+    }
+}
+
 /// `0` — first column.
 pub fn line_start(_buf: &Buffer, pos: Position) -> MotionResult {
     MotionResult {

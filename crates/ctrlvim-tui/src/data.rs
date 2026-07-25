@@ -12,10 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime};
 
-use ratatui::style::Color;
-
 use crate::model::{
-    icon_for, FileEntry, GitStatus, LspServer, Plugin, PluginStatus, SessionEntry, Stats,
+    icon_for, FileEntry, FileIcon, GitStatus, LspServer, Plugin, PluginStatus, SessionEntry, Stats,
 };
 
 /// A gathered snapshot of the project.
@@ -68,7 +66,13 @@ const SKIP_DIRS: &[&str] = &[
 const MAX_FILES: usize = 8000;
 const MAX_DEPTH: usize = 6;
 
-fn scan_files(root: &Path) -> Vec<Scanned> {
+/// Walk the project for files worth listing or searching, skipping VCS/build
+/// directories and dotfiles and bounded by depth and count.
+///
+/// This is the one definition of "which files count" — the dashboard's recent
+/// files and `:vimgrep` both go through it, so they can never disagree about
+/// whether `target/` is part of the project.
+pub fn walk_project(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -86,22 +90,39 @@ fn scan_files(root: &Path) -> Vec<Scanned> {
                 }
                 stack.push((path, depth + 1));
             } else if ft.is_file() {
-                let Ok(meta) = entry.metadata() else { continue };
-                let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let ext = fname.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-                out.push(Scanned { rel, name: fname, mtime, ext });
+                out.push(path);
                 if out.len() >= MAX_FILES {
                     break;
                 }
             }
         }
     }
+    // `read_dir` order is whatever the filesystem hands back; sorting makes
+    // quickfix entries and the file list stable between runs.
+    out.sort();
     out
+}
+
+/// A project path relative to `root`, with `/` separators on every platform.
+pub fn relative_to(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+fn scan_files(root: &Path) -> Vec<Scanned> {
+    walk_project(root)
+        .into_iter()
+        .filter_map(|path| {
+            let meta = fs::metadata(&path).ok()?;
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            Some(Scanned {
+                rel: relative_to(root, &path),
+                name,
+                mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                ext,
+            })
+        })
+        .collect()
 }
 
 fn recent_files(scanned: &[Scanned]) -> Vec<FileEntry> {
@@ -110,12 +131,10 @@ fn recent_files(scanned: &[Scanned]) -> Vec<FileEntry> {
     idx.into_iter()
         .take(8)
         .map(|s| {
-            let (letter, color) = icon_for(&s.name);
             FileEntry {
                 name: s.name.clone(),
                 path: s.rel.clone(),
-                icon_color: color,
-                icon_letter: letter,
+                icon: icon_for(&s.name),
                 modified: humanize_ago(&s.mtime),
             }
         })
@@ -153,8 +172,7 @@ pub struct FinderEntry {
     pub size: String,
     /// Modified time, e.g. `Jul 06 13:24` (empty for the `../` row).
     pub mtime: String,
-    pub icon_letter: char,
-    pub icon_color: Color,
+    pub icon: FileIcon,
 }
 
 /// List `dir` for the browser: directories first, then files (each group
@@ -166,8 +184,7 @@ pub fn list_dir(dir: &Path) -> Vec<FinderEntry> {
             let Ok(meta) = entry.metadata() else { continue };
             let is_dir = meta.is_dir();
             let raw = entry.file_name().to_string_lossy().into_owned();
-            let (icon_letter, icon_color) =
-                if is_dir { ('/', crate::theme::blue()) } else { icon_for(&raw) };
+            let icon = if is_dir { FileIcon::dir() } else { icon_for(&raw) };
             let e = FinderEntry {
                 name: if is_dir { format!("{raw}/") } else { raw },
                 path: entry.path(),
@@ -175,8 +192,7 @@ pub fn list_dir(dir: &Path) -> Vec<FinderEntry> {
                 perms: perms_string(meta.permissions().mode(), is_dir),
                 size: human_size(meta.len()),
                 mtime: fmt_mtime(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
-                icon_letter,
-                icon_color,
+                icon,
             };
             if is_dir { dirs.push(e) } else { files.push(e) }
         }
@@ -198,8 +214,7 @@ pub fn list_dir(dir: &Path) -> Vec<FinderEntry> {
             is_dir: true,
             size: String::new(),
             mtime: String::new(),
-            icon_letter: '/',
-            icon_color: crate::theme::blue(),
+            icon: FileIcon::dir(),
         });
     }
     dirs

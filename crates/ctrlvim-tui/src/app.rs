@@ -15,10 +15,16 @@
 //! The dashboard's recent-files/git/plugin/LSP data is still static mock data
 //! until the engine grows sources for it.
 
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ctrlvim_core::{BufferCmd, Ctrlvim, ExEffect, Key, Selection};
+use ctrlvim_core::syntax::{self, Filetype};
+use ctrlvim_core::{
+    grep_text, BufferCmd, Ctrlvim, Event, EventLoop, ExEffect, HlSpan, Jobs, Key, LineBuffer,
+    Matcher, OutputParser, QfItem, QuickfixCmd, Selection, TagAddress, TagCmd, TimerService,
+};
 
 use crate::config::Config;
 use crate::data::{list_dir, FinderEntry};
@@ -115,6 +121,79 @@ impl FinderCommand {
     }
 }
 
+/// Match a `/`-separated project path against a shell-style glob.
+///
+/// Supports the forms `:vimgrep` is actually given: `*` (any run within one
+/// path segment), `**` (any run across segments), and `?`. A pattern with no
+/// `/` matches against the file name alone, so `:vimgrep /x/ *.rs` searches
+/// every Rust file rather than only those at the root.
+pub fn glob_match(path: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return true;
+    }
+    if !pattern.contains('/') {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        return glob_segment(name, pattern);
+    }
+    glob_segment(path, pattern)
+}
+
+/// Backtracking wildcard match over chars. `**` crosses `/`, a single `*`
+/// doesn't.
+fn glob_segment(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    fn go(t: &[char], ti: usize, p: &[char], pi: usize) -> bool {
+        if pi == p.len() {
+            return ti == t.len();
+        }
+        match p[pi] {
+            '*' => {
+                let double = pi + 1 < p.len() && p[pi + 1] == '*';
+                let (next_pi, crosses) = if double { (pi + 2, true) } else { (pi + 1, false) };
+                // `**/` also matches zero directories, so skip a following `/`.
+                let next_pi = if double && next_pi < p.len() && p[next_pi] == '/' {
+                    next_pi + 1
+                } else {
+                    next_pi
+                };
+                for skip in ti..=t.len() {
+                    if !crosses && t[ti..skip].contains(&'/') {
+                        break;
+                    }
+                    if go(t, skip, p, next_pi) {
+                        return true;
+                    }
+                }
+                false
+            }
+            '?' => ti < t.len() && t[ti] != '/' && go(t, ti + 1, p, pi + 1),
+            c => ti < t.len() && t[ti] == c && go(t, ti + 1, p, pi + 1),
+        }
+    }
+    go(&t, 0, &p, 0)
+}
+
+/// A path's file name for use as a buffer label, falling back to the whole
+/// path when there isn't one.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// A cheap content fingerprint used to invalidate the highlight cache; any edit
+/// changes it, and it costs a pass over the text rather than a re-parse.
+fn text_hash(lines: &[String]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    lines.len().hash(&mut hasher);
+    for line in lines {
+        line.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// Whether a file name looks like markdown.
 fn is_markdown_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -135,6 +214,9 @@ pub enum Action {
     OpenDashboard,
     ToggleLsp(usize),
     ToggleMouse,
+    CycleIconMode,
+    /// Select (and jump to) a quickfix entry by list index.
+    QuickfixSelect(usize),
     SetSettingsIndex(usize),
     OpenPalette,
     ClosePalette,
@@ -209,7 +291,47 @@ pub struct App {
     /// User configuration loaded from `~/.config/ctrlvim/config.toml`.
     pub config: Config,
 
+    /// Tree-sitter highlights for the active buffer, recomputed when its text
+    /// changes. Rendering takes `&App`, so this is behind a `RefCell`.
+    syntax: RefCell<Option<SyntaxCache>>,
+
+    /// Whether the quickfix pane is showing (`:copen` / `:cclose`).
+    pub quickfix_open: bool,
+    /// Selected row in the quickfix pane.
+    pub quickfix_index: usize,
+    /// Queue background jobs push their output onto.
+    events: EventLoop,
+    /// Job runner + its runtime, created on the first `:make`/`:grep`.
+    jobs: Option<Jobs>,
+    timers: Option<TimerService>,
+    /// The job currently filling the quickfix list, if any.
+    job: Option<RunningJob>,
+    /// Modified time of the tags file when it was last loaded, so a
+    /// regenerated one is picked up without a reload command.
+    tags_loaded_at: Option<std::time::SystemTime>,
+
     pub should_quit: bool,
+}
+
+/// A `:make`/`:grep` in flight: its output is reassembled into lines, parsed
+/// into entries, and installed on the engine when the process exits.
+struct RunningJob {
+    id: u64,
+    title: String,
+    /// Reassembles pipe chunks into lines…
+    lines: LineBuffer,
+    /// …which this turns into entries, stitching multi-line diagnostics.
+    parser: OutputParser,
+    items: Vec<QfItem>,
+}
+
+/// Cached highlight spans plus the buffer state they were computed from.
+struct SyntaxCache {
+    /// Active buffer, a hash of its text, and the visible window (`top`,
+    /// `rows`) — an edit or a scroll invalidates.
+    key: (usize, u64, usize, usize),
+    /// Spans per visible row, indexed from the window's first line.
+    lines: Vec<Vec<HlSpan>>,
 }
 
 impl App {
@@ -253,6 +375,14 @@ impl App {
             settings_index: 0,
             help_open: false,
             config,
+            syntax: RefCell::new(None),
+            quickfix_open: false,
+            quickfix_index: 0,
+            events: EventLoop::new(),
+            jobs: None,
+            timers: None,
+            job: None,
+            tags_loaded_at: None,
             should_quit: false,
         }
     }
@@ -330,6 +460,8 @@ impl App {
             Action::OpenDashboard => self.open_dashboard(),
             Action::ToggleLsp(i) => self.toggle_lsp(i),
             Action::ToggleMouse => self.toggle_mouse(),
+            Action::CycleIconMode => self.cycle_icon_mode(),
+            Action::QuickfixSelect(i) => self.quickfix_select(i),
             Action::SetSettingsIndex(i) => {
                 if i < self.settings_count() {
                     self.settings_index = i;
@@ -511,7 +643,7 @@ impl App {
     }
 
     /// Number of Settings rows: the editor options plus each LSP server.
-    pub const SETTINGS_EDITOR_OPTIONS: usize = 2; // drawer, mouse
+    pub const SETTINGS_EDITOR_OPTIONS: usize = 3; // drawer, mouse, icons
 
     pub fn settings_count(&self) -> usize {
         Self::SETTINGS_EDITOR_OPTIONS + self.project.lsp.len()
@@ -533,6 +665,7 @@ impl App {
         match self.settings_index {
             0 => self.toggle_startup_drawer(),
             1 => self.toggle_mouse(),
+            2 => self.cycle_icon_mode(),
             i => self.toggle_lsp(i - Self::SETTINGS_EDITOR_OPTIONS),
         }
     }
@@ -549,6 +682,14 @@ impl App {
         self.config.mouse = !self.config.mouse;
         self.config.save();
         self.message = format!("mouse: {}", if self.config.mouse { "on" } else { "off" });
+    }
+
+    /// Cycle file icons through auto → nerd → text, applying it live and
+    /// persisting it to the config.
+    pub fn cycle_icon_mode(&mut self) {
+        self.config.icons = self.config.icons.next();
+        self.config.save();
+        self.message = format!("file icons: {}", self.config.icons.label());
     }
 
     /// Open (or focus) one of the dashboard's recent files by list index.
@@ -710,8 +851,247 @@ impl App {
                 ExEffect::OpenDashboard => self.open_dashboard(),
                 ExEffect::Edit(name) => self.new_file(&name),
                 ExEffect::Message(m) => self.message = m,
+                ExEffect::Quickfix(cmd) => self.host_quickfix(cmd),
+                ExEffect::Tag(cmd) => self.host_tag(cmd),
             }
         }
+    }
+
+    /// Host side of the tag commands: read the tags file, open the file a tag
+    /// points at, and place the cursor. The table, the stack, and the search
+    /// itself stay in the engine.
+    fn host_tag(&mut self, cmd: TagCmd) {
+        match cmd {
+            TagCmd::Lookup { name } => {
+                self.load_tags_if_changed();
+                if self.engine.session.tags().is_empty() {
+                    self.message = "E433: no tags file (run `ctags -R .`)".into();
+                    return;
+                }
+                let from = self
+                    .active_buffer()
+                    .path
+                    .as_ref()
+                    .map(|p| crate::data::relative_to(&self.root, p))
+                    .unwrap_or_default();
+                match self.engine.session.select_tag(&name, &from) {
+                    Some(tag) => {
+                        let total = self.engine.session.tag_match_count();
+                        self.tag_goto(&tag.path, &tag.address);
+                        if total > 1 {
+                            self.message = format!("tag 1 of {total}");
+                        }
+                    }
+                    None => self.message = format!("E426: tag not found: {name}"),
+                }
+            }
+            TagCmd::Jump { path, address } => self.tag_goto(&path, &address),
+            TagCmd::Return { path, line, col } => {
+                if !path.is_empty() {
+                    let full = self.root.join(&path);
+                    let name = file_name_of(&full);
+                    self.open_path(full, name);
+                }
+                self.engine.session.set_cursor_clamped(line, col);
+            }
+        }
+    }
+
+    /// Open a tag's file and put the cursor on its definition. A pattern
+    /// address is resolved against the file *as it is now*, so a definition
+    /// that moved since `ctags` ran is still found.
+    fn tag_goto(&mut self, path: &str, address: &TagAddress) {
+        let full = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            self.root.join(path)
+        };
+        let name = file_name_of(&full);
+        self.open_path(full, name);
+        let lines = self.editor_lines();
+        match ctrlvim_core::resolve_tag_address(address, &lines) {
+            Some(line) => self.engine.session.set_cursor_clamped(line, 0),
+            None => self.message = "E434: tag pattern not found".into(),
+        }
+    }
+
+    /// Load the tags file if it appeared or changed since the last load.
+    ///
+    /// Checking the mtime on each lookup means running `ctags -R .` in another
+    /// terminal takes effect immediately, without a reload command.
+    fn load_tags_if_changed(&mut self) {
+        let path = self.root.join("tags");
+        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if stamp.is_none() {
+            return;
+        }
+        if stamp == self.tags_loaded_at {
+            return;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            self.engine.session.set_tags(ctrlvim_core::TagTable::parse(&text));
+            self.tags_loaded_at = stamp;
+        }
+    }
+
+    /// Host side of the quickfix commands: the engine owns the list, the
+    /// frontend owns the filesystem, the process, and the pane.
+    fn host_quickfix(&mut self, cmd: QuickfixCmd) {
+        match cmd {
+            QuickfixCmd::Open => self.quickfix_open = !self.engine.session.quickfix().is_empty(),
+            QuickfixCmd::Close => self.quickfix_open = false,
+            QuickfixCmd::Jump { path, line, col } => self.quickfix_goto(&path, line, col),
+            QuickfixCmd::Grep { pattern, glob } => self.host_vimgrep(&pattern, glob.as_deref()),
+            QuickfixCmd::Run { program, args, title } => self.host_run_job(program, args, title),
+        }
+    }
+
+    /// Open a quickfix entry's file and put the cursor on the match.
+    fn quickfix_goto(&mut self, path: &str, line: usize, col: usize) {
+        let path = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            self.root.join(path)
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.open_path(path, name);
+        self.engine.session.set_cursor_clamped(line, col);
+    }
+
+    /// `:vimgrep` — walk the project and match each file's contents. The walk
+    /// and the reads are the host's (the engine never touches the filesystem);
+    /// what counts as a match is the engine's, via [`Matcher`].
+    fn host_vimgrep(&mut self, pattern: &str, glob: Option<&str>) {
+        let matcher = match Matcher::new(pattern) {
+            Ok(m) => m,
+            Err(e) => {
+                self.message = e;
+                return;
+            }
+        };
+        let mut items = Vec::new();
+        for path in crate::data::walk_project(&self.root) {
+            let rel = crate::data::relative_to(&self.root, &path);
+            if let Some(glob) = glob {
+                if !glob_match(&rel, glob) {
+                    continue;
+                }
+            }
+            // Unreadable or binary files are skipped, not reported.
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            items.extend(grep_text(&matcher, Path::new(&rel), &text));
+        }
+        let title = format!(":vimgrep /{pattern}/");
+        self.finish_quickfix(items, title);
+    }
+
+    /// `:make` / `:grep` — spawn the program and collect its output into the
+    /// list as it streams (see [`App::poll_jobs`]).
+    fn host_run_job(&mut self, program: String, args: Vec<String>, title: String) {
+        let root = self.root.clone();
+        let jobs = match self.jobs_mut() {
+            Some(jobs) => jobs,
+            None => {
+                self.message = "E902: could not start the job runtime".into();
+                return;
+            }
+        };
+        let id = jobs.spawn(&program, &args, &root);
+        self.message = format!("{title}: running…");
+        self.job = Some(RunningJob {
+            id,
+            title,
+            lines: LineBuffer::new(),
+            parser: OutputParser::new(),
+            items: Vec::new(),
+        });
+    }
+
+    /// The job runtime, created on first use so a session that never runs a
+    /// job never pays for a tokio runtime.
+    fn jobs_mut(&mut self) -> Option<&mut Jobs> {
+        if self.jobs.is_none() {
+            let timers = TimerService::new(self.events.sender()).ok()?;
+            self.jobs = Some(Jobs::new(timers.runtime().handle().clone(), self.events.sender()));
+            self.timers = Some(timers);
+        }
+        self.jobs.as_mut()
+    }
+
+    /// Drain background job output. Called from the main loop's poll tick so a
+    /// long build streams in without blocking keystrokes.
+    ///
+    /// Returns true when something changed and the screen needs a repaint.
+    pub fn poll_jobs(&mut self) -> bool {
+        let events = self.events.drain();
+        if events.is_empty() {
+            return false;
+        }
+        let mut finished = None;
+        for event in events {
+            match event {
+                Event::ProcessOutput { id, data } => {
+                    let Some(job) = self.job.as_mut().filter(|j| j.id == id) else { continue };
+                    for line in job.lines.push(&data) {
+                        if let Some(item) = job.parser.push(&line) {
+                            job.items.push(item);
+                        }
+                    }
+                }
+                Event::ProcessExit { id, code } => {
+                    let Some(job) = self.job.as_mut().filter(|j| j.id == id) else { continue };
+                    if let Some(last) = job.lines.flush() {
+                        if let Some(item) = job.parser.push(&last) {
+                            job.items.push(item);
+                        }
+                    }
+                    finished = self.job.take().map(|j| (j, code));
+                }
+                // Timers/RPC are not wired into the frontend yet.
+                _ => {}
+            }
+        }
+        if let Some((job, code)) = finished {
+            let title = format!("{} (exit {code})", job.title);
+            self.finish_quickfix(job.items, title);
+        }
+        true
+    }
+
+    /// Store a freshly-built list on the engine and report what came back.
+    fn finish_quickfix(&mut self, items: Vec<QfItem>, title: String) {
+        let n = items.len();
+        self.engine.session.set_quickfix(items, title.clone());
+        if n == 0 {
+            self.quickfix_open = false;
+            self.message = format!("{title}: no matches");
+        } else {
+            self.quickfix_open = true;
+            self.quickfix_index = 0;
+            self.message = format!("{title}: {n} entries");
+        }
+    }
+
+    /// Select entry `i` and jump to it — clicking a row, or `j`/`k` + Enter.
+    pub fn quickfix_select(&mut self, i: usize) {
+        if let Some(item) = self.engine.session.quickfix_select(i) {
+            self.quickfix_index = i;
+            let path = item.path.to_string_lossy().into_owned();
+            self.quickfix_goto(&path, item.line, item.col);
+        }
+    }
+
+    /// Move the quickfix selection without jumping (the pane's `j`/`k`).
+    pub fn move_quickfix_selection(&mut self, dir: i32) {
+        let n = self.engine.session.quickfix().len();
+        if n == 0 {
+            return;
+        }
+        let i = self.quickfix_index as i32;
+        self.quickfix_index = (((i + dir) % n as i32 + n as i32) % n as i32) as usize;
     }
 
     /// Run a line of Vimscript (`:let`/`:echo`/…) and surface `:echo` output or
@@ -950,6 +1330,74 @@ impl App {
     /// The active visual selection to highlight, or `None` outside Visual mode.
     pub fn editor_selection(&self) -> Option<Selection> {
         self.engine.selection()
+    }
+
+    /// The active buffer's filetype, when it's one the engine can highlight.
+    pub fn editor_filetype(&self) -> Option<Filetype> {
+        let b = self.active_buffer();
+        if !matches!(b.kind, BufferKind::File) {
+            return None;
+        }
+        let name = b.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| b.label.clone());
+        Filetype::from_path(&name)
+    }
+
+    /// Tree-sitter highlight spans for rows `[top, top + rows)` of the active
+    /// buffer — empty when the filetype has no grammar, or when live markdown
+    /// rendering already owns the buffer's styling.
+    ///
+    /// Only the visible window is highlighted, and the result is cached until
+    /// the text (or the window) changes, so an idle frame costs a hash of the
+    /// buffer rather than a re-parse.
+    pub fn editor_highlights(&self, lines: &[String], top: usize, rows: usize) -> Vec<Vec<HlSpan>> {
+        let Some(ft) = self.editor_filetype() else { return Vec::new() };
+        if self.md_render_active() {
+            return Vec::new();
+        }
+        let key = (self.active, text_hash(lines), top, rows);
+        let mut cache = self.syntax.borrow_mut();
+        if cache.as_ref().map(|c| c.key) != Some(key) {
+            let spans = syntax::highlight_window(ft, &lines.join("\n"), top, top + rows);
+            *cache = Some(SyntaxCache { key, lines: spans });
+        }
+        cache.as_ref().expect("just populated").lines.clone()
+    }
+
+    /// The active window's folds.
+    pub fn folds(&self) -> &ctrlvim_core::Folds {
+        self.engine.session.folds()
+    }
+
+    /// The closed fold whose *head* is `line`, i.e. the one this row should draw
+    /// a summary for instead of the line's text.
+    pub fn fold_head_at(&self, line: usize) -> Option<&ctrlvim_core::Fold> {
+        self.folds().closed_at(line).filter(|f| f.start == line)
+    }
+
+    /// The buffer lines a viewport of `rows` rows shows, starting at screen row
+    /// `top`. With no closed folds this is just `top..top + rows`; with them,
+    /// hidden lines are skipped, so **the renderer must index lines through this
+    /// rather than assuming row == line**.
+    pub fn visible_lines(&self, top: usize, rows: usize, line_count: usize) -> Vec<usize> {
+        let folds = self.folds();
+        let mut out = Vec::with_capacity(rows);
+        let mut line = folds.buffer_line_of(top, line_count);
+        for _ in 0..rows {
+            if line >= line_count {
+                break;
+            }
+            out.push(line);
+            match folds.next_visible(line, 1, line_count) {
+                Some(next) => line = next,
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// The screen row a buffer line draws on (its fold's row when hidden).
+    pub fn screen_line_of(&self, line: usize) -> usize {
+        self.folds().screen_line_of(line)
     }
 
     /// `hlsearch` match column ranges on `line` (empty when highlighting is off).

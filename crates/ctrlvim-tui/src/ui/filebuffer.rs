@@ -8,7 +8,7 @@
 //! the markup. One source line is always one screen row, so the cursor/scroll
 //! math is identical whether rendering is on or off.
 
-use ctrlvim_core::{Selection, VisualKind};
+use ctrlvim_core::{HlSpan, Selection, VisualKind};
 use ctrlvim_markdown::{analyze, MdLine};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -32,8 +32,14 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
     let content_w = (area.x + area.width).saturating_sub(text_x);
     let height = area.height as usize;
 
-    // Scroll so the cursor line stays visible.
-    let top = if cur_line >= height { cur_line - height + 1 } else { 0 };
+    // Scroll so the cursor stays visible — in *screen* rows, since a closed
+    // fold collapses many buffer lines onto one.
+    let cur_row = app.screen_line_of(cur_line);
+    let top_row = if cur_row >= height { cur_row - height + 1 } else { 0 };
+    // The buffer lines these rows actually show: `visible[row]`, never
+    // `top + row`, because folds make those differ.
+    let visible = app.visible_lines(top_row, height, lines.len());
+    let first_line = visible.first().copied().unwrap_or(0);
 
     // Cursor color tracks the mode: green in insert, blue otherwise.
     let cursor_color = if app.editor_mode() == "i" { theme::green() } else { theme::blue() };
@@ -42,25 +48,45 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
     // state spans lines, so this needs the full source, not just the viewport.
     let md: Option<Vec<MdLine>> =
         app.md_render_active().then(|| analyze(&lines.join("\n")));
+    // Tree-sitter highlights over the buffer-line span the viewport covers —
+    // wider than `height` when folds are closed inside it — indexed from
+    // `first_line`.
+    let span_len = visible.last().map(|last| last + 1 - first_line).unwrap_or(0);
+    let hl = app.editor_highlights(&lines, first_line, span_len);
 
     for row in 0..height {
-        let i = top + row;
         let y = area.y + row as u16;
-        if i >= lines.len() {
+        let Some(&i) = visible.get(row) else {
             // Empty rows past end-of-buffer, Vim-style `~` markers.
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled("~", Style::default().fg(theme::border())))),
                 Rect { x: area.x, y, width: 1, height: 1 },
             );
             continue;
-        }
+        };
 
         let raw = &lines[i];
         let gutter = format!("{:>w$}  ", i + 1, w = gutter_w as usize);
         let mut spans = vec![Span::styled(gutter, Style::default().fg(theme::border()))];
+        // A closed fold draws one summary row instead of its lines.
+        if let Some(fold) = app.fold_head_at(i) {
+            spans.push(Span::styled(
+                ctrlvim_core::fold_text(fold, raw),
+                Style::default().fg(theme::fg_dim()).bg(theme::code_bg()),
+            ));
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::code_bg())),
+                Rect { x: area.x, y, width: area.width, height: 1 },
+            );
+            continue;
+        }
         match &md {
             Some(mdlines) => md_spans(&mdlines[i], i == cur_line, content_w, &mut spans),
-            None => spans.push(Span::styled(raw.clone(), Style::default().fg(theme::fg()))),
+            None => syntax_spans(
+                raw,
+                hl.get(i - first_line).map(Vec::as_slice).unwrap_or(&[]),
+                &mut spans,
+            ),
         }
         f.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg())),
@@ -155,6 +181,40 @@ fn selection_cols(sel: &Selection, i: usize, len: usize) -> Option<(usize, usize
             };
             Some(range)
         }
+    }
+}
+
+/// Append one source line's spans, cut at its tree-sitter highlight ranges.
+/// With no highlights (unsupported filetype, or a line with nothing to style)
+/// this is the plain single-span rendering.
+///
+/// Spans arrive in char columns and in order; anything between them — and any
+/// range running past the line, which a stale cache could produce mid-edit —
+/// falls back to the default text color rather than dropping characters.
+fn syntax_spans(raw: &str, hl: &[HlSpan], out: &mut Vec<Span<'static>>) {
+    let plain = Style::default().fg(theme::fg());
+    if hl.is_empty() {
+        out.push(Span::styled(raw.to_string(), plain));
+        return;
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let mut col = 0usize;
+    for span in hl {
+        let start = span.start.clamp(col, chars.len());
+        let end = span.end.clamp(start, chars.len());
+        if start > col {
+            out.push(Span::styled(chars[col..start].iter().collect::<String>(), plain));
+        }
+        if end > start {
+            out.push(Span::styled(
+                chars[start..end].iter().collect::<String>(),
+                theme::syn_style(span.kind),
+            ));
+        }
+        col = end;
+    }
+    if col < chars.len() {
+        out.push(Span::styled(chars[col..].iter().collect::<String>(), plain));
     }
 }
 

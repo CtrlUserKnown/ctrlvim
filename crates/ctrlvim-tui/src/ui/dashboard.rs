@@ -9,7 +9,7 @@ use ratatui::Frame;
 use crate::app::{Action, App, DashboardSection};
 use crate::theme;
 
-use super::{hint_badge, icon_chip, row_style, selection_bar, titled_panel, Zones};
+use super::{file_chip, hint_badge, icon_chip, row_style, selection_bar, titled_panel, Zones};
 
 /// ctrlvim logo glyph + wordmark, then the workspace/settings/about tab row.
 pub fn header(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
@@ -27,9 +27,9 @@ pub fn header(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         return;
     }
     let tabs = [
-        ('w', "workspace", DashboardSection::Workspace),
-        ('s', "settings", DashboardSection::Settings),
-        ('a', "about", DashboardSection::About),
+        ('1', "workspace", DashboardSection::Workspace),
+        ('2', "settings", DashboardSection::Settings),
+        ('3', "about", DashboardSection::About),
     ];
     let right = area.x + area.width; // frame edge; ratatui does not clip for us
     let mut x = area.x;
@@ -217,7 +217,7 @@ fn recent_files_rows(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, fu
         let label = if full_path { file.path.as_str() } else { file.name.as_str() };
         let mut spans = vec![
             selection_bar(selected, theme::blue()),
-            icon_chip(file.icon_letter, file.icon_color),
+            file_chip(&file.icon, app.config.icons),
             Span::raw(" "),
             Span::styled(format!("{label} "), Style::default().fg(theme::fg())),
         ];
@@ -298,12 +298,35 @@ fn option_row(
     zones.push(row, action);
 }
 
+/// Like [`option_row`], but for a setting with more than two states: the
+/// right-aligned toggle is replaced by the current value.
+fn choice_row(
+    f: &mut Frame,
+    row: Rect,
+    label: &str,
+    value: &str,
+    selected: bool,
+    zones: &mut Zones,
+    action: Action,
+) {
+    f.render_widget(Block::default().style(row_style(selected)), row);
+    let mut spans = vec![selection_bar(selected, theme::cyan()), Span::styled(label.to_string(), Style::default().fg(theme::fg()))];
+    let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
+    let vw = value.chars().count() as u16;
+    if row.width > used + vw {
+        spans.push(Span::styled(" ".repeat((row.width - used - vw) as usize), row_style(selected)));
+    }
+    spans.push(Span::styled(value.to_string(), Style::default().fg(theme::cyan())));
+    f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
+    zones.push(row, action);
+}
+
 fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     if area.width < 10 || area.height < 4 {
         return;
     }
     // EDITOR options panel: live-toggleable settings backed by config.toml.
-    let opt_h = 5u16.min(area.height);
+    let opt_h = 6u16.min(area.height);
     let opt_rect = Rect { height: opt_h, ..area };
     let cfg_hint = Line::from(Span::styled("┤ ~/.config/ctrlvim/config.toml ├", Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
     let opt_inner = super::titled_panel_with_right(f, opt_rect, "EDITOR", theme::cyan(), Some(cfg_hint));
@@ -315,6 +338,10 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     if opt_inner.height >= 2 {
         let r = Rect { x: opt_inner.x, y: opt_inner.y + 1, width: opt_inner.width, height: 1 };
         option_row(f, r, "Mouse support (scroll the editor)", app.config.mouse, sel == 1, zones, Action::ToggleMouse);
+    }
+    if opt_inner.height >= 3 {
+        let r = Rect { x: opt_inner.x, y: opt_inner.y + 2, width: opt_inner.width, height: 1 };
+        choice_row(f, r, "File icons (Nerd Font)", &app.config.icons.label(), sel == 2, zones, Action::CycleIconMode);
     }
 
     // Header row for the LSP table.

@@ -49,6 +49,44 @@ pub enum ExEffect {
     Source(String),
     /// Show an informational / error message on the command line.
     Message(String),
+    /// A quickfix action for the host: show/hide the list, jump to an entry, or
+    /// run a program whose output fills it (`:make`, `:grep`, `:vimgrep`).
+    Quickfix(QuickfixCmd),
+    /// A tag action for the host (`Ctrl-]`, `Ctrl-T`, `:tag`).
+    Tag(TagCmd),
+}
+
+/// What the host should do for a tag command. The engine owns the tag table and
+/// the tagstack; the host reads the tags file and opens buffers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagCmd {
+    /// Look `name` up in the tags file and jump to its definition. The host
+    /// refreshes the table first, so a tags file written mid-session is picked
+    /// up without a manual reload.
+    Lookup { name: String },
+    /// Jump to an already-resolved position (`Ctrl-T`, `:tnext`).
+    Jump { path: String, address: crate::tags::TagAddress },
+    /// Return to a position popped off the tagstack.
+    Return { path: String, line: usize, col: usize },
+}
+
+/// What the host should do for a quickfix command. The engine owns the list
+/// itself; everything here needs the filesystem, a process, or the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuickfixCmd {
+    /// `:copen` / `:cwindow` — show the quickfix pane.
+    Open,
+    /// `:cclose` — hide it.
+    Close,
+    /// Open `path` and put the cursor at (0-based) `line`/`col` — what
+    /// `:cnext`, `:cc`, and clicking an entry all resolve to.
+    Jump { path: String, line: usize, col: usize },
+    /// Walk the project and fill the list with matches (`:vimgrep /pat/ glob`).
+    /// The host does the walking; [`crate::quickfix::Matcher`] decides matches.
+    Grep { pattern: String, glob: Option<String> },
+    /// Spawn `program` with `args` and fill the list from its output
+    /// (`:make`, `:grep`). The host owns process lifetime.
+    Run { program: String, args: Vec<String>, title: String },
 }
 
 /// Buffer-list navigation, shared by the `:b*` and (tab-aliased) `:tab*`
@@ -82,6 +120,9 @@ pub(crate) enum SetItem {
     Tabstop(i64),
     Shiftwidth(i64),
     Scrolloff(i64),
+    Foldenable(bool),
+    Foldmethod(ctrlvim_options::FoldMethod),
+    Foldcolumn(i64),
     /// An unrecognized option name, reported as an error.
     Unknown(String),
 }
@@ -133,6 +174,15 @@ pub fn is_ex_command(cmd: &str) -> bool {
         "s", "su", "sub", "substitute", "g", "global", "v", "vglobal", "d", "de", "del",
         "delete", "y", "ya", "yank", "m", "mo", "move", "t", "co", "copy", "j", "join",
         "sort", "sor", "normal", "norm", "pu", "put", "noh", "nohl", "nohlsearch",
+        // tags
+        "ta", "tag", "tn", "tnext", "tp", "tprevious", "tprev", "tN", "tf", "tfirst",
+        "tr", "trewind", "tl", "tlast", "ts", "tselect", "tj", "tjump", "tags", "po", "pop",
+        // folds
+        "fo", "fold", "foldo", "foldopen", "foldc", "foldclose",
+        // quickfix
+        "copen", "cope", "cw", "cwindow", "cclose", "ccl", "cnext", "cn", "cprevious",
+        "cprev", "cp", "cN", "cfirst", "cfir", "crewind", "cr", "clast", "cla", "cc",
+        "clist", "cl", "make", "grep", "gr", "vimgrep", "vim", "vimg",
         // scripting
         "map", "nmap", "nnoremap", "noremap", "vmap", "vnoremap", "imap", "inoremap",
         "unmap", "let", "echo", "echom", "echomsg", "call", "if", "for", "while",
@@ -168,6 +218,13 @@ pub fn commands() -> &'static [ExCommand] {
         ExCommand { name: "nohlsearch", desc: "clear search highlighting" },
         ExCommand { name: "source", desc: "run a script file (:source file)" },
         ExCommand { name: "Files", desc: "open the fuzzy file browser" },
+        ExCommand { name: "vimgrep", desc: "search files into the quickfix list (:vimgrep /pat/)" },
+        ExCommand { name: "grep", desc: "run grep into the quickfix list" },
+        ExCommand { name: "make", desc: "build the project into the quickfix list" },
+        ExCommand { name: "copen", desc: "open the quickfix list" },
+        ExCommand { name: "cclose", desc: "close the quickfix list" },
+        ExCommand { name: "cnext", desc: "jump to the next quickfix entry" },
+        ExCommand { name: "cprevious", desc: "jump to the previous quickfix entry" },
     ]
 }
 
@@ -218,6 +275,12 @@ fn parse_set(arg: &str) -> Vec<SetItem> {
                     "tabstop" | "ts" => SetItem::Tabstop(n),
                     "shiftwidth" | "sw" => SetItem::Shiftwidth(n),
                     "scrolloff" | "so" => SetItem::Scrolloff(n),
+                    "foldcolumn" | "fdc" => SetItem::Foldcolumn(n),
+                    // `'foldmethod'` takes a name, not a number.
+                    "foldmethod" | "fdm" => match ctrlvim_options::FoldMethod::parse(value) {
+                        Some(m) => SetItem::Foldmethod(m),
+                        None => SetItem::Unknown(format!("{name}={value}")),
+                    },
                     _ => SetItem::Unknown(name.to_string()),
                 };
             }
@@ -235,6 +298,7 @@ fn parse_set(arg: &str) -> Vec<SetItem> {
                 "number" | "nu" => SetItem::Number(value),
                 "wrap" => SetItem::Wrap(value),
                 "expandtab" | "et" => SetItem::Expandtab(value),
+                "foldenable" | "fen" => SetItem::Foldenable(value),
                 other => SetItem::Unknown(other.to_string()),
             }
         })

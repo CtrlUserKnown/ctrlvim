@@ -12,7 +12,7 @@ use ratatui::Frame;
 use crate::app::{Action, App};
 use crate::theme;
 
-use super::{centered, icon_chip, row_style, selection_bar, Zones};
+use super::{centered, file_chip, icon_chip, row_style, selection_bar, Zones};
 
 /// Left-anchored file explorer drawer (Ctrl+B).
 pub fn explorer(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
@@ -94,7 +94,7 @@ pub fn explorer(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         let spans = vec![
             selection_bar(selected, theme::blue()),
             Span::raw(" "),
-            icon_chip(file.icon_letter, file.icon_color),
+            file_chip(&file.icon, app.config.icons),
             Span::raw(" "),
             Span::styled(file.name.clone(), Style::default().fg(if selected { theme::fg() } else { theme::fg_muted() })),
         ];

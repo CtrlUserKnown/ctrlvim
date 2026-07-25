@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::icons::IconMode;
+
 /// Parsed user configuration. Every field has a sensible default so a missing
 /// or partial file still yields a usable config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,11 +21,14 @@ pub struct Config {
     pub drawer: bool,
     /// Enable mouse support in the editor (scrolling to move through the buffer).
     pub mouse: bool,
+    /// How file icons are drawn: Nerd Font glyphs, extension text, or auto-
+    /// detect (see [`crate::icons`]).
+    pub icons: IconMode,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { drawer: false, mouse: false }
+        Config { drawer: false, mouse: false, icons: IconMode::Auto }
     }
 }
 
@@ -72,8 +77,13 @@ impl Config {
              # Open the file drawer on startup.\n\
              drawer = {}\n\n\
              # Enable mouse support (scroll the editor).\n\
-             mouse = {}\n",
-            self.drawer, self.mouse
+             mouse = {}\n\n\
+             # File icons: \"auto\" (Nerd Font glyphs if one is installed),\n\
+             # \"nerd\" (always glyphs), or \"text\" (a letter per filetype).\n\
+             icons = \"{}\"\n",
+            self.drawer,
+            self.mouse,
+            self.icons.as_str()
         )
     }
 
@@ -102,6 +112,11 @@ impl Config {
                 "mouse" => {
                     if let Some(b) = parse_bool(value) {
                         cfg.mouse = b;
+                    }
+                }
+                "icons" | "nerd_font" | "nerd_fonts" => {
+                    if let Some(m) = IconMode::parse(value) {
+                        cfg.icons = m;
                     }
                 }
                 _ => {}
@@ -145,6 +160,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_icon_mode() {
+        assert_eq!(Config::default().icons, IconMode::Auto);
+        assert_eq!(Config::parse("icons = \"nerd\"").icons, IconMode::Nerd);
+        assert_eq!(Config::parse("icons = \"text\"").icons, IconMode::Text);
+        // Alias, and an unparseable value keeps the default.
+        assert_eq!(Config::parse("nerd_font = true").icons, IconMode::Nerd);
+        assert_eq!(Config::parse("icons = \"wat\"").icons, IconMode::Auto);
+    }
+
+    #[test]
     fn unknown_keys_and_junk_are_ignored() {
         let text = "wat = 3\nnonsense line\ndrawer = true\n";
         assert!(Config::parse(text).drawer);
@@ -157,7 +182,7 @@ mod tests {
         // Hermetic: writes to a unique temp file, never the real config dir.
         let path = std::env::temp_dir()
             .join(format!("ctrlvim-cfg-{}-{:p}.toml", std::process::id(), &()));
-        let cfg = Config { drawer: true, mouse: true };
+        let cfg = Config { drawer: true, mouse: true, icons: IconMode::Text };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
         // A missing file loads defaults.

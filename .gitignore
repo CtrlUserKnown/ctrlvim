@@ -19,3 +19,6 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# ctags output (`:tag`, Ctrl-])
+tags

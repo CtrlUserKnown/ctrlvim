@@ -10,6 +10,7 @@
 pub mod app;
 pub mod config;
 pub mod data;
+pub mod icons;
 pub mod input;
 pub mod model;
 pub mod theme;

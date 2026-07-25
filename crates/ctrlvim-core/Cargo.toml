@@ -12,9 +12,11 @@ ctrlvim-editor.workspace = true
 ctrlvim-vimscript.workspace = true
 ctrlvim-api.workspace = true
 ctrlvim-lua.workspace = true
+ctrlvim-treesitter.workspace = true
 ctrlvim-async.workspace = true
 mlua.workspace = true
-tree-sitter-json = "0.21"
+tree-sitter-json = "0.24"
+tree-sitter-rust = "0.24"
 
 [[bin]]
 name = "ctrlvim-demo"

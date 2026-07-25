@@ -19,7 +19,7 @@ use ratatui::Frame;
 use crate::app::{Action, App};
 use crate::theme;
 
-use super::{centered, icon_chip, row_style, selection_bar, Zones};
+use super::{centered, file_chip, row_style, selection_bar, Zones};
 
 pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     let Some(finder) = &app.finder else { return };
@@ -87,7 +87,7 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             let name_color = if entry.is_dir { theme::blue() } else { theme::fg() };
             let mut spans = vec![
                 selection_bar(selected, theme::blue()),
-                icon_chip(entry.icon_letter, entry.icon_color),
+                file_chip(&entry.icon, app.config.icons),
                 Span::raw(" "),
                 Span::styled(entry.name.clone(), Style::default().fg(name_color)),
             ];

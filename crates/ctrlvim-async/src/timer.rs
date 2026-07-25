@@ -38,9 +38,12 @@ impl TimerHandle {
 
 impl TimerService {
     pub fn new(tx: Sender<Event>) -> std::io::Result<Self> {
+        // IO as well as time: this runtime is shared with [`crate::job::Jobs`],
+        // and tokio's child-process pipes panic without the IO driver.
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_time()
+            .enable_io()
             .build()?;
         Ok(TimerService { rt, tx, next_id: 1 })
     }

@@ -9,7 +9,7 @@
 
 use crate::editor::Editor;
 use crate::motion::MotionKind;
-use ctrlvim_text::{MotionType, YankReg};
+use ctrlvim_text::{Buffer, MotionType, YankReg};
 use ctrlvim_types::Position;
 
 /// The operators we implement. (Neovim has ~30; these are the core three plus
@@ -27,10 +27,22 @@ pub enum Operator {
     Lower,
     Upper,
     ToggleCase,
+    /// `zf` — fold the swept lines. Unlike the others this changes no text; the
+    /// session applies it, because folds are window state this layer can't see.
+    Fold,
 }
 
 /// Number of spaces one `>`/`<` shift adds or removes.
 const SHIFTWIDTH: usize = 4;
+
+/// Column of a line's first non-blank character (or 0 for a blank line).
+fn first_non_blank_col(buf: &Buffer, line: usize) -> usize {
+    buf.line(line)
+        .unwrap_or_default()
+        .chars()
+        .position(|c| !c.is_whitespace())
+        .unwrap_or(0)
+}
 
 /// A resolved region to operate on, plus how to treat it.
 #[derive(Debug, Clone, Copy)]
@@ -41,13 +53,46 @@ pub struct OperatorSpan {
 }
 
 impl OperatorSpan {
-    /// Build a span from the cursor + a motion result, ordering the endpoints.
-    pub fn from_motion(cursor: Position, target: Position, kind: MotionKind) -> Self {
+    /// Build a span from the cursor + a motion result, ordering the endpoints
+    /// and applying Vim's exclusive-motion adjustment.
+    ///
+    /// Per `:help exclusive`, an exclusive motion that ends in column 1 is
+    /// rewritten, because operating "up to the start of a line" almost never
+    /// means what it literally says:
+    ///
+    /// 1. the end moves back to the end of the previous line, and the motion
+    ///    becomes inclusive — this is why `dw` on a line's last word does not
+    ///    pull the following line up;
+    /// 2. and if the start was at or before its line's first non-blank, the
+    ///    whole thing becomes linewise — this is why `d}` from the start of a
+    ///    paragraph deletes whole lines.
+    pub fn from_motion(
+        buf: &Buffer,
+        cursor: Position,
+        target: Position,
+        kind: MotionKind,
+    ) -> Self {
         let (start, end) = if cursor <= target {
             (cursor, target)
         } else {
             (target, cursor)
         };
+        if kind == MotionKind::CharExclusive && end.col == 0 && end.line > start.line {
+            let last = end.line - 1;
+            if start.col <= first_non_blank_col(buf, start.line) {
+                return OperatorSpan {
+                    start: Position::new(start.line, 0),
+                    end: Position::new(last, 0),
+                    kind: MotionKind::Linewise,
+                };
+            }
+            let len = buf.line(last).unwrap_or_default().chars().count();
+            return OperatorSpan {
+                start,
+                end: Position::new(last, len.saturating_sub(1)),
+                kind: MotionKind::CharInclusive,
+            };
+        }
         OperatorSpan { start, end, kind }
     }
 
@@ -82,6 +127,11 @@ pub fn apply_operator(
     match op {
         Operator::Indent { right } => return apply_indent(editor, span, right),
         Operator::Lower | Operator::Upper | Operator::ToggleCase => return apply_case(editor, op, span),
+        // Handled by the session (it owns the window's folds); reaching here
+        // means nothing to do to the text.
+        Operator::Fold => {
+            return OperatorOutcome { cursor: span.start, enter_insert: false }
+        }
         _ => {}
     }
     match span.kind {
@@ -311,7 +361,7 @@ mod tests {
     fn delete_word_charwise() {
         let mut e = ed(&["foo bar"]);
         let m = motion::word_forward(&e.cur_buffer().text, Position::new(0, 0), 1, false);
-        let span = OperatorSpan::from_motion(Position::new(0, 0), m.target, m.kind);
+        let span = OperatorSpan::from_motion(&e.cur_buffer().text, Position::new(0, 0), m.target, m.kind);
         apply_operator(&mut e, Operator::Delete, span, None);
         assert_eq!(e.cur_buffer().text.line(0).as_deref(), Some("bar"));
         assert_eq!(e.registers.read('"').unwrap().lines, vec!["foo "]);
@@ -331,7 +381,7 @@ mod tests {
     fn yank_does_not_modify_buffer() {
         let mut e = ed(&["hello"]);
         let m = motion::line_end(&e.cur_buffer().text, Position::new(0, 0));
-        let span = OperatorSpan::from_motion(Position::new(0, 0), m.target, m.kind);
+        let span = OperatorSpan::from_motion(&e.cur_buffer().text, Position::new(0, 0), m.target, m.kind);
         apply_operator(&mut e, Operator::Yank, span, None);
         assert_eq!(e.cur_buffer().text.line(0).as_deref(), Some("hello"));
         assert_eq!(e.registers.read('"').unwrap().lines, vec!["hello"]);
@@ -342,7 +392,7 @@ mod tests {
         let mut e = ed(&["hello"]);
         e.set_cursor(Position::new(0, 2));
         let m = motion::line_end(&e.cur_buffer().text, e.cursor());
-        let span = OperatorSpan::from_motion(e.cursor(), m.target, m.kind);
+        let span = OperatorSpan::from_motion(&e.cur_buffer().text, e.cursor(), m.target, m.kind);
         apply_operator(&mut e, Operator::Delete, span, None);
         assert_eq!(e.cur_buffer().text.line(0).as_deref(), Some("he"));
     }

@@ -107,7 +107,7 @@ fn main() -> mlua::Result<()> {
 
     // ---- M7: treesitter ----
     rule("M7 — treesitter query (JSON grammar)");
-    host.register_ts_language("json", tree_sitter_json::language());
+    host.register_ts_language("json", tree_sitter_json::LANGUAGE.into());
     host.exec(
         r#"
         local caps = vim.treesitter.query('json', '{"name": "ada", "age": 36}', '(number) @n (string) @s')

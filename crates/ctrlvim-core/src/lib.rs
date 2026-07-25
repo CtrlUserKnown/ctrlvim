@@ -7,12 +7,18 @@
 //! would render the `Session`/`Host` editor state each frame and feed [`Key`]s
 //! back in.
 
+pub mod syntax;
+
 pub use ctrlvim_api::ApiContext;
-pub use ctrlvim_async::{Event, EventLoop};
+pub use ctrlvim_treesitter::{HlKind, HlSpan};
+pub use ctrlvim_async::{Event, EventLoop, Jobs, LineBuffer, TimerService};
 pub use ctrlvim_editor::{
-    ex_commands, is_ex_command, BufferCmd, Editor, ExCommand, ExEffect, Frame, Key, Mode,
-    Selection, Session, VisualKind,
+    ex_commands, is_ex_command, BufferCmd, Editor, ExCommand, ExEffect, Fold, Folds, Frame, Key,
+    Mode, QfItem, QfKind, QuickfixCmd, QuickfixList, Selection, Session, TagCmd, VisualKind,
 };
+pub use ctrlvim_editor::fold::fold_text;
+pub use ctrlvim_editor::tags::{resolve_address as resolve_tag_address, TagAddress, TagTable};
+pub use ctrlvim_editor::quickfix::{grep_text, Matcher, OutputParser};
 pub use ctrlvim_lua::Host;
 pub use ctrlvim_types::{BufferId, Object, Position, WindowId};
 
