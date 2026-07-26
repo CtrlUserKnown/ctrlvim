@@ -252,8 +252,9 @@ pub fn save_prompt(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
 pub fn help(f: &mut Frame, _app: &App, area: Rect, zones: &mut Zones) {
     zones.push(area, Action::CloseHelp);
 
-    let bindings: [(&str, &str); 15] = [
+    let bindings: [(&str, &str); 16] = [
         ("␣e / ␣ff", "fuzzy file browser"),
+        ("␣S / :Find", "find & replace in project"),
         ("n / :new", "new file"),
         ("␣w / ␣q", "write / write+quit"),
         (":w :q :wq", "ex write / quit"),

@@ -54,6 +54,12 @@ pub enum ExEffect {
     Quickfix(QuickfixCmd),
     /// A tag action for the host (`Ctrl-]`, `Ctrl-T`, `:tag`).
     Tag(TagCmd),
+    /// Open the interactive project-wide find & replace panel (`:Find`), seeded
+    /// with the given pattern — the word under the cursor when the command was
+    /// given bare. The engine owns the replace semantics
+    /// ([`crate::replace::ReplacePlan`]); the panel and the files are the
+    /// host's.
+    OpenReplace { pattern: Option<String> },
 }
 
 /// What the host should do for a tag command. The engine owns the tag table and
@@ -183,6 +189,8 @@ pub fn is_ex_command(cmd: &str) -> bool {
         "copen", "cope", "cw", "cwindow", "cclose", "ccl", "cnext", "cn", "cprevious",
         "cprev", "cp", "cN", "cfirst", "cfir", "crewind", "cr", "clast", "cla", "cc",
         "clist", "cl", "make", "grep", "gr", "vimgrep", "vim", "vimg",
+        // find & replace panel
+        "Find", "Replace", "Repl",
         // scripting
         "map", "nmap", "nnoremap", "noremap", "vmap", "vnoremap", "imap", "inoremap",
         "unmap", "let", "echo", "echom", "echomsg", "call", "if", "for", "while",
@@ -218,6 +226,7 @@ pub fn commands() -> &'static [ExCommand] {
         ExCommand { name: "nohlsearch", desc: "clear search highlighting" },
         ExCommand { name: "source", desc: "run a script file (:source file)" },
         ExCommand { name: "Files", desc: "open the fuzzy file browser" },
+        ExCommand { name: "Find", desc: "find & replace across the project (:Find [pattern])" },
         ExCommand { name: "vimgrep", desc: "search files into the quickfix list (:vimgrep /pat/)" },
         ExCommand { name: "grep", desc: "run grep into the quickfix list" },
         ExCommand { name: "make", desc: "build the project into the quickfix list" },
@@ -408,6 +417,11 @@ pub(crate) fn parse_ex(cmd: &str) -> ExParsed {
             }
         }
         "Files" | "Explore" | "Ex" | "E" => ExEffect::OpenBrowser,
+        // Bare `:Find` seeds itself from the word under the cursor, which only
+        // the session knows — it fills the `None` in before the host sees it.
+        "Find" | "Replace" | "Repl" => {
+            ExEffect::OpenReplace { pattern: (!arg.is_empty()).then(|| arg.to_string()) }
+        }
         "dash" | "dashboard" | "Dash" | "Dashboard" => ExEffect::OpenDashboard,
         // Scripting: run in the core (which owns the interpreters).
         "lua" if !arg.is_empty() => ExEffect::Lua(arg.to_string()),

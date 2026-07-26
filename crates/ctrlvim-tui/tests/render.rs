@@ -1415,3 +1415,325 @@ fn drawer_slash_search_filters() {
     assert!(out.contains("zeta.md"));
     assert!(!out.contains("alpha.rs"));
 }
+
+// --- find & replace panel --------------------------------------------------
+
+/// A two-file project the replace tests share.
+fn replace_project() -> App {
+    temp_project(&[
+        ("alpha.rs", "let widget = 1;\nfn other() {}\nprintln!(\"{widget} {widget}\");\n"),
+        ("beta.rs", "use widget::thing;\n"),
+    ])
+}
+
+/// The panel's hits as `path:line` strings, for order-sensitive assertions.
+fn hit_locs(app: &App) -> Vec<String> {
+    app.replace
+        .as_ref()
+        .unwrap()
+        .hits
+        .iter()
+        .map(|h| format!("{}:{}", h.path.display(), h.line))
+        .collect()
+}
+
+#[test]
+fn replace_panel_searches_the_whole_project_on_open() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    let panel = app.replace.as_ref().unwrap();
+    assert_eq!(panel.find, "widget");
+    // Three matching *lines* across two files, holding four matches.
+    assert_eq!(hit_locs(&app), vec!["alpha.rs:0", "alpha.rs:2", "beta.rs:0"]);
+    assert_eq!(panel.match_count(), 4, "the doubled line counts twice");
+    assert_eq!(panel.summary(), "4 matches in 2 files");
+}
+
+#[test]
+fn replace_panel_renders_inputs_results_and_a_before_after_preview() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    typ(&mut app, ""); // focus starts on Find
+    press(&mut app, KeyCode::Tab); // → Replace
+    typ(&mut app, "gadget");
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["Find", "Replace", "Matches", "widget", "gadget", "alpha.rs"]);
+    // The preview shows the match line as a diff: what it is, and what it becomes.
+    assert!(out.contains("- let widget = 1;"), "missing before line:\n{out}");
+    assert!(out.contains("+ let gadget = 1;"), "missing after line:\n{out}");
+}
+
+#[test]
+fn typing_in_find_re_searches_but_typing_in_replace_does_not() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    assert_eq!(app.replace.as_ref().unwrap().hits.len(), 3);
+
+    // Narrowing the pattern drops the non-matching hits.
+    typ(&mut app, "s");
+    assert!(app.replace.as_ref().unwrap().hits.is_empty(), "`widgets` matches nothing");
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(app.replace.as_ref().unwrap().hits.len(), 3);
+
+    // The Replace field only changes the preview, never the result set.
+    press(&mut app, KeyCode::Tab);
+    typ(&mut app, "gadget");
+    let panel = app.replace.as_ref().unwrap();
+    assert_eq!(panel.hits.len(), 3);
+    assert_eq!(panel.hits[0].preview, "let gadget = 1;");
+}
+
+#[test]
+fn accepting_one_occurrence_edits_only_that_match() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    press(&mut app, KeyCode::Tab);
+    typ(&mut app, "gadget");
+    press(&mut app, KeyCode::Tab); // → Results
+    key(&mut app, 'j'); // the doubled line, alpha.rs:2
+    key(&mut app, 'j'); // beta.rs — skip past, then come back
+    key(&mut app, 'k');
+    assert_eq!(app.replace.as_ref().unwrap().current().unwrap().line, 2);
+
+    key(&mut app, 'y');
+
+    let text = fs::read_to_string(app.root.join("alpha.rs")).unwrap();
+    assert!(
+        text.contains("println!(\"{gadget} {widget}\");"),
+        "only the first match on the line changed:\n{text}"
+    );
+    // The list is re-derived, so the line still appears — with one match left.
+    let panel = app.replace.as_ref().unwrap();
+    assert_eq!(panel.match_count(), 3);
+}
+
+#[test]
+fn accepting_all_rewrites_every_matched_file() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    press(&mut app, KeyCode::Tab);
+    typ(&mut app, "gadget");
+    ctrl(&mut app, 'a'); // replace all, from the Replace field
+
+    let alpha = fs::read_to_string(app.root.join("alpha.rs")).unwrap();
+    let beta = fs::read_to_string(app.root.join("beta.rs")).unwrap();
+    assert!(!alpha.contains("widget"), "alpha still has a match:\n{alpha}");
+    assert!(alpha.contains("println!(\"{gadget} {gadget}\");"), "{alpha}");
+    assert_eq!(beta.trim(), "use gadget::thing;");
+    assert!(app.message.starts_with("4 replacements in 2 files"), "{}", app.message);
+    // Re-searching after the rewrite finds nothing left.
+    assert!(app.replace.as_ref().unwrap().hits.is_empty());
+}
+
+#[test]
+fn an_edit_to_an_open_buffer_stays_unsaved_rather_than_hitting_disk() {
+    let mut app = replace_project();
+    let path = app.root.join("alpha.rs");
+    app.open_path(path.clone(), "alpha.rs".into());
+    assert!(app.is_file());
+
+    app.open_replace(Some("widget".into()));
+    press(&mut app, KeyCode::Tab);
+    typ(&mut app, "gadget");
+    ctrl(&mut app, 'a');
+
+    // The open buffer holds the change and is marked modified...
+    assert!(app.editor_lines().iter().any(|l| l.contains("gadget")), "{:?}", app.editor_lines());
+    assert!(app.active_modified(), "the buffer should need a `:w`");
+    // ...while the file on disk is untouched until it is written.
+    let on_disk = fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("widget"), "disk was written behind the buffer:\n{on_disk}");
+    // A file with no buffer is written straight through, though.
+    assert!(!fs::read_to_string(app.root.join("beta.rs")).unwrap().contains("widget"));
+}
+
+#[test]
+fn the_search_reads_unsaved_buffer_text_not_the_stale_file() {
+    let mut app = replace_project();
+    app.open_path(app.root.join("alpha.rs"), "alpha.rs".into());
+    // Type a new occurrence into the buffer without saving.
+    typ(&mut app, "Owidget again");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.active_modified());
+
+    app.open_replace(Some("widget".into()));
+    assert_eq!(
+        app.replace.as_ref().unwrap().match_count(),
+        5,
+        "the unsaved line's match is found too: {:?}",
+        hit_locs(&app)
+    );
+}
+
+#[test]
+fn capture_groups_and_word_boundaries_work_as_in_substitute() {
+    let mut app = temp_project(&[("a.rs", "call foo_old();\nlet fnord = foo_old;\n")]);
+    app.open_replace(Some(r"\(\w\+\)_old".into()));
+    press(&mut app, KeyCode::Tab);
+    typ(&mut app, r"\1_new");
+    ctrl(&mut app, 'a');
+    let text = fs::read_to_string(app.root.join("a.rs")).unwrap();
+    assert!(text.contains("call foo_new();"), "{text}");
+    assert!(text.contains("let fnord = foo_new;"), "{text}");
+}
+
+#[test]
+fn an_invalid_pattern_shows_an_error_instead_of_results() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    assert_eq!(app.replace.as_ref().unwrap().hits.len(), 3);
+    typ(&mut app, "["); // `widget[` — an unterminated class
+    let panel = app.replace.as_ref().unwrap();
+    assert!(panel.error.is_some());
+    assert!(panel.hits.is_empty(), "stale hits must not survive a broken pattern");
+    let out = render(&app, 130, 44);
+    assert!(out.contains("E486"), "the error should be on screen:\n{out}");
+}
+
+#[test]
+fn ctrl_i_toggles_ignorecase_and_re_searches() {
+    let mut app = temp_project(&[("a.rs", "Widget\n")]);
+    app.open_replace(Some("widget".into()));
+    assert!(app.replace.as_ref().unwrap().hits.is_empty());
+    ctrl(&mut app, 'i');
+    let panel = app.replace.as_ref().unwrap();
+    assert!(panel.ignorecase);
+    assert_eq!(panel.hits.len(), 1);
+}
+
+#[test]
+fn enter_on_a_result_opens_the_file_at_the_match_and_closes_the_panel() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Tab); // → Results
+    key(&mut app, 'j');
+    key(&mut app, 'j'); // beta.rs:0
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.replace.is_none(), "jumping closes the panel");
+    assert_eq!(app.active_buffer().label, "beta.rs");
+    assert_eq!(app.editor_cursor(), (0, 4), "cursor on the match, not the line start");
+}
+
+#[test]
+fn esc_closes_the_panel_without_changing_anything() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    press(&mut app, KeyCode::Tab);
+    typ(&mut app, "gadget");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.replace.is_none());
+    assert!(fs::read_to_string(app.root.join("alpha.rs")).unwrap().contains("widget"));
+}
+
+#[test]
+fn the_find_command_opens_the_panel_seeded_from_the_cursor() {
+    let mut app = replace_project();
+    app.open_path(app.root.join("alpha.rs"), "alpha.rs".into());
+    typ(&mut app, "wl"); // cursor onto `widget` (past `let `)
+    app.run_ex_command("Find");
+    assert_eq!(app.replace.as_ref().unwrap().find, "widget");
+
+    // And an explicit argument wins over the cursor.
+    app.dispatch(Action::CloseReplace);
+    app.run_ex_command("Find other");
+    assert_eq!(app.replace.as_ref().unwrap().find, "other");
+}
+
+#[test]
+fn tab_cycles_the_three_fields_and_shift_tab_goes_back() {
+    use ctrlvim::replace::Field;
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    let focus = |a: &App| a.replace.as_ref().unwrap().focus;
+    assert_eq!(focus(&app), Field::Find);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(focus(&app), Field::Replace);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(focus(&app), Field::Results);
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(focus(&app), Field::Find);
+    press(&mut app, KeyCode::BackTab);
+    assert_eq!(focus(&app), Field::Results, "shift-tab walks back");
+}
+
+#[test]
+fn the_panel_survives_a_tiny_terminal() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    for (w, h) in [(30u16, 10u16), (60, 14), (80, 20), (200, 60)] {
+        let _ = render(&app, w, h);
+    }
+}
+#[test]
+fn leader_s_opens_the_panel_from_the_editor_and_the_dashboard() {
+    // From a file buffer: <Space>S goes through the engine keymap.
+    let mut app = replace_project();
+    app.open_path(app.root.join("alpha.rs"), "alpha.rs".into());
+    key(&mut app, ' ');
+    input::handle_key(&mut app, KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+    assert!(app.replace.is_some(), "leader-S in the editor");
+
+    // From the dashboard: the shell's own leader handling.
+    let mut app = replace_project();
+    key(&mut app, ' ');
+    input::handle_key(&mut app, KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+    assert!(app.replace.is_some(), "leader-S on the dashboard");
+}
+
+#[test]
+fn the_panel_floats_over_the_screen_rather_than_replacing_it() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    let out = render(&app, 130, 44);
+
+    // The dashboard behind it is still visible on every side — that is what
+    // makes this read as a popup instead of a screen you navigated to.
+    contains_all(&out, &["ctrlvim", "workspace", "settings", "about"]);
+    // Every row has screen content outside the popup's left and right edges.
+    let framed = out
+        .lines()
+        .filter(|l| l.contains("\u{256d}") || l.contains("\u{2570}"))
+        .count();
+    assert!(framed > 0, "expected rounded popup borders:\n{out}");
+    // Top and bottom rows belong to the shell, not the panel.
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].contains("Dashboard"), "tab bar survives: {:?}", lines[0]);
+    assert!(
+        lines.iter().rev().take(2).any(|l| l.contains("NORMAL")),
+        "status line survives:\n{out}"
+    );
+}
+
+#[test]
+fn the_panel_wears_the_same_chrome_as_the_file_browser() {
+    // Both are centered popups with rounded boxes and centered border titles;
+    // drifting apart is a regression in how coherent the editor feels.
+    let mut app = replace_project();
+    app.dispatch(Action::OpenFinder);
+    let browser = render(&app, 130, 44);
+    app.dispatch(Action::CloseFinder);
+    app.open_replace(Some("widget".into()));
+    let panel = render(&app, 130, 44);
+
+    for out in [&browser, &panel] {
+        assert!(out.contains('\u{256d}'), "rounded top-left corner:\n{out}");
+        assert!(out.contains('\u{256f}'), "rounded bottom-right corner:\n{out}");
+    }
+    // The panel's boxes are titled and centered like the browser's.
+    contains_all(&panel, &["Find", "Replace", "Matches"]);
+}
+
+#[test]
+fn a_narrow_terminal_drops_the_preview_rather_than_squeezing_it() {
+    let mut app = replace_project();
+    app.open_replace(Some("widget".into()));
+    // Wide: both columns.
+    let wide = render(&app, 130, 44);
+    assert!(wide.contains("- let widget = 1;"), "preview column expected:\n{wide}");
+    // Narrow: the results list takes the whole popup, no preview.
+    let narrow = render(&app, 62, 30);
+    assert!(!narrow.contains("- let widget = 1;"), "preview should be dropped:\n{narrow}");
+    assert!(narrow.contains("alpha.rs"), "results still shown:\n{narrow}");
+}

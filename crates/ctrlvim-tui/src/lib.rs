@@ -13,5 +13,6 @@ pub mod data;
 pub mod icons;
 pub mod input;
 pub mod model;
+pub mod replace;
 pub mod theme;
 pub mod ui;

@@ -1,6 +1,10 @@
 //! Prints a plain-text snapshot of a chosen screen to stdout — a quick way to
 //! eyeball layout without a live terminal. Usage:
-//!   cargo run -p ctrlvim-tui --example snapshot -- [dashboard|settings|about|plugins|drawer|finder|palette|help|file]
+//!   cargo run -p ctrlvim-tui --example snapshot -- [dashboard|settings|about|plugins|drawer|finder|palette|help|file|replace]
+//!
+//! `replace` takes an optional pattern and replacement, so the panel can be
+//! eyeballed with real results:
+//!   cargo run -p ctrlvim-tui --example snapshot -- replace quickfix qflist
 
 use ctrlvim::app::{Action, App, DashboardSection};
 use ctrlvim::ui;
@@ -19,6 +23,16 @@ fn main() {
         "palette" => app.dispatch(Action::OpenPalette),
         "help" => app.dispatch(Action::ToggleHelp),
         "file" => app.open_file(0),
+        // Searches the real project the example is run in.
+        "replace" => {
+            let pattern = std::env::args().nth(2).unwrap_or_else(|| "fn".into());
+            app.open_replace(Some(pattern));
+            if let (Some(rep), Some(panel)) = (std::env::args().nth(3), app.replace.as_mut()) {
+                panel.replace = rep;
+                panel.refresh_previews();
+                panel.focus = ctrlvim::replace::Field::Results;
+            }
+        }
         _ => {}
     }
 

@@ -29,6 +29,7 @@ use ctrlvim_core::{
 use crate::config::Config;
 use crate::data::{list_dir, FinderEntry};
 use crate::data::Project;
+use crate::replace::{by_file, Field, ReplacePanel, MAX_HITS};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DashboardSection {
@@ -224,6 +225,13 @@ pub enum Action {
     OpenFinder,
     CloseFinder,
     RunFinder(usize),
+    /// Open the find & replace panel, seeded with the word under the cursor.
+    OpenReplace,
+    CloseReplace,
+    /// Select a result row in the replace panel by index.
+    SelectReplaceHit(usize),
+    /// Give the replace panel's focus to a specific field (clicking a box).
+    FocusReplaceField(Field),
     ToggleSidebar,
     CloseSidebar,
     ToggleHelp,
@@ -263,6 +271,9 @@ pub struct App {
 
     /// The full-screen fuzzy file browser, present only while open.
     pub finder: Option<Finder>,
+
+    /// The project-wide find & replace panel, present only while open.
+    pub replace: Option<ReplacePanel>,
 
     pub palette_open: bool,
     pub palette_query: String,
@@ -370,6 +381,7 @@ impl App {
             drawer_query: String::new(),
             file_index: 0,
             finder: None,
+            replace: None,
             palette_open: false,
             palette_query: String::new(),
             palette_index: 0,
@@ -489,6 +501,26 @@ impl App {
                     f.selected = i;
                 }
                 self.finder_select();
+            }
+            // A click-opened panel has no cursor context to seed from, so it
+            // reuses whatever `:Find` would find under the cursor.
+            Action::OpenReplace => {
+                let seed = self.engine.session.word_at_cursor();
+                self.open_replace(seed);
+            }
+            Action::CloseReplace => self.replace = None,
+            Action::SelectReplaceHit(i) => {
+                if let Some(p) = &mut self.replace {
+                    p.focus = Field::Results;
+                    if i < p.hits.len() {
+                        p.selected = i;
+                    }
+                }
+            }
+            Action::FocusReplaceField(field) => {
+                if let Some(p) = &mut self.replace {
+                    p.focus = field;
+                }
             }
             // The file drawer is only available when enabled in the config.
             Action::ToggleSidebar => {
@@ -893,6 +925,7 @@ impl App {
                 ExEffect::Message(m) => self.message = m,
                 ExEffect::Quickfix(cmd) => self.host_quickfix(cmd),
                 ExEffect::Tag(cmd) => self.host_tag(cmd),
+                ExEffect::OpenReplace { pattern } => self.open_replace(pattern),
             }
         }
     }
@@ -1754,6 +1787,247 @@ impl App {
                     }
                     Err(e) => self.message = format!("E: cannot delete {label}: {e}"),
                 }
+            }
+        }
+    }
+
+    // --- find & replace panel ---------------------------------------------
+
+    /// Open the panel (`:Find`, `<leader>S`) seeded with `pattern`, and run the
+    /// first search immediately so a seeded word shows its matches at once.
+    pub fn open_replace(&mut self, pattern: Option<String>) {
+        self.replace = Some(ReplacePanel::new(pattern));
+        self.replace_search();
+    }
+
+    /// Re-run the project search for the panel's current pattern.
+    ///
+    /// This is synchronous, like `:vimgrep` — the walk is bounded by
+    /// [`crate::data::walk_project`]'s file cap and the result list by
+    /// [`MAX_HITS`], so a keystroke stays a keystroke rather than a job.
+    pub fn replace_search(&mut self) {
+        let Some(panel) = &self.replace else { return };
+        let plan = match panel.plan() {
+            Some(Ok(plan)) => plan,
+            Some(Err(e)) => {
+                if let Some(p) = &mut self.replace {
+                    p.set_error(e);
+                }
+                return;
+            }
+            // An empty Find field: no results, and no error to shout about.
+            None => {
+                if let Some(p) = &mut self.replace {
+                    p.set_hits(Vec::new(), false);
+                }
+                return;
+            }
+        };
+
+        let mut hits = Vec::new();
+        let mut truncated = false;
+        for path in crate::data::walk_project(&self.root) {
+            let rel = crate::data::relative_to(&self.root, &path);
+            // Search what the *editor* would show: an open buffer's unsaved text
+            // wins over what is on disk, so a match can't point at a stale line.
+            let text = match self.open_buffer_text(&path) {
+                Some(lines) => lines.join("\n"),
+                None => match std::fs::read_to_string(&path) {
+                    Ok(t) => t,
+                    // Unreadable or binary files are skipped, not reported.
+                    Err(_) => continue,
+                },
+            };
+            hits.extend(plan.hits_in(Path::new(&rel), &text));
+            if hits.len() >= MAX_HITS {
+                hits.truncate(MAX_HITS);
+                truncated = true;
+                break;
+            }
+        }
+        if let Some(p) = &mut self.replace {
+            p.set_hits(hits, truncated);
+        }
+    }
+
+    /// The live text of an open buffer for `path`, if there is one. The active
+    /// buffer's lives in the engine; the rest sit in their cached `text`.
+    fn open_buffer_text(&self, path: &Path) -> Option<Vec<String>> {
+        let i = self.buffers.iter().position(|b| b.path.as_deref() == Some(path))?;
+        Some(if i == self.active { self.engine.lines() } else { self.buffers[i].text.clone() })
+    }
+
+    /// Type into the focused field: a change to Find re-runs the search, while
+    /// a change to Replace only re-renders what each match would become.
+    pub fn replace_type(&mut self, c: char) {
+        let Some(p) = &mut self.replace else { return };
+        if p.type_char(c) {
+            self.replace_search();
+        } else {
+            p.refresh_previews();
+        }
+    }
+
+    /// Backspace in the focused field; same split as [`replace_type`](Self::replace_type).
+    pub fn replace_backspace(&mut self) {
+        let Some(p) = &mut self.replace else { return };
+        if p.backspace() {
+            self.replace_search();
+        } else {
+            p.refresh_previews();
+        }
+    }
+
+    /// `<Tab>` — move focus Find → Replace → Results → Find.
+    pub fn replace_cycle(&mut self) {
+        if let Some(p) = &mut self.replace {
+            p.focus = p.focus.next();
+        }
+    }
+
+    /// Move the results selection (`j`/`k`, arrows, or the wheel).
+    pub fn replace_move(&mut self, dir: i32) {
+        if let Some(p) = &mut self.replace {
+            p.move_selection(dir);
+        }
+    }
+
+    /// Flip `'ignorecase'` for this search and re-run it.
+    pub fn replace_toggle_case(&mut self) {
+        let Some(p) = &mut self.replace else { return };
+        p.ignorecase = !p.ignorecase;
+        self.replace_search();
+    }
+
+    /// Open the highlighted hit's file at the match and close the panel — the
+    /// escape hatch for "this one needs a real edit, not a substitution".
+    pub fn replace_jump(&mut self) {
+        let Some(hit) = self.replace.as_ref().and_then(|p| p.current()) else { return };
+        let (rel, line, col) = (hit.path.display().to_string(), hit.line, hit.col);
+        self.replace = None;
+        self.quickfix_goto(&rel, line, col);
+    }
+
+    /// `y` — replace just the highlighted occurrence.
+    ///
+    /// The remaining hits are re-derived by searching again rather than by
+    /// dropping the row, so counts stay right when the edit changes how many
+    /// matches the line holds.
+    pub fn replace_accept_one(&mut self) {
+        let Some(panel) = &self.replace else { return };
+        let Some(Ok(plan)) = panel.plan() else { return };
+        let Some(hit) = panel.current() else { return };
+        let (rel, line, col) = (hit.path.clone(), hit.line, hit.col);
+
+        let Some(mut lines) = self.file_lines(&rel) else {
+            self.message = format!("E: cannot read {}", rel.display());
+            return;
+        };
+        let Some(old) = lines.get(line) else {
+            self.message = "E: that match is stale — search again".into();
+            return;
+        };
+        let Some(new) = plan.apply_match_at(old, col) else {
+            self.message = "E: that match is stale — search again".into();
+            return;
+        };
+        // A replacement containing `\r` splits the line, as `:s` does.
+        let split: Vec<String> = new.split('\n').map(str::to_string).collect();
+        lines.splice(line..line + 1, split);
+
+        match self.write_file_lines(&rel, lines) {
+            Ok(where_) => self.message = format!("1 replacement in {} ({where_})", rel.display()),
+            Err(e) => {
+                self.message = e;
+                return;
+            }
+        }
+        self.replace_search();
+    }
+
+    /// `Y` — replace every occurrence in every matched file.
+    pub fn replace_accept_all(&mut self) {
+        let Some(panel) = &self.replace else { return };
+        let Some(Ok(plan)) = panel.plan() else { return };
+        if panel.hits.is_empty() {
+            self.message = "no matches to replace".into();
+            return;
+        }
+        // Grouped by file: each file is read once, rewritten once.
+        let paths: Vec<PathBuf> = by_file(&panel.hits).into_keys().collect();
+
+        let (mut replaced, mut files, mut failed) = (0usize, 0usize, 0usize);
+        for rel in paths {
+            let Some(lines) = self.file_lines(&rel) else {
+                failed += 1;
+                continue;
+            };
+            let Some((new_lines, n)) = plan.apply_lines(&lines) else { continue };
+            match self.write_file_lines(&rel, new_lines) {
+                Ok(_) => {
+                    replaced += n;
+                    files += 1;
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        self.message = format!(
+            "{replaced} replacement{} in {files} file{}{}",
+            if replaced == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" },
+            if failed > 0 { format!(" ({failed} failed)") } else { String::new() },
+        );
+        // The panel stays open on the (now empty) result set, so a mistyped
+        // replacement is visible immediately rather than after reopening.
+        self.replace_search();
+    }
+
+    /// The lines the preview pane draws context from — the same source the
+    /// search read, so the surrounding code can't disagree with the match.
+    pub fn replace_preview_lines(&self, rel: &Path) -> Option<Vec<String>> {
+        self.file_lines(rel)
+    }
+
+    /// The current lines of a project-relative path — from its open buffer when
+    /// there is one, else from disk.
+    fn file_lines(&self, rel: &Path) -> Option<Vec<String>> {
+        let abs = self.root.join(rel);
+        if let Some(lines) = self.open_buffer_text(&abs) {
+            return Some(lines);
+        }
+        Some(std::fs::read_to_string(&abs).ok()?.lines().map(String::from).collect())
+    }
+
+    /// Write `lines` back to a project-relative path, returning where the edit
+    /// landed (for the status message) or a user-facing error.
+    ///
+    /// An open buffer is edited in memory and left **modified** — the change
+    /// joins the undo history and `:w` commits it — while a file with no buffer
+    /// is written straight to disk, there being nothing to hold it otherwise.
+    fn write_file_lines(&mut self, rel: &Path, lines: Vec<String>) -> Result<&'static str, String> {
+        let abs = self.root.join(rel);
+        match self.buffers.iter().position(|b| b.path.as_deref() == Some(abs.as_path())) {
+            Some(i) if i == self.active => {
+                // In place, so the buffer keeps its undo history and cursor.
+                let count = self.engine.session.editor.cur_buffer().text.line_count();
+                self.engine.session.editor.cur_buffer_mut().text.set_lines(0, count, &lines);
+                self.engine.session.checkpoint_undo();
+                self.engine.set_modified(true);
+                let (line, col) = self.editor_cursor();
+                self.engine.session.set_cursor_clamped(line, col);
+                Ok("buffer")
+            }
+            Some(i) => {
+                self.buffers[i].text = lines;
+                self.buffers[i].modified = true;
+                Ok("buffer")
+            }
+            None => {
+                let mut text = lines.join("\n");
+                text.push('\n');
+                std::fs::write(&abs, text)
+                    .map(|()| "disk")
+                    .map_err(|e| format!("E212: cannot write {}: {e}", rel.display()))
             }
         }
     }

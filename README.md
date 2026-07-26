@@ -18,6 +18,7 @@ Neovim is incredible — but its C codebase is a mountain of complexity. ctrlvim
 - **Window management** — Splits with `<C-w>` commands, just like Vim
 - **Async I/O** — Tokio-powered event loop for timers, and job control that streams a spawned program's output into the editor without blocking it
 - **Quickfix list** — `:vimgrep`, `:make`, and `:grep` fill a navigable list (`:copen`, `:cnext`) that jumps straight to the file and line
+- **Find & replace across the project** — `<leader>S` (or `:Find`) opens a live panel seeded with the word under the cursor: every match grouped by file, a before/after diff of the line each one would become, and `y`/`Y` to accept one or all. Same Vim pattern flavor as `:s`, so `\<word\>`, `\(groups\)` and `\1` all carry over
 - **Folds** — `zf`/`za`/`zR`/`zM` and `foldmethod=indent`, with fold-aware movement and scrolling
 - **Tags** — `Ctrl-]` / `Ctrl-T` and the `:tag` family over a `ctags -R .` table
 - **TUI interface** — Dashboard, file browser, plugin manager, and floating overlays

@@ -17,6 +17,9 @@ use crate::textobject;
 use ctrlvim_text::{MotionType, YankReg};
 use ctrlvim_types::Position;
 use crate::pattern::{compile as compile_pattern, compile_opts as compile_pattern_opts};
+// `:s` and the project-wide replace panel must translate replacements the same
+// way, so both use the one in `replace`.
+use crate::replace::vim_replacement;
 
 /// Pending command-accumulation state (`cmdarg_T`/`oparg_T` in C).
 #[derive(Default)]
@@ -1018,6 +1021,13 @@ impl Session {
             ExParsed::Map { lhs, rhs } => self.keymap.set_normal(&lhs, &rhs),
             ExParsed::DefineCommand { name, repl } => {
                 self.user_commands.insert(name, repl);
+            }
+            // Bare `:Find` seeds the panel with the word under the cursor —
+            // `parse_ex` is pure, so the fill-in happens here where the buffer
+            // is in reach.
+            ExParsed::Effect(ExEffect::OpenReplace { pattern: None }) => {
+                let pattern = self.word_at_cursor();
+                self.queue_effect(ExEffect::OpenReplace { pattern });
             }
             ExParsed::Effect(effect) => self.queue_effect(effect),
             ExParsed::Nop => {}
@@ -2268,35 +2278,6 @@ fn parse_vimgrep(arg: &str) -> Option<(String, Option<String>)> {
     Some((pattern, (!glob.is_empty()).then(|| glob.to_string())))
 }
 
-/// Translate a Vim `:s` replacement into a Rust `regex` replacement string:
-/// `\1`..`\9` → `${n}`, `&`/`\0` → whole match, `\r`/`\n` → newline, and a
-/// literal `$` is escaped as `$$`.
-fn vim_replacement(rep: &str) -> String {
-    let mut out = String::new();
-    let mut chars = rep.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some(d @ '0'..='9') => {
-                    out.push_str("${");
-                    out.push(d);
-                    out.push('}');
-                }
-                Some('r') | Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('&') => out.push('&'),
-                Some('\\') => out.push('\\'),
-                Some(other) => out.push(other),
-                None => {}
-            },
-            '&' => out.push_str("${0}"),
-            '$' => out.push_str("$$"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 impl Default for Session {
     fn default() -> Self {
         Session::new()
@@ -2313,6 +2294,7 @@ fn default_keymap() -> Keymap {
     km.set_normal("<Space>w", ":w<CR>");
     km.set_normal("<Space>q", ":wq<CR>");
     km.set_normal("<Space>d", ":dash<CR>");
+    km.set_normal("<Space>S", ":Find<CR>");
     // `<leader>1`..`<leader>9` jump to that tab/buffer (`:b N`).
     for n in 1..=9 {
         km.set_normal(&format!("<Space>{n}"), &format!(":b {n}<CR>"));
@@ -3092,6 +3074,32 @@ mod tests {
         let mut s = Session::with_text("x");
         s.feed_str(" d"); // <leader>d
         assert!(s.take_effects().contains(&ExEffect::OpenDashboard));
+    }
+
+    #[test]
+    fn leader_s_opens_find_and_replace_seeded_from_the_cursor() {
+        use crate::ex::ExEffect;
+        let mut s = Session::with_text("let widget = 1;");
+        s.feed_str("wl"); // onto `widget`
+        s.feed_str(" S"); // <leader>S
+        assert!(s
+            .take_effects()
+            .contains(&ExEffect::OpenReplace { pattern: Some("widget".into()) }));
+    }
+
+    #[test]
+    fn find_takes_an_explicit_pattern_over_the_cursor_word() {
+        use crate::ex::ExEffect;
+        let mut s = Session::with_text("let widget = 1;");
+        s.feed_str(r":Find \<fn\><CR>");
+        assert!(s
+            .take_effects()
+            .contains(&ExEffect::OpenReplace { pattern: Some(r"\<fn\>".into()) }));
+        // And off a word entirely, a bare `:Find` seeds nothing rather than
+        // seeding whatever punctuation is under the cursor.
+        let mut s = Session::with_text("   ");
+        s.feed_str(":Find<CR>");
+        assert!(s.take_effects().contains(&ExEffect::OpenReplace { pattern: None }));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub use ctrlvim_editor::{
 pub use ctrlvim_editor::fold::fold_text;
 pub use ctrlvim_editor::tags::{resolve_address as resolve_tag_address, TagAddress, TagTable};
 pub use ctrlvim_editor::quickfix::{grep_text, Matcher, OutputParser};
+pub use ctrlvim_editor::replace::{ReplaceHit, ReplacePlan};
 pub use ctrlvim_lua::Host;
 pub use ctrlvim_types::{BufferId, Object, Position, WindowId};
 

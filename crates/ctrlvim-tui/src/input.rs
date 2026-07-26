@@ -16,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ctrlvim_core::Key;
 
 use crate::app::{Action, App, DashboardSection, PanelId};
+use crate::replace::Field;
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Emergency quit, honored even mid-insert. (Ctrl-Q is intentionally not a
@@ -34,6 +35,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     // Modal frontend overlays.
+    if app.replace.is_some() {
+        handle_replace(app, key);
+        return;
+    }
     if app.finder.is_some() {
         handle_finder(app, key);
         return;
@@ -141,6 +146,57 @@ fn handle_finder(app: &mut App, key: KeyEvent) {
     }
 }
 
+// --- find & replace panel --------------------------------------------------
+
+/// Keys in the replace panel. The two text fields take typing; the results list
+/// takes Vim-ish commands (`j`/`k`, `y`, `Y`, `<CR>`), which is why the same
+/// letter means different things depending on focus.
+fn handle_replace(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let results = app.replace.as_ref().is_some_and(|p| p.focus == Field::Results);
+
+    // Chords that work from every field, so accepting doesn't require a detour
+    // through the results list first.
+    match key.code {
+        KeyCode::Esc => return app.dispatch(Action::CloseReplace),
+        KeyCode::Tab => return app.replace_cycle(),
+        KeyCode::BackTab => {
+            // Shift-Tab walks the cycle backwards (twice forward, of three).
+            app.replace_cycle();
+            return app.replace_cycle();
+        }
+        KeyCode::Down => return app.replace_move(1),
+        KeyCode::Up => return app.replace_move(-1),
+        KeyCode::Char('n') if ctrl => return app.replace_move(1),
+        KeyCode::Char('p') if ctrl => return app.replace_move(-1),
+        KeyCode::Char('i') if ctrl => return app.replace_toggle_case(),
+        KeyCode::Char('a') if ctrl => return app.replace_accept_all(),
+        _ => {}
+    }
+
+    if results {
+        match (key.code, char_of(&key)) {
+            (KeyCode::Enter, _) => app.replace_jump(),
+            (_, Some('j')) => app.replace_move(1),
+            (_, Some('k')) => app.replace_move(-1),
+            (KeyCode::Char('y'), _) => app.replace_accept_one(),
+            (KeyCode::Char('Y'), _) => app.replace_accept_all(),
+            (_, Some('q')) => app.dispatch(Action::CloseReplace),
+            _ => {}
+        }
+        return;
+    }
+
+    // A text field: Enter accepts everything (the fields have nothing else to
+    // do with it), and the rest is plain typing.
+    match key.code {
+        KeyCode::Enter => app.replace_accept_all(),
+        KeyCode::Backspace => app.replace_backspace(),
+        KeyCode::Char(c) => app.replace_type(c),
+        _ => {}
+    }
+}
+
 // --- command palette -------------------------------------------------------
 
 fn handle_palette(app: &mut App, key: KeyEvent) {
@@ -194,6 +250,11 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         }
         if c == Some('d') {
             app.dispatch(Action::OpenDashboard);
+            return;
+        }
+        // `<leader>S` — the same chord the engine keymap binds in the editor.
+        if matches!(key.code, KeyCode::Char('S')) {
+            app.dispatch(Action::OpenReplace);
             return;
         }
         // Not a recognized leader chord — fall through and handle normally.

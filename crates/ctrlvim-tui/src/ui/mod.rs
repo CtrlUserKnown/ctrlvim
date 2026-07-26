@@ -13,6 +13,7 @@ mod finder;
 mod overlays;
 mod plugins;
 mod quickfix;
+mod replace;
 mod shell;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -80,6 +81,9 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     }
     if app.finder.is_some() {
         finder::screen(f, app, area, &mut zones);
+    }
+    if app.replace.is_some() {
+        replace::screen(f, app, area, &mut zones);
     }
     if app.help_open {
         overlays::help(f, app, area, &mut zones);
