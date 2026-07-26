@@ -29,7 +29,12 @@ fn temp_project(files: &[(&str, &str)]) -> App {
     for (name, content) in files {
         fs::write(dir.join(name), content).unwrap();
     }
-    App::with_root(dir, Instant::now())
+    let mut app = App::with_root(dir, Instant::now());
+    // `App::with_root` loads the *developer's* `~/.config/ctrlvim/config.toml`,
+    // which would make these tests depend on whoever runs them — a machine with
+    // `drawer = true` renders a different screen. Pin the defaults instead.
+    app.config = ctrlvim::config::Config::default();
+    app
 }
 
 fn render(app: &App, w: u16, h: u16) -> String {
@@ -74,6 +79,14 @@ fn fg_of(buf: &ratatui::buffer::Buffer, needle: &str, offset: u16) -> ratatui::s
         }
     }
     panic!("{needle:?} never rendered");
+}
+
+/// A 40-line file buffer, opened — enough to scroll around in.
+fn long_file() -> App {
+    let src: String = (1..=40).map(|i| format!("line {i:02}\n")).collect();
+    let mut app = temp_project(&[("long.rs", &src)]);
+    app.open_file(0);
+    app
 }
 
 fn contains_all(hay: &str, needles: &[&str]) {
@@ -1104,17 +1117,80 @@ fn gt_and_dashboard_commands() {
 }
 
 #[test]
-fn mouse_scroll_is_opt_in() {
-    let mut app = temp_project(&[("f.rs", "1\n2\n3\n4\n5\n6\n7\n8\n")]);
-    app.open_file(0);
-    assert_eq!(app.editor_cursor().0, 0);
-    app.scroll_editor(3); // ignored while mouse support is off
-    assert_eq!(app.editor_cursor().0, 0);
-    app.config.mouse = true;
-    app.scroll_editor(3); // now moves down 3 lines
-    assert_eq!(app.editor_cursor().0, 3);
+fn mouse_scroll_moves_the_view() {
+    let mut app = long_file();
+    assert!(app.config.mouse, "mouse scrolling is on by default");
+    // One render so the app knows how tall the viewport is.
+    let out = render(&app, 100, 20);
+    assert!(out.contains("line 01"), "starts at the top:\n{out}");
+
+    app.scroll_editor(5);
+    let out = render(&app, 100, 20);
+    assert!(!out.contains("line 01"), "scrolled past the first line:\n{out}");
+    assert!(out.contains("line 06"), "now showing from line 6:\n{out}");
+}
+
+#[test]
+fn scrolling_only_drags_the_cursor_when_it_would_leave_the_view() {
+    let mut app = long_file();
+    render(&app, 100, 20);
+
+    // Scrolling down past the cursor pulls it along, since it may not sit
+    // outside the window.
+    app.scroll_editor(5);
+    assert_eq!(app.editor_cursor().0, 5, "cursor followed the view down");
+
+    // Scrolling back up while the cursor is still on screen leaves it alone —
+    // this is view scrolling, not cursor movement.
     app.scroll_editor(-2);
-    assert_eq!(app.editor_cursor().0, 1);
+    assert_eq!(app.editor_cursor().0, 5, "cursor stayed put");
+    let out = render(&app, 100, 20);
+    assert!(out.contains("line 04"), "but the view moved:\n{out}");
+}
+
+#[test]
+fn scrolling_never_edits_the_buffer() {
+    // Regression: scrolling used to feed `j`/`k` into the engine, so a wheel
+    // tick with an operator pending (`d` then scroll) deleted lines.
+    let mut app = long_file();
+    render(&app, 100, 20);
+    let before = app.editor_lines();
+    key(&mut app, 'd'); // operator pending
+    app.scroll_editor(3);
+    app.scroll_editor(-3);
+    assert_eq!(app.editor_lines(), before, "the buffer is untouched");
+}
+
+#[test]
+fn scrolling_stops_at_the_buffer_edges() {
+    let mut app = long_file();
+    render(&app, 100, 20);
+    app.scroll_editor(-10); // already at the top
+    assert_eq!(app.view_top(), 0);
+    app.scroll_editor(9999); // far past the end
+    let out = render(&app, 100, 20);
+    assert!(out.contains("line 40"), "the last line is still reachable:\n{out}");
+}
+
+#[test]
+fn mouse_scrolling_can_be_turned_off() {
+    let mut app = long_file();
+    render(&app, 100, 20);
+    app.config.mouse = false;
+    app.scroll_editor(5);
+    assert_eq!(app.view_top(), 0, "the wheel belongs to the terminal now");
+}
+
+#[test]
+fn scrolling_a_folded_buffer_moves_by_screen_rows() {
+    let mut app = long_file();
+    typ(&mut app, "zf9j"); // fold lines 1..=10 into one row
+    render(&app, 100, 20);
+    app.scroll_editor(2);
+    let out = render(&app, 100, 20);
+    // Two rows past the fold's summary row is line 12, not line 3 — the
+    // collapsed lines don't count as rows.
+    assert!(out.contains("line 12"), "scrolled by screen rows:\n{out}");
 }
 
 #[test]

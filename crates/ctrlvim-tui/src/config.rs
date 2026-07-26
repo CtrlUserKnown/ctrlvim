@@ -19,7 +19,9 @@ use crate::icons::IconMode;
 pub struct Config {
     /// Open the file drawer (the `Ctrl+B` sidebar) automatically on startup.
     pub drawer: bool,
-    /// Enable mouse support in the editor (scrolling to move through the buffer).
+    /// Enable mouse support in the editor (wheel scrolling). On by default, as
+    /// in Neovim since 0.8; set `mouse = false` to give the wheel back to the
+    /// terminal for its own scrollback.
     pub mouse: bool,
     /// How file icons are drawn: Nerd Font glyphs, extension text, or auto-
     /// detect (see [`crate::icons`]).
@@ -28,7 +30,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { drawer: false, mouse: false, icons: IconMode::Auto }
+        Config { drawer: false, mouse: true, icons: IconMode::Auto }
     }
 }
 
@@ -76,7 +78,8 @@ impl Config {
             "# ctrlvim config\n\n\
              # Open the file drawer on startup.\n\
              drawer = {}\n\n\
-             # Enable mouse support (scroll the editor).\n\
+             # Mouse wheel scrolling in the editor. Turn this off to give the\n\
+             # wheel back to the terminal's own scrollback.\n\
              mouse = {}\n\n\
              # File icons: \"auto\" (Nerd Font glyphs if one is installed),\n\
              # \"nerd\" (always glyphs), or \"text\" (a letter per filetype).\n\
@@ -156,7 +159,7 @@ mod tests {
     fn parses_mouse_option() {
         assert!(Config::parse("mouse = true").mouse);
         assert!(!Config::parse("mouse = false").mouse);
-        assert!(!Config::default().mouse);
+        assert!(Config::default().mouse, "on by default, as in Neovim");
     }
 
     #[test]

@@ -32,10 +32,15 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
     let content_w = (area.x + area.width).saturating_sub(text_x);
     let height = area.height as usize;
 
-    // Scroll so the cursor stays visible — in *screen* rows, since a closed
-    // fold collapses many buffer lines onto one.
+    // Where the viewport starts, in *screen* rows (a closed fold is one row).
+    // The mouse wheel moves `view_top`; clamping it against the cursor here
+    // means keyboard movement scrolls the view without the app having to track
+    // the viewport, and the cursor can never be off-screen.
+    app.set_viewport_rows(height);
     let cur_row = app.screen_line_of(cur_line);
-    let top_row = if cur_row >= height { cur_row - height + 1 } else { 0 };
+    let top_row = app
+        .view_top()
+        .clamp(cur_row.saturating_sub(height.saturating_sub(1)), cur_row);
     // The buffer lines these rows actually show: `visible[row]`, never
     // `top + row`, because folds make those differ.
     let visible = app.visible_lines(top_row, height, lines.len());

@@ -54,7 +54,8 @@ cargo run -p ctrlvim-tui --example snapshot -- grid   # print a text snapshot of
 explorer · `Tab`/`Shift+Tab` cycle buffers · `[`/`]` cycle dashboard section ·
 `w`/`s`/`a` jump to section · `p` plugin manager · `2`/`3` layout · `r`/`g`/`b`
 expand panels · `j`/`k` move selection · `Enter` open/toggle · `?` help · `Esc`
-close overlay. Every list row, tab, pill, and toggle is also clickable.
+close overlay. Every list row, tab, pill, and toggle is also clickable, and the
+wheel scrolls the editor view (`mouse = false` gives it back to the terminal).
 
 **Editor** (a file buffer is focused): keys go straight to the engine — Vim
 motions/operators/insert all work. A few chords escape back to the shell:
@@ -88,4 +89,8 @@ so they can be swapped for engine-fed data later.
 
 Mouse support uses a per-frame **click-zone registry**: each interactive element
 registers a `Rect` + `Action`; a click dispatches the same `Action` its
-keyboard equivalent would, so keyboard and mouse never diverge.
+keyboard equivalent would, so keyboard and mouse never diverge. The wheel moves
+`App::view_top`, a viewport offset in *screen rows* (so a closed fold counts
+once); the renderer clamps it against the cursor, which is why keyboard movement
+scrolls the view without anyone tracking the viewport, and why scrolling drags
+the cursor only when it would otherwise leave the window.

@@ -309,6 +309,12 @@ pub struct App {
     /// Modified time of the tags file when it was last loaded, so a
     /// regenerated one is picked up without a reload command.
     tags_loaded_at: Option<std::time::SystemTime>,
+    /// Top of the editor viewport in screen rows — what the mouse wheel moves.
+    /// The renderer clamps it so the cursor is always visible, so it doesn't
+    /// need updating when the cursor moves by keyboard.
+    view_top: usize,
+    /// Editor viewport height, recorded by the renderer for scroll clamping.
+    viewport_rows: std::cell::Cell<usize>,
 
     pub should_quit: bool,
 }
@@ -383,6 +389,8 @@ impl App {
             timers: None,
             job: None,
             tags_loaded_at: None,
+            view_top: 0,
+            viewport_rows: std::cell::Cell::new(24),
             should_quit: false,
         }
     }
@@ -797,10 +805,42 @@ impl App {
         if !self.config.mouse || !self.editor_focus() {
             return;
         }
-        let key = if lines >= 0 { Key::Char('j') } else { Key::Char('k') };
-        for _ in 0..lines.unsigned_abs() {
-            self.feed_engine(key);
+        let text = self.editor_lines();
+        let line_count = text.len();
+        let rows = self.viewport_rows.get().max(1);
+        // Screen rows, not buffer lines: a closed fold is one row.
+        let max_top = self.folds().screen_line_count(line_count).saturating_sub(1);
+        let cur_row = self.screen_line_of(self.editor_cursor().0);
+
+        // Start from the row actually on screen, which may differ from the
+        // stored offset after the cursor was moved by the keyboard.
+        let effective = self.view_top.clamp(cur_row.saturating_sub(rows - 1), cur_row);
+        self.view_top = if lines >= 0 {
+            (effective + lines as usize).min(max_top)
+        } else {
+            effective.saturating_sub(lines.unsigned_abs() as usize)
+        };
+
+        // Vim drags the cursor along only when the view would leave it behind.
+        let (first, last) = (self.view_top, self.view_top + rows - 1);
+        if cur_row < first || cur_row > last {
+            let row = cur_row.clamp(first, last);
+            let line = self.folds().buffer_line_of(row, line_count);
+            let col = self.editor_cursor().1;
+            self.engine.session.set_cursor_clamped(line, col);
         }
+    }
+
+    /// The stored viewport offset, in screen rows.
+    pub fn view_top(&self) -> usize {
+        self.view_top
+    }
+
+    /// Record how many rows the editor viewport has. Called from the renderer,
+    /// which is the only place that knows — mouse scrolling needs it to keep
+    /// the cursor inside the window.
+    pub fn set_viewport_rows(&self, rows: usize) {
+        self.viewport_rows.set(rows);
     }
 
     /// Feed one key to the engine's editing session, then perform any host
