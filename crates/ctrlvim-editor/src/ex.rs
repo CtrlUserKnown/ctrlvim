@@ -60,6 +60,9 @@ pub enum ExEffect {
     /// ([`crate::replace::ReplacePlan`]); the panel and the files are the
     /// host's.
     OpenReplace { pattern: Option<String> },
+    /// Run a raw command line through the user's configured shell and show its
+    /// output (`:!{cmd}`). The host owns the shell binary and the process.
+    Shell(String),
 }
 
 /// What the host should do for a tag command. The engine owns the tag table and
@@ -133,17 +136,146 @@ pub(crate) enum SetItem {
     Unknown(String),
 }
 
-/// A user-facing Ex command for the frontend's command palette: the text to
-/// type (without the leading `:`) and a short description. The catalog lives in
-/// the engine so the set of commands has one source of truth; the frontend only
-/// *presents* them, and running one still goes back through [`parse_ex`].
+/// A recognized Ex command: its canonical name, any other spellings Vim
+/// users expect (`clo` for `close`), and a one-line description. This one
+/// table backs both [`is_ex_command`] (so an abbreviation like `:cl` is
+/// recognized as *some* real command) and [`commands`] (so every recognized
+/// command — abbreviation or not — is offered in the frontend's command
+/// palette). Previously these were two independently hand-maintained lists
+/// and could silently drift apart: `:clist` parsed and ran but had no
+/// palette entry, so typing its `:cl` abbreviation looked like it did
+/// nothing. A command can no longer exist in one without the other.
 #[derive(Debug, Clone, Copy)]
 pub struct ExCommand {
-    /// Command text as typed, e.g. `"wq"` (no leading colon).
+    /// Canonical command text, e.g. `"wq"` (no leading colon). This is what
+    /// the palette both displays and runs; [`aliases`](Self::aliases) are
+    /// only for recognizing other spellings, never displayed.
     pub name: &'static str,
+    /// Other recognized spellings of this same command, e.g. `&["clo"]` for
+    /// `"close"`. Not shown in the palette label, but typing one runs the
+    /// command and `is_ex_command` recognizes it.
+    pub aliases: &'static [&'static str],
     /// One-line description shown next to the command.
     pub desc: &'static str,
 }
+
+impl ExCommand {
+    /// Every recognized spelling of this command, canonical name first.
+    fn spellings(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.name).chain(self.aliases.iter().copied())
+    }
+}
+
+/// The full table of recognized Ex commands: one entry per distinct command,
+/// covering everything [`crate::session::Session::execute_ex`] can dispatch.
+/// [`is_ex_command`] and [`commands`] both read this, so a command can't be
+/// runnable without also being visible in the palette (or vice versa).
+const TABLE: &[ExCommand] = &[
+    // -- file / quit ------------------------------------------------------
+    ExCommand { name: "w", aliases: &["write"], desc: "write buffer to file" },
+    ExCommand { name: "wq", aliases: &[], desc: "write buffer and quit" },
+    ExCommand { name: "x", aliases: &["xit", "exit"], desc: "write if changed, then quit" },
+    ExCommand { name: "q", aliases: &["quit"], desc: "quit window" },
+    ExCommand { name: "q!", aliases: &[], desc: "quit without saving" },
+    ExCommand { name: "qa", aliases: &["qall", "quita", "quitall", "cq", "cquit"], desc: "quit all windows" },
+    ExCommand { name: "wa", aliases: &["wall"], desc: "write all buffers" },
+    ExCommand { name: "wqa", aliases: &["wqall", "xa", "xall"], desc: "write all and quit" },
+    ExCommand { name: "close", aliases: &["clo"], desc: "close ctrlvim" },
+    ExCommand { name: "new", aliases: &["enew", "tabnew", "tabe", "tabedit"], desc: "create a new file (:new name), or the file browser if bare" },
+    ExCommand { name: "edit", aliases: &["e"], desc: "edit a file by name (:edit name), or the file browser if bare" },
+    ExCommand { name: "saveas", aliases: &["sav", "save"], desc: "write buffer to a new file (:saveas name)" },
+    ExCommand { name: "update", aliases: &["up"], desc: "write buffer to file if modified" },
+    ExCommand { name: "Files", aliases: &["Explore", "Ex", "E"], desc: "open the fuzzy file browser" },
+    ExCommand { name: "dashboard", aliases: &["dash", "Dash", "Dashboard"], desc: "go to the dashboard" },
+    ExCommand { name: "colorscheme", aliases: &["colo", "colors"], desc: "change the color theme" },
+    ExCommand { name: "set", aliases: &["se", "setl", "setlocal", "setg", "setglobal"], desc: "set an option (:set number, ts=4)" },
+    ExCommand { name: "undo", aliases: &["u", "un"], desc: "undo the last change" },
+    ExCommand { name: "redo", aliases: &["red"], desc: "redo the last undone change" },
+    ExCommand { name: "earlier", aliases: &["ea"], desc: "undo N changes at once (:earlier 3)" },
+    ExCommand { name: "later", aliases: &["lat"], desc: "redo N changes at once (:later 3)" },
+
+    // -- buffers / tabs (ctrlvim's tabs are its buffer list) --------------
+    ExCommand { name: "ls", aliases: &["buffers", "tabs"], desc: "list open buffers" },
+    ExCommand { name: "bnext", aliases: &["bn", "tabn", "tabnext"], desc: "go to the next buffer" },
+    ExCommand { name: "bprevious", aliases: &["bp", "bN", "bNext", "tabp", "tabprevious", "tabN", "tabNext"], desc: "go to the previous buffer" },
+    ExCommand { name: "bfirst", aliases: &["bf", "br", "brewind", "tabfir", "tabfirst", "tabr", "tabrewind"], desc: "go to the first buffer" },
+    ExCommand { name: "blast", aliases: &["bl", "tabl", "tablast"], desc: "go to the last buffer" },
+    ExCommand { name: "buffer", aliases: &["b", "bu", "buf"], desc: "go to buffer N (:buffer 2)" },
+    ExCommand { name: "bdelete", aliases: &["bd", "bdel", "tabc", "tabclose"], desc: "close the current buffer" },
+    ExCommand { name: "only", aliases: &["on", "tabo", "tabonly"], desc: "close all other buffers" },
+
+    // -- range / text-processing ------------------------------------------
+    ExCommand { name: "substitute", aliases: &["s", "su", "sub"], desc: "search & replace (:s/old/new/g)" },
+    ExCommand { name: "global", aliases: &["g"], desc: "run a command on every matching line (:g/pat/d)" },
+    ExCommand { name: "vglobal", aliases: &["v"], desc: "run a command on every non-matching line" },
+    ExCommand { name: "delete", aliases: &["d", "de", "del"], desc: "delete the line(s) in range" },
+    ExCommand { name: "yank", aliases: &["y", "ya"], desc: "yank the line(s) in range" },
+    ExCommand { name: "move", aliases: &["m", "mo"], desc: "move the line(s) in range (:m $)" },
+    ExCommand { name: "copy", aliases: &["t", "co"], desc: "copy the line(s) in range (:t $)" },
+    ExCommand { name: "join", aliases: &["j"], desc: "join the line(s) in range" },
+    ExCommand { name: "sort", aliases: &["sor"], desc: "sort the line(s) in range" },
+    ExCommand { name: "normal", aliases: &["norm"], desc: "run normal-mode keys over the range (:%norm A;)" },
+    ExCommand { name: "put", aliases: &["pu"], desc: "paste the unnamed register below the line" },
+    ExCommand { name: "nohlsearch", aliases: &["noh", "nohl"], desc: "clear search highlighting" },
+
+    // -- tags ---------------------------------------------------------------
+    ExCommand { name: "tag", aliases: &["ta"], desc: "jump to a tag's definition (:tag name)" },
+    ExCommand { name: "tnext", aliases: &["tn"], desc: "jump to the next match for the last tag" },
+    ExCommand { name: "tprevious", aliases: &["tp", "tprev", "tN"], desc: "jump to the previous match for the last tag" },
+    ExCommand { name: "tfirst", aliases: &["tf", "tr", "trewind"], desc: "jump to the first match for the last tag" },
+    ExCommand { name: "tlast", aliases: &["tl"], desc: "jump to the last match for the last tag" },
+    ExCommand { name: "tselect", aliases: &["ts", "tj", "tjump"], desc: "list matches for a tag and jump" },
+    ExCommand { name: "tags", aliases: &[], desc: "show the tag stack" },
+    ExCommand { name: "pop", aliases: &["po"], desc: "jump back up the tag stack" },
+
+    // -- folds --------------------------------------------------------------
+    ExCommand { name: "fold", aliases: &["fo"], desc: "create a fold over the range" },
+    ExCommand { name: "foldopen", aliases: &["foldo"], desc: "open the fold(s) in range" },
+    ExCommand { name: "foldclose", aliases: &["foldc"], desc: "close the fold(s) in range" },
+
+    // -- quickfix -------------------------------------------------------
+    ExCommand { name: "copen", aliases: &["cope", "cw", "cwindow"], desc: "open the quickfix list" },
+    ExCommand { name: "cclose", aliases: &["ccl"], desc: "close the quickfix list" },
+    ExCommand { name: "cnext", aliases: &["cn"], desc: "jump to the next quickfix entry" },
+    ExCommand { name: "cprevious", aliases: &["cprev", "cp", "cN"], desc: "jump to the previous quickfix entry" },
+    ExCommand { name: "cfirst", aliases: &["cfir", "crewind", "cr"], desc: "jump to the first quickfix entry" },
+    ExCommand { name: "clast", aliases: &["cla"], desc: "jump to the last quickfix entry" },
+    ExCommand { name: "cc", aliases: &[], desc: "jump to the current (or Nth) quickfix entry" },
+    ExCommand { name: "clist", aliases: &["cl"], desc: "show how many quickfix entries there are" },
+    ExCommand { name: "make", aliases: &[], desc: "build the project into the quickfix list" },
+    ExCommand { name: "grep", aliases: &["gr"], desc: "run grep into the quickfix list" },
+    ExCommand { name: "vimgrep", aliases: &["vim", "vimg"], desc: "search files into the quickfix list (:vimgrep /pat/)" },
+
+    // -- find & replace panel ----------------------------------------------
+    ExCommand { name: "Find", aliases: &[], desc: "find & replace across the project (:Find [pattern])" },
+    ExCommand { name: "Replace", aliases: &["Repl"], desc: "find & replace across the project" },
+
+    // -- scripting ----------------------------------------------------------
+    ExCommand { name: "map", aliases: &["nmap", "nnoremap", "noremap", "nore"], desc: "define a normal-mode mapping (:map lhs rhs)" },
+    ExCommand { name: "command", aliases: &["com", "comm"], desc: "define a user command (:command Name expansion)" },
+    ExCommand { name: "comclear", aliases: &[], desc: "remove all user-defined commands" },
+    ExCommand { name: "let", aliases: &[], desc: "set a script variable (:let g:x = 1)" },
+    ExCommand { name: "echo", aliases: &["echom", "echomsg"], desc: "show a message (:echo expr)" },
+    ExCommand { name: "call", aliases: &[], desc: "call a function (:call Foo())" },
+    ExCommand { name: "function", aliases: &["func", "fu"], desc: "define a script function" },
+    ExCommand { name: "source", aliases: &["so", "luafile"], desc: "run a script file (:source file)" },
+    ExCommand { name: "lua", aliases: &[], desc: "run a Lua chunk (:lua code)" },
+    ExCommand { name: "if", aliases: &[], desc: "vimscript: start a conditional block" },
+    ExCommand { name: "elseif", aliases: &[], desc: "vimscript: conditional else-if branch" },
+    ExCommand { name: "else", aliases: &[], desc: "vimscript: conditional else branch" },
+    ExCommand { name: "endif", aliases: &[], desc: "vimscript: end a conditional block" },
+    ExCommand { name: "for", aliases: &[], desc: "vimscript: start a for loop" },
+    ExCommand { name: "endfor", aliases: &[], desc: "vimscript: end a for loop" },
+    ExCommand { name: "while", aliases: &[], desc: "vimscript: start a while loop" },
+    ExCommand { name: "endwhile", aliases: &[], desc: "vimscript: end a while loop" },
+    ExCommand { name: "endfunction", aliases: &["endfunc"], desc: "vimscript: end a function definition" },
+    ExCommand { name: "return", aliases: &[], desc: "vimscript: return from a function" },
+    ExCommand { name: "unlet", aliases: &[], desc: "vimscript: delete a variable" },
+    ExCommand { name: "const", aliases: &[], desc: "vimscript: declare a constant" },
+    ExCommand { name: "eval", aliases: &[], desc: "vimscript: evaluate an expression" },
+    ExCommand { name: "execute", aliases: &["exe"], desc: "vimscript: execute a built command string" },
+    ExCommand { name: "echoerr", aliases: &[], desc: "vimscript: show an error message" },
+];
 
 /// Whether `cmd` looks like a real Ex command (so the frontend command line
 /// runs it verbatim instead of treating the text as a fuzzy palette query). A
@@ -158,83 +290,17 @@ pub fn is_ex_command(cmd: &str) -> bool {
         return !matches!(spec, crate::range::RangeSpec::None);
     }
     // Leading command token: a glued single-char command, or an alphabetic run.
-    if rest.starts_with(['>', '<', '=', '&']) {
+    if rest.starts_with(['>', '<', '=', '&', '!']) {
         return true;
     }
     let end = rest.find(|c: char| !c.is_ascii_alphabetic()).unwrap_or(rest.len());
     let name = &rest[..end.max(1)];
-    const KNOWN: &[&str] = &[
-        // file / quit / buffers / tabs / options / history / theme (also catalog)
-        "w", "write", "wq", "x", "xit", "exit", "q", "quit", "qa", "qall", "wa", "wall",
-        "wqa", "xa", "xall", "cq", "cquit", "close", "clo", "e", "edit", "new", "enew",
-        "sav", "save", "saveas", "up", "update", "Files", "Explore", "Ex", "E",
-        "dash", "dashboard", "Dash", "Dashboard", "ls",
-        "buffers", "b", "bu", "buf", "buffer", "bn", "bnext", "bp", "bprevious", "bN",
-        "bNext", "bf", "bfirst", "br", "brewind", "bl", "blast", "bd", "bdel", "bdelete",
-        "on", "only", "tabn", "tabnext", "tabp", "tabprevious", "tabc", "tabclose",
-        "tabo", "tabonly", "tabnew", "tabe", "tabedit", "tabs", "tabfir", "tabfirst",
-        "tabl", "tablast", "colo", "colors", "colorscheme", "set", "se", "setl",
-        "setlocal", "setg", "setglobal", "u", "un", "undo", "red", "redo", "ea",
-        "earlier", "lat", "later",
-        // range / text-processing
-        "s", "su", "sub", "substitute", "g", "global", "v", "vglobal", "d", "de", "del",
-        "delete", "y", "ya", "yank", "m", "mo", "move", "t", "co", "copy", "j", "join",
-        "sort", "sor", "normal", "norm", "pu", "put", "noh", "nohl", "nohlsearch",
-        // tags
-        "ta", "tag", "tn", "tnext", "tp", "tprevious", "tprev", "tN", "tf", "tfirst",
-        "tr", "trewind", "tl", "tlast", "ts", "tselect", "tj", "tjump", "tags", "po", "pop",
-        // folds
-        "fo", "fold", "foldo", "foldopen", "foldc", "foldclose",
-        // quickfix
-        "copen", "cope", "cw", "cwindow", "cclose", "ccl", "cnext", "cn", "cprevious",
-        "cprev", "cp", "cN", "cfirst", "cfir", "crewind", "cr", "clast", "cla", "cc",
-        "clist", "cl", "make", "grep", "gr", "vimgrep", "vim", "vimg",
-        // find & replace panel
-        "Find", "Replace", "Repl",
-        // scripting
-        "map", "nmap", "nnoremap", "noremap", "vmap", "vnoremap", "imap", "inoremap",
-        "unmap", "let", "echo", "echom", "echomsg", "call", "if", "for", "while",
-        "function", "func", "fu", "source", "so", "lua", "luafile", "command", "comclear",
-    ];
-    KNOWN.contains(&name)
+    TABLE.iter().any(|cmd| cmd.spellings().any(|s| s == name))
 }
 
 /// The catalog of Ex commands offered in the command palette, in display order.
 pub fn commands() -> &'static [ExCommand] {
-    &[
-        ExCommand { name: "w", desc: "write buffer to file" },
-        ExCommand { name: "wq", desc: "write buffer and quit" },
-        ExCommand { name: "x", desc: "write if changed, then quit" },
-        ExCommand { name: "q", desc: "quit window" },
-        ExCommand { name: "q!", desc: "quit without saving" },
-        ExCommand { name: "qa", desc: "quit all windows" },
-        ExCommand { name: "wa", desc: "write all buffers" },
-        ExCommand { name: "wqa", desc: "write all and quit" },
-        ExCommand { name: "close", desc: "close ctrlvim" },
-        ExCommand { name: "new", desc: "create a new file (:new name)" },
-        ExCommand { name: "dashboard", desc: "go to the dashboard" },
-        ExCommand { name: "ls", desc: "list open buffers" },
-        ExCommand { name: "bnext", desc: "go to the next buffer" },
-        ExCommand { name: "bprevious", desc: "go to the previous buffer" },
-        ExCommand { name: "bdelete", desc: "close the current buffer" },
-        ExCommand { name: "only", desc: "close all other buffers" },
-        ExCommand { name: "undo", desc: "undo the last change" },
-        ExCommand { name: "redo", desc: "redo the last undone change" },
-        ExCommand { name: "set", desc: "set an option (:set number, ts=4)" },
-        ExCommand { name: "colorscheme", desc: "change the color theme" },
-        ExCommand { name: "substitute", desc: "search & replace (:s/old/new/g)" },
-        ExCommand { name: "nohlsearch", desc: "clear search highlighting" },
-        ExCommand { name: "source", desc: "run a script file (:source file)" },
-        ExCommand { name: "Files", desc: "open the fuzzy file browser" },
-        ExCommand { name: "Find", desc: "find & replace across the project (:Find [pattern])" },
-        ExCommand { name: "vimgrep", desc: "search files into the quickfix list (:vimgrep /pat/)" },
-        ExCommand { name: "grep", desc: "run grep into the quickfix list" },
-        ExCommand { name: "make", desc: "build the project into the quickfix list" },
-        ExCommand { name: "copen", desc: "open the quickfix list" },
-        ExCommand { name: "cclose", desc: "close the quickfix list" },
-        ExCommand { name: "cnext", desc: "jump to the next quickfix entry" },
-        ExCommand { name: "cprevious", desc: "jump to the previous quickfix entry" },
-    ]
+    TABLE
 }
 
 /// The parsed outcome of a `:` command line.
@@ -253,6 +319,8 @@ pub(crate) enum ExParsed {
     Map { lhs: String, rhs: String },
     /// Define a user command (`:command Name expansion`).
     DefineCommand { name: String, repl: String },
+    /// Remove all user-defined commands (`:comclear`).
+    ClearUserCommands,
     /// A side effect for the host to perform.
     Effect(ExEffect),
     /// Empty command line — do nothing.
@@ -367,6 +435,7 @@ pub(crate) fn parse_ex(cmd: &str) -> ExParsed {
             }
             return ExParsed::Nop;
         }
+        "comclear" => return ExParsed::ClearUserCommands,
         _ => {}
     }
 
@@ -492,6 +561,51 @@ mod tests {
         for cmd in commands() {
             assert!(is_ex_command(cmd.name), "catalog command {:?} is not recognized", cmd.name);
         }
+    }
+
+    #[test]
+    fn every_spelling_is_globally_unique() {
+        // Two commands can't claim the same abbreviation -- that's exactly
+        // the bug that made `:cl` silently run `:clist` instead of the
+        // `:close` the palette was highlighting.
+        let mut seen = std::collections::HashMap::new();
+        for cmd in TABLE {
+            for spelling in cmd.spellings() {
+                if let Some(owner) = seen.insert(spelling, cmd.name) {
+                    assert_eq!(
+                        owner, cmd.name,
+                        "{spelling:?} is claimed by both {owner:?} and {:?}",
+                        cmd.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_has_a_description() {
+        for cmd in TABLE {
+            assert!(!cmd.desc.is_empty(), "{:?} has no description", cmd.name);
+        }
+    }
+
+    #[test]
+    fn comclear_removes_user_commands() {
+        assert!(matches!(parse_ex("comclear"), ExParsed::ClearUserCommands));
+    }
+
+    #[test]
+    fn norm_is_an_alias_of_normal() {
+        assert!(is_ex_command("norm"));
+        assert!(is_ex_command("norm A;"));
+    }
+
+    #[test]
+    fn bang_is_a_recognized_ex_command() {
+        // So the palette runs `:!{cmd}` verbatim rather than falling through to
+        // a fuzzy-matched entry.
+        assert!(is_ex_command("!echo hi"));
+        assert!(is_ex_command("!"));
     }
 
     #[test]

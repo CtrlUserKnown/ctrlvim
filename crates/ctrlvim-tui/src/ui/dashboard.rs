@@ -321,6 +321,16 @@ fn choice_row(
     zones.push(row, action);
 }
 
+/// Clip `s` to `max` characters, marking the cut with an ellipsis — keeps a
+/// fixed-width column from swallowing the one after it when a registry entry
+/// (e.g. a formatter's filetype list) runs long.
+fn truncate(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.chars().count() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>()))
+}
+
 fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     if area.width < 10 || area.height < 4 {
         return;
@@ -387,11 +397,13 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
         f.render_widget(Block::default().style(row_style(selected)), row);
 
-        // Status reflects PATH detection + the on/off toggle.
+        // Status reflects PATH/tools-dir detection + the on/off toggle. A
+        // known-installable tool that's missing is orange (actionable via
+        // `I`); one ctrlvim doesn't know how to install is red.
         let (status_label, status_color) = if !lsp.installed {
-            ("not found", theme::red())
+            ("not found", if lsp.installable { theme::orange() } else { theme::red() })
         } else if on {
-            ("running", theme::green())
+            (if lsp.managed { "running*" } else { "running" }, theme::green())
         } else {
             ("disabled", theme::fg_dim())
         };
@@ -399,8 +411,10 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         let toggle_color = if on { theme::green() } else { theme::fg_dim() };
         let spans = vec![
             selection_bar(selected, theme::blue()),
-            Span::styled(format!("{:<18}", lsp.name), Style::default().fg(theme::fg())),
-            Span::styled(format!("{:<20}", lsp.filetypes), Style::default().fg(theme::fg_dim())),
+            // Truncate one character short of the column width so a clipped
+            // entry still leaves at least one space before the next column.
+            Span::styled(format!("{:<18}", truncate(&lsp.name, 17)), Style::default().fg(theme::fg())),
+            Span::styled(format!("{:<20}", truncate(&lsp.filetypes, 19)), Style::default().fg(theme::fg_dim())),
             Span::styled(format!("{:<12}", status_label), Style::default().fg(status_color)),
             Span::styled(toggle, Style::default().fg(toggle_color)),
         ];
@@ -412,14 +426,37 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         zones.push(Rect { x: tx, y, width: toggle_w, height: 1 }, Action::ToggleLsp(i));
     }
 
-    // Footer config path, one blank line beneath the table.
+    // Footer: a per-row install hint when the focused row can use one,
+    // otherwise the config path plus the `*` legend (managed installs).
     let foot_y = table.y + table_h + 1;
     if foot_y < area.y + area.height {
-        let footer = Line::from(vec![
-            Span::styled("Config file: ", Style::default().fg(theme::fg_dim())),
-            Span::styled("~/.config/ctrlvim/lsp.toml", Style::default().fg(theme::cyan())),
-        ]);
+        let focused = app.settings_index.checked_sub(App::SETTINGS_EDITOR_OPTIONS).and_then(|i| app.project.lsp.get(i));
+        let footer = match focused {
+            Some(lsp) if !lsp.installed && lsp.installable => Line::from(vec![Span::styled(
+                format!("Press I to install {} ({})", lsp.name, ctrlvim_tools_command_hint(&lsp.name)),
+                Style::default().fg(theme::orange()),
+            )]),
+            _ => Line::from(vec![
+                Span::styled("Config file: ", Style::default().fg(theme::fg_dim())),
+                Span::styled("~/.config/ctrlvim/lsp.toml", Style::default().fg(theme::cyan())),
+                Span::styled("   * = installed by ctrlvim", Style::default().fg(theme::fg_dim())),
+            ]),
+        };
         f.render_widget(Paragraph::new(footer), Rect { x: area.x, y: foot_y, width: area.width, height: 1 });
+    }
+}
+
+/// A short description of what pressing `I` would run, for the Settings
+/// footer hint — e.g. "cargo install" rather than the full command line.
+fn ctrlvim_tools_command_hint(name: &str) -> &'static str {
+    use ctrlvim_tools::InstallMethod;
+    match ctrlvim_tools::REGISTRY.iter().find(|t| t.name == name).map(|t| t.method) {
+        Some(InstallMethod::Cargo(_)) => "cargo install",
+        Some(InstallMethod::Npm(_)) => "npm install",
+        Some(InstallMethod::Pip(_)) => "pip install",
+        Some(InstallMethod::GoInstall(_)) => "go install",
+        Some(InstallMethod::Rustup(_)) => "rustup component add",
+        _ => "unknown",
     }
 }
 

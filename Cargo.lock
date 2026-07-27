@@ -122,6 +122,7 @@ dependencies = [
  "crossterm",
  "ctrlvim-core",
  "ctrlvim-markdown",
+ "ctrlvim-tools",
  "ratatui",
 ]
 
@@ -215,6 +216,10 @@ dependencies = [
  "ctrlvim-types",
  "ropey",
 ]
+
+[[package]]
+name = "ctrlvim-tools"
+version = "0.1.0"
 
 [[package]]
 name = "ctrlvim-treesitter"

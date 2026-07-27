@@ -978,6 +978,22 @@ impl Session {
 
         let (name, arg) = split_ex(&rest);
 
+        // `:!{cmd}` runs a raw command line through the configured shell.
+        // Filtering a range through a command (`:%!sort`) isn't supported yet.
+        if name == "!" {
+            if !matches!(spec, RangeSpec::None) {
+                self.queue_effect(ExEffect::Message(
+                    "E492: filtering a range through an external command is not supported yet"
+                        .into(),
+                ));
+            } else if arg.is_empty() {
+                self.queue_effect(ExEffect::Message("E34: No previous command".into()));
+            } else {
+                self.queue_effect(ExEffect::Shell(arg));
+            }
+            return;
+        }
+
         // User commands (`:command Name …`) expand and re-run.
         if let Some(repl) = self.user_commands.get(&name).cloned() {
             let expanded = if arg.is_empty() { repl } else { format!("{repl} {arg}") };
@@ -1022,6 +1038,7 @@ impl Session {
             ExParsed::DefineCommand { name, repl } => {
                 self.user_commands.insert(name, repl);
             }
+            ExParsed::ClearUserCommands => self.user_commands.clear(),
             // Bare `:Find` seeds the panel with the word under the cursor —
             // `parse_ex` is pure, so the fill-in happens here where the buffer
             // is in reach.
@@ -1427,6 +1444,12 @@ impl Session {
         &self.editor.quickfix
     }
 
+    /// User-defined commands (`:command Name expansion`), name and expansion
+    /// pairs, for the host to list in the command palette.
+    pub fn user_commands(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.user_commands.iter().map(|(name, repl)| (name.as_str(), repl.as_str()))
+    }
+
     /// Select entry `index` (0-based) and return the jump for the host — what
     /// clicking a row in the quickfix pane does.
     pub fn quickfix_select(&mut self, index: usize) -> Option<crate::quickfix::QfItem> {
@@ -1504,7 +1527,7 @@ impl Session {
                 let r = self.range_or_whole(spec);
                 self.ex_sort(r, arg);
             }
-            "normal" => {
+            "normal" | "norm" => {
                 let r = self.resolve_range(spec);
                 self.ex_normal(r, arg);
             }
@@ -2686,6 +2709,33 @@ mod tests {
             ExEffect::Quickfix(QuickfixCmd::Run { program, args, .. })
                 if program == "grep" && args == &["-rn".to_string(), "todo".to_string()]
         )));
+    }
+
+    #[test]
+    fn bang_command_asks_the_host_to_run_a_shell_command() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":!echo hi<CR>");
+        assert!(s
+            .take_effects()
+            .contains(&ExEffect::Shell("echo hi".to_string())));
+    }
+
+    #[test]
+    fn bare_bang_with_no_command_reports_an_error() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":!<CR>");
+        assert!(s
+            .take_effects()
+            .contains(&ExEffect::Message("E34: No previous command".into())));
+    }
+
+    #[test]
+    fn ranged_bang_is_rejected_rather_than_silently_ignoring_the_range() {
+        let mut s = Session::with_text("a\nb\nc");
+        s.feed_str(":%!sort<CR>");
+        let effects = s.take_effects();
+        assert!(!effects.contains(&ExEffect::Shell("sort".to_string())));
+        assert!(effects.iter().any(|e| matches!(e, ExEffect::Message(m) if m.starts_with("E492"))));
     }
 
     #[test]

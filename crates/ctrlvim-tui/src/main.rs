@@ -65,6 +65,12 @@ fn run(terminal: &mut Term, start: Instant) -> io::Result<()> {
             // Mouse-wheel scrolling in the editor (opt-in via `mouse` config).
             Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => app.scroll_editor(3),
             Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => app.scroll_editor(-3),
+            // A resize can leave stale glyphs behind: ratatui only repaints
+            // cells that changed since its last known buffer, and a terminal
+            // that grew (or whose emulator redraws lazily mid-resize) can
+            // leave old content in the newly-exposed area. `clear()` blanks
+            // the real screen and forces a full repaint on the next `draw`.
+            Event::Resize(_, _) => terminal.clear()?,
             _ => {}
         }
     }

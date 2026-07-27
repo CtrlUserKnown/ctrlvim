@@ -202,7 +202,7 @@ pub fn palette(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         if inner.width > used + hint_w {
             spans.push(Span::styled(" ".repeat((inner.width - used - hint_w) as usize), row_style(selected)));
         }
-        spans.push(Span::styled(item.hint, Style::default().fg(theme::fg_dim())));
+        spans.push(Span::styled(item.hint.clone(), Style::default().fg(theme::fg_dim())));
         f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
         zones.push(row, Action::RunPalette(i));
     }
@@ -305,6 +305,44 @@ pub fn help(f: &mut Frame, _app: &App, area: Rect, zones: &mut Zones) {
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme::bg_dark())),
             Rect { x: cx, y: cy, width: col_w, height: 1 },
+        );
+    }
+}
+
+/// Scrollable output panel for a finished `:!{cmd}` (`j`/`k` scroll, `Esc` close).
+pub fn shell_output(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
+    zones.push(area, Action::CloseShellOutput); // click-outside closes
+
+    let w = 96u16.min(area.width.saturating_sub(4));
+    let h = 24u16.min(area.height.saturating_sub(2));
+    if w == 0 || h == 0 {
+        return;
+    }
+    let panel = centered(area, w, h);
+    f.render_widget(Clear, panel);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::border()))
+        .style(Style::default().bg(theme::bg_dark()))
+        .title(Line::from(Span::styled(
+            format!(" {} ", app.shell_title),
+            Style::default().fg(theme::fg()).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    zones.push(panel, Action::None); // clicks on the panel don't cancel
+
+    let close_rect = Rect { x: panel.x + panel.width.saturating_sub(3), y: panel.y, width: 1, height: 1 };
+    f.render_widget(Paragraph::new(Span::styled("×", Style::default().fg(theme::fg_dim()))), close_rect);
+    zones.push(close_rect, Action::CloseShellOutput);
+
+    for (row, line) in app.shell_output.iter().skip(app.shell_scroll).take(inner.height as usize).enumerate() {
+        let y = inner.y + row as u16;
+        f.render_widget(
+            Paragraph::new(Span::styled(line.as_str(), Style::default().fg(theme::fg())))
+                .style(Style::default().bg(theme::bg_dark())),
+            Rect { x: inner.x, y, width: inner.width, height: 1 },
         );
     }
 }

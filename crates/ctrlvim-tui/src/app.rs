@@ -12,8 +12,8 @@
 //! buffer, the frontend keeps per-tab text: switching buffers snapshots the
 //! outgoing file's text and loads the incoming one (see [`App::set_active`]).
 //!
-//! The dashboard's recent-files/git/plugin/LSP data is still static mock data
-//! until the engine grows sources for it.
+//! The dashboard's recent-files/git/plugin/LSP data is drawn from the real
+//! project ([`crate::data::Project::load`]), not mock data.
 
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -214,6 +214,8 @@ pub enum Action {
     OpenPlugins,
     OpenDashboard,
     ToggleLsp(usize),
+    /// Install the tool at this row in `project.lsp` (see `App::install_tool`).
+    InstallTool(usize),
     ToggleMouse,
     CycleIconMode,
     /// Select (and jump to) a quickfix entry by list index.
@@ -240,6 +242,9 @@ pub enum Action {
     /// Run an Ex command through the engine (e.g. `"w"`, `"q!"`). Carries the
     /// command text without the leading colon.
     RunEx(String),
+    /// Run a plugin-registered command by name
+    /// (`vim.api.ctrlvim_create_user_command`).
+    RunPluginCommand(String),
     /// Switch to the theme at this index in [`theme::ALL`](crate::theme::ALL).
     SetTheme(usize),
     /// Start a new file: opens the file browser where a typed name is created.
@@ -248,6 +253,8 @@ pub enum Action {
     ToggleStartupDrawer,
     /// Dismiss the save-as prompt without saving.
     CloseSavePrompt,
+    /// Dismiss the `:!{cmd}` output overlay.
+    CloseShellOutput,
 }
 
 pub struct App {
@@ -317,6 +324,20 @@ pub struct App {
     timers: Option<TimerService>,
     /// The job currently filling the quickfix list, if any.
     job: Option<RunningJob>,
+    /// The `:!{cmd}` job currently filling [`App::shell_output`], if any.
+    shell_job: Option<RunningShell>,
+    /// The tool install currently running through `shell_job`, if any: its
+    /// name, its row index in `project.lsp`, and the job id — so completion
+    /// is attributed to the right job even if a `:!{cmd}` interleaves.
+    installing_tool: Option<(String, usize, u64)>,
+    /// Whether the `:!{cmd}` output overlay is showing.
+    pub shell_open: bool,
+    /// Overlay title: the command line plus its exit code once it's back.
+    pub shell_title: String,
+    /// Output lines of the last `:!{cmd}`, shown in the overlay.
+    pub shell_output: Vec<String>,
+    /// Scroll offset (in lines) into `shell_output`.
+    pub shell_scroll: usize,
     /// Modified time of the tags file when it was last loaded, so a
     /// regenerated one is picked up without a reload command.
     tags_loaded_at: Option<std::time::SystemTime>,
@@ -342,6 +363,14 @@ struct RunningJob {
     items: Vec<QfItem>,
 }
 
+/// A `:!{cmd}` in flight: raw output lines, with no quickfix parsing.
+struct RunningShell {
+    id: u64,
+    command: String,
+    lines: LineBuffer,
+    output: Vec<String>,
+}
+
 /// Cached highlight spans plus the buffer state they were computed from.
 struct SyntaxCache {
     /// Active buffer, a hash of its text, and the visible window (`top`,
@@ -349,6 +378,19 @@ struct SyntaxCache {
     key: (usize, u64, usize, usize),
     /// Spans per visible row, indexed from the window's first line.
     lines: Vec<Vec<HlSpan>>,
+}
+
+/// Delete the previous word from the end of `s`: trailing whitespace, then
+/// back to (and keeping) the whitespace before it, or to the start if there
+/// is none. Shared by every single-line frontend field's Option+Backspace /
+/// Ctrl+Backspace handling — see [`crate::input`].
+pub(crate) fn delete_word_backward(s: &mut String) {
+    let trimmed_len = s.trim_end().len();
+    s.truncate(trimmed_len);
+    match s.char_indices().rev().find(|(_, c)| c.is_whitespace()) {
+        Some((idx, ch)) => s.truncate(idx + ch.len_utf8()),
+        None => s.clear(),
+    }
 }
 
 impl App {
@@ -368,8 +410,10 @@ impl App {
             crate::theme::set_by_name(&name);
         }
         let config = Config::load();
+        let mut engine = Ctrlvim::new();
+        let startup_message = load_startup_plugins(&mut engine, &config.plugins);
         App {
-            engine: Ctrlvim::new(),
+            engine,
             project,
             root,
             buffers: vec![Buffer::dashboard()],
@@ -387,7 +431,7 @@ impl App {
             palette_index: 0,
             save_prompt: None,
             leader_pending: false,
-            message: String::new(),
+            message: startup_message,
             expand_git: false,
             lsp_enabled,
             settings_index: 0,
@@ -400,6 +444,12 @@ impl App {
             jobs: None,
             timers: None,
             job: None,
+            shell_job: None,
+            installing_tool: None,
+            shell_open: false,
+            shell_title: String::new(),
+            shell_output: Vec::new(),
+            shell_scroll: 0,
             tags_loaded_at: None,
             view_top: 0,
             viewport_rows: std::cell::Cell::new(24),
@@ -479,6 +529,7 @@ impl App {
             Action::OpenPlugins => self.open_plugins(),
             Action::OpenDashboard => self.open_dashboard(),
             Action::ToggleLsp(i) => self.toggle_lsp(i),
+            Action::InstallTool(i) => self.install_tool(i),
             Action::ToggleMouse => self.toggle_mouse(),
             Action::CycleIconMode => self.cycle_icon_mode(),
             Action::QuickfixSelect(i) => self.quickfix_select(i),
@@ -533,10 +584,12 @@ impl App {
             Action::CloseHelp => self.help_open = false,
             Action::ToggleMarkdown => self.toggle_md_render(),
             Action::RunEx(cmd) => self.run_ex_command(&cmd),
+            Action::RunPluginCommand(name) => self.run_plugin_command(&name),
             Action::SetTheme(i) => self.set_theme(i),
             Action::NewFile => self.new_untitled(),
             Action::ToggleStartupDrawer => self.toggle_startup_drawer(),
             Action::CloseSavePrompt => self.close_save_prompt(),
+            Action::CloseShellOutput => self.shell_open = false,
         }
     }
 
@@ -575,6 +628,18 @@ impl App {
     pub fn save_prompt_backspace(&mut self) {
         if let Some(name) = &mut self.save_prompt {
             name.pop();
+        }
+    }
+
+    pub fn save_prompt_word_backspace(&mut self) {
+        if let Some(name) = &mut self.save_prompt {
+            delete_word_backward(name);
+        }
+    }
+
+    pub fn save_prompt_clear_to_start(&mut self) {
+        if let Some(name) = &mut self.save_prompt {
+            name.clear();
         }
     }
 
@@ -650,6 +715,17 @@ impl App {
         self.feed_engine(Key::Enter);
     }
 
+    /// Run a plugin-registered command by name (selecting it from the
+    /// palette) — the frontend counterpart to [`run_ex_command`](Self::run_ex_command)
+    /// for commands a Lua plugin registered with `ctrlvim_create_user_command`.
+    pub fn run_plugin_command(&mut self, name: &str) {
+        match self.engine.run_plugin_command(name) {
+            Ok(true) => {}
+            Ok(false) => self.message = format!("E492: not a plugin command: {name}"),
+            Err(e) => self.message = e,
+        }
+    }
+
     pub fn cycle_section(&mut self, dir: i32) {
         let order = [
             DashboardSection::Workspace,
@@ -715,6 +791,49 @@ impl App {
             *slot = !*slot;
             self.settings_index = i + Self::SETTINGS_EDITOR_OPTIONS;
         }
+    }
+
+    /// Install whichever Settings row is focused (`I`), if it's a tool row
+    /// with a known install method.
+    pub fn install_focused_tool(&mut self) {
+        if let Some(i) = self.settings_index.checked_sub(Self::SETTINGS_EDITOR_OPTIONS) {
+            self.install_tool(i);
+        }
+    }
+
+    /// Install the tool at row `i` of `project.lsp` by shelling out to its
+    /// registry install command (`cargo install`, `npm install`, …), reusing
+    /// the same `:!{cmd}` job machinery as [`App::host_run_shell`] — the
+    /// output overlay doubles as the install log.
+    pub fn install_tool(&mut self, i: usize) {
+        let Some(lsp) = self.project.lsp.get(i) else { return };
+        if lsp.installed {
+            self.message = format!("{}: already installed", lsp.name);
+            return;
+        }
+        if self.installing_tool.is_some() {
+            self.message = "an install is already running".into();
+            return;
+        }
+        let Some(tool) = ctrlvim_tools::REGISTRY.iter().find(|t| t.name == lsp.name) else {
+            self.message = format!("{}: no install method available", lsp.name);
+            return;
+        };
+        let Some(command) = ctrlvim_tools::install_command(tool) else {
+            self.message = format!("{}: no install method available", lsp.name);
+            return;
+        };
+        if let Some(dir) = ctrlvim_tools::install_dir(tool.name) {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                self.message = format!("{}: could not create {}: {e}", lsp.name, dir.display());
+                return;
+            }
+        }
+        let name = tool.name.to_string();
+        self.host_run_shell(command);
+        let Some(id) = self.shell_job.as_ref().map(|j| j.id) else { return };
+        self.installing_tool = Some((name.clone(), i, id));
+        self.message = format!("installing {name}…");
     }
 
     /// Toggle mouse support, persisting it to the config.
@@ -926,6 +1045,7 @@ impl App {
                 ExEffect::Quickfix(cmd) => self.host_quickfix(cmd),
                 ExEffect::Tag(cmd) => self.host_tag(cmd),
                 ExEffect::OpenReplace { pattern } => self.open_replace(pattern),
+                ExEffect::Shell(command) => self.host_run_shell(command),
             }
         }
     }
@@ -1083,6 +1203,64 @@ impl App {
         });
     }
 
+    /// `:!{cmd}` — run a raw command line through the configured shell
+    /// ([`Config::shell`]) and collect its output for the overlay (see
+    /// [`App::poll_jobs`]).
+    fn host_run_shell(&mut self, command: String) {
+        let root = self.root.clone();
+        let shell = self.config.shell.clone();
+        let jobs = match self.jobs_mut() {
+            Some(jobs) => jobs,
+            None => {
+                self.message = "E902: could not start the job runtime".into();
+                return;
+            }
+        };
+        let id = jobs.spawn_shell(&shell, &command, &root);
+        self.message = format!(":!{command} — running…");
+        self.shell_job = Some(RunningShell { id, command, lines: LineBuffer::new(), output: Vec::new() });
+    }
+
+    /// Install a finished `:!{cmd}` job's output and open the overlay.
+    fn finish_shell(&mut self, job: RunningShell, code: i64) {
+        self.shell_title = format!(":!{} (exit {code})", job.command);
+        self.shell_output = if job.output.is_empty() {
+            vec!["(no output)".to_string()]
+        } else {
+            job.output.iter().map(|l| sanitize_for_display(l)).collect()
+        };
+        self.shell_scroll = 0;
+        self.shell_open = true;
+        self.message = format!("{}: exit {code}", job.command);
+
+        if let Some((name, index, id)) = self.installing_tool.take() {
+            if id != job.id {
+                // A `:!{cmd}` finished first; the install is still running.
+                self.installing_tool = Some((name, index, id));
+                return;
+            }
+            self.shell_title = format!("install {name} (exit {code})");
+            if let Some(lsp) = self.project.lsp.get_mut(index).filter(|l| l.name == name) {
+                if let Some(tool) = ctrlvim_tools::REGISTRY.iter().find(|t| t.name == name) {
+                    let (installed, managed) = ctrlvim_tools::installed_and_managed(tool);
+                    lsp.installed = installed;
+                    lsp.managed = managed;
+                }
+            }
+            self.message = if code == 0 {
+                format!("{name}: installed")
+            } else {
+                format!("{name}: install failed (exit {code}) — see the output overlay")
+            };
+        }
+    }
+
+    /// Scroll the `:!{cmd}` output overlay by `dir` lines (`j`/`k`, wheel).
+    pub fn scroll_shell_output(&mut self, dir: i32) {
+        let max = self.shell_output.len().saturating_sub(1) as i32;
+        self.shell_scroll = (self.shell_scroll as i32 + dir).clamp(0, max) as usize;
+    }
+
     /// The job runtime, created on first use so a session that never runs a
     /// job never pays for a tokio runtime.
     fn jobs_mut(&mut self) -> Option<&mut Jobs> {
@@ -1104,24 +1282,39 @@ impl App {
             return false;
         }
         let mut finished = None;
+        let mut shell_finished = None;
         for event in events {
             match event {
                 Event::ProcessOutput { id, data } => {
-                    let Some(job) = self.job.as_mut().filter(|j| j.id == id) else { continue };
-                    for line in job.lines.push(&data) {
-                        if let Some(item) = job.parser.push(&line) {
-                            job.items.push(item);
+                    if let Some(job) = self.job.as_mut().filter(|j| j.id == id) {
+                        for line in job.lines.push(&data) {
+                            if let Some(item) = job.parser.push(&line) {
+                                job.items.push(item);
+                            }
                         }
+                        continue;
+                    }
+                    if let Some(job) = self.shell_job.as_mut().filter(|j| j.id == id) {
+                        let lines = job.lines.push(&data);
+                        job.output.extend(lines);
                     }
                 }
                 Event::ProcessExit { id, code } => {
-                    let Some(job) = self.job.as_mut().filter(|j| j.id == id) else { continue };
-                    if let Some(last) = job.lines.flush() {
-                        if let Some(item) = job.parser.push(&last) {
-                            job.items.push(item);
+                    if let Some(job) = self.job.as_mut().filter(|j| j.id == id) {
+                        if let Some(last) = job.lines.flush() {
+                            if let Some(item) = job.parser.push(&last) {
+                                job.items.push(item);
+                            }
                         }
+                        finished = self.job.take().map(|j| (j, code));
+                        continue;
                     }
-                    finished = self.job.take().map(|j| (j, code));
+                    if let Some(job) = self.shell_job.as_mut().filter(|j| j.id == id) {
+                        if let Some(last) = job.lines.flush() {
+                            job.output.push(last);
+                        }
+                        shell_finished = self.shell_job.take().map(|j| (j, code));
+                    }
                 }
                 // Timers/RPC are not wired into the frontend yet.
                 _ => {}
@@ -1130,6 +1323,9 @@ impl App {
         if let Some((job, code)) = finished {
             let title = format!("{} (exit {code})", job.title);
             self.finish_quickfix(job.items, title);
+        }
+        if let Some((job, code)) = shell_finished {
+            self.finish_shell(job, code);
         }
         true
     }
@@ -1494,6 +1690,14 @@ impl App {
     /// The command palette is the unified command line: it lists **commands**
     /// (never files — file finding is the finder / the `Find File` entry) and
     /// fuzzy-filters them against the typed query. It opens with `:`.
+    ///
+    /// Every recognized Ex command shows up here (see `ctrlvim_core::ex_commands`,
+    /// itself the single source of truth `is_ex_command` also reads from), plus
+    /// anything defined at runtime: `:command`-defined user commands and
+    /// Lua-registered plugin commands (`ctrlvim_create_user_command`) — a
+    /// command can't be runnable without also being listed, the same way a
+    /// VS Code extension's commands all land in one palette regardless of
+    /// where they came from.
     pub fn palette_results(&self) -> Vec<PaletteItem> {
         let q = &self.palette_query;
         let mut items: Vec<PaletteItem> = Vec::new();
@@ -1503,10 +1707,50 @@ impl App {
         for cmd in ctrlvim_core::ex_commands() {
             items.push(PaletteItem {
                 label: format!(":{}", cmd.name),
-                hint: cmd.desc,
+                hint: cmd.desc.to_string(),
                 icon_color: crate::theme::green(),
                 icon_letter: ':',
                 action: Action::RunEx(cmd.name.to_string()),
+            });
+        }
+
+        // User-defined commands (`:command Name expansion`) — running one
+        // goes back through the same `:name` path as a built-in, since
+        // `Session::execute_ex` checks user commands before its own table.
+        let mut user_cmds: Vec<(String, String)> =
+            self.engine.session.user_commands().map(|(name, repl)| (name.to_string(), repl.to_string())).collect();
+        user_cmds.sort();
+        for (name, repl) in user_cmds {
+            items.push(PaletteItem {
+                label: format!(":{name}"),
+                hint: format!("user command → {repl}"),
+                icon_color: crate::theme::red(),
+                icon_letter: 'U',
+                action: Action::RunEx(name),
+            });
+        }
+
+        // Plugin-registered commands (`vim.api.ctrlvim_create_user_command`) —
+        // a Lua plugin's commands get the same palette visibility as the
+        // engine's own, closing the gap a plugin manager would otherwise need.
+        let mut plugin_cmds = self.engine.plugin_commands();
+        plugin_cmds.sort();
+        for (name, desc, source) in plugin_cmds {
+            let hint = match (desc.is_empty(), &source) {
+                (false, Some(src)) => format!("{desc} — {src}"),
+                (false, None) => desc,
+                (true, Some(src)) => format!("plugin command — {src}"),
+                (true, None) => "plugin command".to_string(),
+            };
+            items.push(PaletteItem {
+                label: format!(":{name}"),
+                hint,
+                icon_color: crate::theme::orange(),
+                // 'L' (Lua) rather than 'P' -- the "Plugin Manager" action
+                // below is a distinct entry and shouldn't share a letter with
+                // an individual plugin-registered command.
+                icon_letter: 'L',
+                action: Action::RunPluginCommand(name),
             });
         }
 
@@ -1517,19 +1761,19 @@ impl App {
             } else {
                 ("Markdown: Live Render".to_string(), 'M')
             };
-            items.push(PaletteItem { label, hint: "toggle markdown render", icon_color: crate::theme::purple(), icon_letter: letter, action: Action::ToggleMarkdown });
+            items.push(PaletteItem { label, hint: "toggle markdown render".to_string(), icon_color: crate::theme::purple(), icon_letter: letter, action: Action::ToggleMarkdown });
         }
-        items.push(PaletteItem { label: "Find File".into(), hint: "fuzzy file browser", icon_color: crate::theme::blue(), icon_letter: 'F', action: Action::OpenFinder });
-        items.push(PaletteItem { label: "Plugin Manager".into(), hint: "manage plugins", icon_color: crate::theme::orange(), icon_letter: 'P', action: Action::OpenPlugins });
+        items.push(PaletteItem { label: "Find File".into(), hint: "fuzzy file browser".to_string(), icon_color: crate::theme::blue(), icon_letter: 'F', action: Action::OpenFinder });
+        items.push(PaletteItem { label: "Plugin Manager".into(), hint: "manage plugins".to_string(), icon_color: crate::theme::orange(), icon_letter: 'P', action: Action::OpenPlugins });
         if self.config.drawer {
-            items.push(PaletteItem { label: "Toggle Sidebar".into(), hint: "file drawer", icon_color: crate::theme::cyan(), icon_letter: 'S', action: Action::ToggleSidebar });
+            items.push(PaletteItem { label: "Toggle Sidebar".into(), hint: "file drawer".to_string(), icon_color: crate::theme::cyan(), icon_letter: 'S', action: Action::ToggleSidebar });
         }
 
         // Theme switching (one entry per registered theme).
         for (i, t) in crate::theme::ALL.iter().enumerate() {
             items.push(PaletteItem {
                 label: format!("Theme: {}", t.name),
-                hint: "color theme",
+                hint: "color theme".to_string(),
                 icon_color: crate::theme::purple(),
                 icon_letter: 'T',
                 action: Action::SetTheme(i),
@@ -1562,6 +1806,16 @@ impl App {
         self.palette_index = 0;
     }
 
+    pub fn palette_word_backspace(&mut self) {
+        delete_word_backward(&mut self.palette_query);
+        self.palette_index = 0;
+    }
+
+    pub fn palette_clear_to_start(&mut self) {
+        self.palette_query.clear();
+        self.palette_index = 0;
+    }
+
     fn run_palette(&mut self, idx: usize) {
         let results = self.palette_results();
         if let Some(item) = results.get(idx) {
@@ -1577,13 +1831,34 @@ impl App {
         self.palette_index = 0;
     }
 
-    /// Confirm the command line (`Enter`). Command-line semantics take priority
-    /// over the fuzzy list: an **exactly** typed command name runs verbatim
-    /// (typing `q` runs `:q`, never the `:wq` that fuzzy-matching would rank
-    /// first). Otherwise the highlighted item runs; and if nothing matched, the
-    /// raw text runs as a freeform Ex command (`:42`, `:$`, unknown → E492).
+    /// Confirm the command line (`Enter`).
+    ///
+    /// A bare command word (letters only — no range, bang, or args) whose
+    /// *highlighted* suggestion actually names that command runs whatever's
+    /// on screen: what you see focused is what Enter does, so `:cl` picking
+    /// `:close` out of the list executes `close`, not some other command
+    /// that happens to share the `cl` abbreviation (`:clist`). If the
+    /// highlighted row is only a loose/incidental fuzzy hit (matched via its
+    /// description, not its name), it isn't trusted as "the" selection.
+    ///
+    /// Otherwise a recognized Ex command (ranges, `:s/../../`, `!`-args, or a
+    /// real command not offered in the palette like `:clist`/`:cc`) runs
+    /// verbatim. Failing that, the highlighted fuzzy item runs (themes, Find
+    /// File, …); with no match at all, the raw text runs as a freeform Ex
+    /// command (`:42`, `:$`, unknown → E492).
     pub fn submit_palette(&mut self) {
         let q = self.palette_query.trim().to_string();
+        let results = self.palette_results();
+        let bare_word = !q.is_empty() && q.chars().all(|c| c.is_ascii_alphabetic());
+        let highlighted_is_strong = results
+            .get(self.palette_index.min(results.len().saturating_sub(1)))
+            .is_some_and(|item| item.label.trim_start_matches(':').to_lowercase().starts_with(&q.to_lowercase()));
+
+        if bare_word && highlighted_is_strong {
+            let idx = self.palette_index.min(results.len() - 1);
+            self.run_palette(idx);
+            return;
+        }
         // A recognized Ex command (incl. ranges/`:s`/`:noh`/…) runs verbatim,
         // so short command names aren't hijacked by a fuzzy palette entry.
         if !q.is_empty() && ctrlvim_core::is_ex_command(&q) {
@@ -1592,7 +1867,6 @@ impl App {
             return;
         }
         // Otherwise pick from the fuzzy list (themes, Find File, …).
-        let results = self.palette_results();
         if !results.is_empty() {
             let idx = self.palette_index.min(results.len() - 1);
             self.run_palette(idx);
@@ -1673,6 +1947,20 @@ impl App {
     pub fn finder_backspace(&mut self) {
         if let Some(f) = &mut self.finder {
             f.query.pop();
+            f.selected = 0;
+        }
+    }
+
+    pub fn finder_word_backspace(&mut self) {
+        if let Some(f) = &mut self.finder {
+            delete_word_backward(&mut f.query);
+            f.selected = 0;
+        }
+    }
+
+    pub fn finder_clear_to_start(&mut self) {
+        if let Some(f) = &mut self.finder {
+            f.query.clear();
             f.selected = 0;
         }
     }
@@ -1878,6 +2166,28 @@ impl App {
         }
     }
 
+    /// Delete the previous word (Option+Backspace / Ctrl+Backspace); same
+    /// split as [`replace_type`](Self::replace_type).
+    pub fn replace_word_backspace(&mut self) {
+        let Some(p) = &mut self.replace else { return };
+        if p.word_backspace() {
+            self.replace_search();
+        } else {
+            p.refresh_previews();
+        }
+    }
+
+    /// Clear the focused field back to its start (Cmd+Backspace); same split
+    /// as [`replace_type`](Self::replace_type).
+    pub fn replace_clear_to_start(&mut self) {
+        let Some(p) = &mut self.replace else { return };
+        if p.clear_to_start() {
+            self.replace_search();
+        } else {
+            p.refresh_previews();
+        }
+    }
+
     /// `<Tab>` — move focus Find → Replace → Results → Find.
     pub fn replace_cycle(&mut self) {
         if let Some(p) = &mut self.replace {
@@ -2072,6 +2382,16 @@ impl App {
         self.clamp_file_index_to_drawer();
     }
 
+    pub fn drawer_word_backspace(&mut self) {
+        delete_word_backward(&mut self.drawer_query);
+        self.clamp_file_index_to_drawer();
+    }
+
+    pub fn drawer_clear_to_start(&mut self) {
+        self.drawer_query.clear();
+        self.clamp_file_index_to_drawer();
+    }
+
     /// Move the selection within the drawer's filtered results.
     pub fn drawer_move(&mut self, dir: i32) {
         let matches = self.drawer_matches();
@@ -2103,6 +2423,80 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
 }
 
+/// Strip a line of raw process output down to plain printable text before it
+/// reaches a `Span`: drop ANSI escape sequences (some tools colorize even off
+/// a tty), expand tabs to 8-column stops, and drop other C0 control bytes.
+///
+/// ratatui measures a `Span`'s width in *characters*, then the backend writes
+/// its bytes as one contiguous run and moves on. An embedded raw `\t` or ESC
+/// byte breaks that assumption differently per terminal — Ghostty (confirmed;
+/// likely also Kitty/WezTerm/xterm, which follow the same control-sequence
+/// handling) advances the real cursor by its own tab-stop/escape rules rather
+/// than treating it as a printable cell, so the actual cursor position drifts
+/// from what ratatui's diff believes it is. Once that drifts, every later
+/// write in the frame lands at the wrong column — which is why unrelated
+/// panels elsewhere on screen can end up smeared. Sanitizing here removes the
+/// byte sequences no terminal agrees on the meaning of, rather than special-
+/// casing any particular emulator.
+fn sanitize_for_display(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut col = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => {
+                // CSI (`ESC [ params... final`) or a bare two-byte escape —
+                // either way, swallow through the final byte and move on.
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            '\t' => {
+                let next = (col / 8 + 1) * 8;
+                out.extend(std::iter::repeat(' ').take(next - col));
+                col = next;
+            }
+            c if (c as u32) < 0x20 => {} // other control bytes: drop
+            c => {
+                out.push(c);
+                col += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Run each `config.toml`-declared plugin once at startup, in order, over the
+/// same Lua path as `:luafile` (see `host_source`). A broken script doesn't
+/// stop the rest from loading; the first failure becomes the startup status
+/// message (empty if everything loaded cleanly).
+fn load_startup_plugins(engine: &mut Ctrlvim, plugins: &[PathBuf]) -> String {
+    let mut message = String::new();
+    for path in plugins {
+        // The file stem (e.g. "hello" from "hello.lua") tags any commands
+        // the script registers, so the palette can attribute them to it.
+        let source = path.file_stem().and_then(|s| s.to_str());
+        let result = std::fs::read_to_string(path)
+            .map_err(|e| format!("E484: Can't open file {}: {e}", path.display()))
+            .and_then(|contents| {
+                engine.run_lua_as(source, &contents).map_err(|e| format!("E5108: {} ({})", first_line(&e), path.display()))
+            });
+        if let Err(e) = result {
+            if message.is_empty() {
+                message = e;
+            }
+        }
+    }
+    message
+}
+
 /// Case-insensitive subsequence match: every char of `query` appears in
 /// `text`, in order. An empty query matches everything.
 pub fn fuzzy_match(query: &str, text: &str) -> bool {
@@ -2120,8 +2514,106 @@ pub fn fuzzy_match(query: &str, text: &str) -> bool {
 
 pub struct PaletteItem {
     pub label: String,
-    pub hint: &'static str,
+    pub hint: String,
     pub icon_color: ratatui::style::Color,
     pub icon_letter: char,
     pub action: Action,
+}
+
+#[cfg(test)]
+mod delete_word_backward_tests {
+    use super::delete_word_backward;
+
+    #[test]
+    fn deletes_the_trailing_word_and_keeps_the_separator() {
+        let mut s = String::from("hello world");
+        delete_word_backward(&mut s);
+        assert_eq!(s, "hello ");
+    }
+
+    #[test]
+    fn eats_trailing_whitespace_before_the_word() {
+        let mut s = String::from("hello world   ");
+        delete_word_backward(&mut s);
+        assert_eq!(s, "hello ");
+    }
+
+    #[test]
+    fn a_single_word_is_cleared_entirely() {
+        let mut s = String::from("hello");
+        delete_word_backward(&mut s);
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn an_empty_string_is_a_no_op() {
+        let mut s = String::new();
+        delete_word_backward(&mut s);
+        assert_eq!(s, "");
+    }
+}
+
+#[cfg(test)]
+mod sanitize_for_display_tests {
+    use super::sanitize_for_display;
+
+    #[test]
+    fn expands_tabs_to_8_column_stops() {
+        // Real `git status` output for a modified file, tab-indented.
+        assert_eq!(sanitize_for_display("\tmodified:   job.rs"), "        modified:   job.rs");
+        // A tab after some text lands on the next stop, not a fixed offset.
+        assert_eq!(sanitize_for_display("ab\tc"), "ab      c");
+    }
+
+    #[test]
+    fn strips_ansi_escape_sequences() {
+        assert_eq!(sanitize_for_display("\x1b[31mred\x1b[0m text"), "red text");
+    }
+
+    #[test]
+    fn drops_other_control_bytes_but_keeps_printable_unicode() {
+        assert_eq!(sanitize_for_display("a\x07b\r"), "ab");
+        assert_eq!(sanitize_for_display("héllo → 🎉"), "héllo → 🎉");
+    }
+}
+
+#[cfg(test)]
+mod startup_plugin_tests {
+    use super::*;
+
+    /// The repo's config.toml-plugin example, loaded the same way `App::with_root`
+    /// loads `config.plugins` at startup.
+    fn example_plugin_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/hello.lua")
+    }
+
+    #[test]
+    fn loads_and_runs_a_declared_plugin() {
+        let mut engine = Ctrlvim::new();
+        let path = example_plugin_path();
+        assert!(path.is_file(), "missing example plugin at {}", path.display());
+
+        let message = load_startup_plugins(&mut engine, std::slice::from_ref(&path));
+        assert!(message.is_empty(), "unexpected startup error: {message}");
+
+        // The plugin's global should now be callable, proving the file actually ran.
+        engine.open("first line", Some("scratch"));
+        engine.run_lua("Hello.greet()").unwrap();
+        assert_eq!(engine.lines(), vec!["Hello from ctrlvim!"]);
+    }
+
+    #[test]
+    fn a_missing_plugin_reports_the_first_failure_but_does_not_stop_the_rest() {
+        let mut engine = Ctrlvim::new();
+        let missing = PathBuf::from("/nonexistent/ctrlvim-plugin-does-not-exist.lua");
+        let good = example_plugin_path();
+
+        let message = load_startup_plugins(&mut engine, &[missing, good]);
+        assert!(message.starts_with("E484"), "message: {message}");
+
+        // The second, valid plugin still loaded despite the first one failing.
+        engine.open("x", Some("scratch"));
+        engine.run_lua("Hello.greet()").unwrap();
+        assert_eq!(engine.lines(), vec!["Hello from ctrlvim!"]);
+    }
 }

@@ -94,6 +94,9 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     if app.save_prompt.is_some() {
         overlays::save_prompt(f, app, area, &mut zones);
     }
+    if app.shell_open {
+        overlays::shell_output(f, app, area, &mut zones);
+    }
 
     zones
 }
@@ -177,10 +180,16 @@ pub fn titled_panel_with_right(
 }
 
 /// The colored two-letter file icon chip (` R `), bg = file color.
+///
+/// The letter is always drawn in black: the chip's `bg(color)` is always an
+/// opaque, bright accent, so black gives reliable contrast regardless of
+/// theme — unlike `theme::bg_dark()`, which is `Color::Reset` under the
+/// Terminal theme and renders as the terminal's (often light) default
+/// foreground instead of a dark one.
 pub fn icon_chip(letter: char, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {letter} "),
-        Style::default().fg(theme::bg_dark()).bg(color),
+        Style::default().fg(Color::Black).bg(color),
     )
 }
 

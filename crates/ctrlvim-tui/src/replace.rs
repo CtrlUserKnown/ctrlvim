@@ -117,6 +117,27 @@ impl ReplacePanel {
         refind
     }
 
+    /// Delete the previous word in the focused field (Option+Backspace on
+    /// macOS, Ctrl+Backspace on Linux); same return meaning as
+    /// [`type_char`](Self::type_char).
+    pub fn word_backspace(&mut self) -> bool {
+        let refind = self.focus == Field::Find;
+        if let Some(field) = self.active_input() {
+            crate::app::delete_word_backward(field);
+        }
+        refind
+    }
+
+    /// Clear the focused field back to its start (Cmd+Backspace on macOS);
+    /// same return meaning as [`type_char`](Self::type_char).
+    pub fn clear_to_start(&mut self) -> bool {
+        let refind = self.focus == Field::Find;
+        if let Some(field) = self.active_input() {
+            field.clear();
+        }
+        refind
+    }
+
     /// Move the results selection by `dir`, saturating at both ends so held
     /// `j` doesn't wrap past the list.
     pub fn move_selection(&mut self, dir: i32) {
@@ -258,6 +279,25 @@ mod tests {
         p.focus = Field::Results;
         assert!(!p.backspace());
         assert_eq!(p.find, "fo", "the results list swallows backspace");
+    }
+
+    #[test]
+    fn word_backspace_deletes_the_last_word_of_the_focused_field() {
+        let mut p = ReplacePanel::new(Some("hello world".into()));
+        assert!(p.word_backspace());
+        assert_eq!(p.find, "hello ");
+        p.focus = Field::Results;
+        assert!(!p.word_backspace());
+        assert_eq!(p.find, "hello ", "the results list swallows it");
+    }
+
+    #[test]
+    fn clear_to_start_empties_the_focused_field() {
+        let mut p = ReplacePanel::new(Some("hello world".into()));
+        p.focus = Field::Replace;
+        p.type_char('x');
+        assert!(!p.clear_to_start(), "editing Replace doesn't re-search");
+        assert_eq!((p.find.as_str(), p.replace.as_str()), ("hello world", ""));
     }
 
     #[test]

@@ -86,6 +86,41 @@ impl Host {
         }
     }
 
+    /// List plugin-registered commands (`vim.api.ctrlvim_create_user_command`):
+    /// name, description, and source script (if any), for the frontend's
+    /// command palette to display and attribute to a plugin.
+    pub fn user_commands(&self) -> Vec<(String, String, Option<String>)> {
+        self.ctx
+            .borrow()
+            .user_commands
+            .iter()
+            .map(|(name, (_, desc, source))| (name.clone(), desc.clone(), source.clone()))
+            .collect()
+    }
+
+    /// Invoke a plugin-registered command by name (selecting it from the
+    /// palette) — the same `LuaRef` invocation mechanism as keymaps/autocmds.
+    /// Returns whether a command with that name was found.
+    pub fn run_user_command(&self, name: &str) -> mlua::Result<bool> {
+        let luaref = self.ctx.borrow().user_commands.get(name).map(|(r, _, _)| r.0);
+        match luaref {
+            Some(id) => {
+                if let Some(func) = self.store.get(&self.lua, id)? {
+                    let _: () = func.call(())?;
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Set (or clear) the script currently being sourced, so
+    /// `ctrlvim_create_user_command` calls made while it runs are tagged with
+    /// this source (see [`ApiContext::current_source`]).
+    pub fn set_current_source(&self, source: Option<String>) {
+        self.ctx.borrow_mut().current_source = source;
+    }
+
     /// Build the global `vim` table with `api` and `uv` sub-tables.
     fn install(&self) -> mlua::Result<()> {
         let vim = self.lua.create_table()?;
@@ -578,6 +613,41 @@ mod tests {
         assert_eq!(host.eval_string("tostring(_G.pressed)").unwrap(), "0");
         assert!(host.trigger_keymap("n", "<leader>x").unwrap());
         assert_eq!(host.eval_string("tostring(_G.pressed)").unwrap(), "1");
+    }
+
+    #[test]
+    fn plugin_registered_command_is_listed_and_runnable() {
+        let host = host_with("x");
+        host.exec(
+            r#"
+            _G.ran = 0
+            vim.api.ctrlvim_create_user_command('Greet', function()
+                _G.ran = _G.ran + 1
+            end, { desc = 'say hello' })
+            "#,
+        )
+        .unwrap();
+        assert_eq!(host.user_commands(), vec![("Greet".to_string(), "say hello".to_string(), None)]);
+        assert!(host.run_user_command("Greet").unwrap());
+        assert_eq!(host.eval_string("tostring(_G.ran)").unwrap(), "1");
+        assert!(!host.run_user_command("NoSuchCommand").unwrap());
+    }
+
+    #[test]
+    fn plugin_registered_command_is_tagged_with_its_source() {
+        let host = host_with("x");
+        host.set_current_source(Some("my-plugin".to_string()));
+        host.exec(
+            r#"
+            vim.api.ctrlvim_create_user_command('Greet', function() end, {})
+            "#,
+        )
+        .unwrap();
+        host.set_current_source(None);
+        assert_eq!(
+            host.user_commands(),
+            vec![("Greet".to_string(), String::new(), Some("my-plugin".to_string()))]
+        );
     }
 
     /// M8 — a representative "unmodified-style" plugin that leans on api + fn +

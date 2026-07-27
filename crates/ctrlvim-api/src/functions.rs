@@ -105,6 +105,32 @@ fn ctrlvim_create_autocmd(cx: &mut ApiContext, event: String, opts: Object) -> R
     Ok(Object::Integer(id as i64))
 }
 
+/// `ctrlvim_create_user_command` — register a Lua-backed command under `name`,
+/// the plugin equivalent of Vimscript's `:command`. `opts` is a dict with an
+/// optional `desc` (string) shown in the command palette. Unlike
+/// `nvim_create_user_command`, `name` is looked up case-sensitively and takes
+/// no arguments yet — this is the palette-visibility half of the feature; a
+/// full `<args>`/`<f-args>`/range surface is future work.
+#[ctrlvim_api(since = 1)]
+fn ctrlvim_create_user_command(cx: &mut ApiContext, name: String, callback: Object, opts: Object) -> Result<Object> {
+    let callback = match callback {
+        Object::LuaRef(r) => r,
+        other => {
+            return Err(Error::validation(format!(
+                "ctrlvim_create_user_command: callback must be a function, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    let desc = match &opts {
+        Object::Dict(d) => d.get("desc").and_then(|o| o.as_str()).unwrap_or("").to_string(),
+        _ => String::new(),
+    };
+    let source = cx.current_source.clone();
+    cx.user_commands.insert(name, (callback, desc, source));
+    Ok(Object::Nil)
+}
+
 /// `ctrlvim_del_autocmd` — remove an autocmd by id.
 #[ctrlvim_api(since = 1)]
 fn ctrlvim_del_autocmd(cx: &mut ApiContext, id: i64) -> Result<Object> {

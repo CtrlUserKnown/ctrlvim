@@ -47,6 +47,15 @@ cargo run -p ctrlvim-tui --example snapshot -- grid   # print a text snapshot of
   glyph per filetype, or the lettered chip when no Nerd Font is installed.
   `icons = "auto" | "nerd" | "text"` in `config.toml` (or the Settings row /
   `i`) overrides the detection; `CTRLVIM_NERD_FONT=1|0` forces it for `auto`.
+- **Startup plugins**: `plugin = "path/to/file.lua"` lines in `config.toml`
+  (one per plugin, repeated for more than one) run once at startup, in order,
+  over the same Lua path as `:luafile` — see `examples/plugins/hello.lua`.
+- **Shell**: `shell = "fish"` in `config.toml` picks the shell external
+  commands run through (`ctrlvim_async::Jobs::spawn_shell`); defaults to `zsh`
+  on macOS and `bash` everywhere else. `:!{cmd}` runs a command line through it
+  and shows the output in a scrollable overlay (`j`/`k` to scroll, `Esc`/`q` to
+  close) once the process exits; filtering a range through a command
+  (`:%!sort`) isn't implemented yet.
 
 ## Keymap
 

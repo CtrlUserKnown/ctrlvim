@@ -230,6 +230,24 @@ fn plugin_manager_screen() {
     contains_all(&out, &["Plugin Manager", "loaded", "updates available"]);
 }
 
+#[test]
+fn plugin_manager_shows_commands_a_matching_plugin_contributed() {
+    use ctrlvim::model::{Plugin, PluginStatus};
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    // Simulate a pack-directory plugin entry ...
+    app.project.plugins.push(Plugin {
+        name: "hello".to_string(),
+        repo: "someone/hello".to_string(),
+        category: "start".to_string(),
+        status: PluginStatus::Loaded,
+    });
+    // ... whose startup script (file stem "hello") registered a command.
+    app.engine.run_lua_as(Some("hello"), "vim.api.ctrlvim_create_user_command('Greet', function() end, {})").unwrap();
+    app.dispatch(Action::OpenPlugins);
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["hello", "commands: Greet"]);
+}
+
 // --- overlays --------------------------------------------------------------
 
 #[test]
@@ -427,6 +445,48 @@ fn palette_surfaces_theme_commands() {
         .find(|it| it.label == "Theme: Gruvbox")
         .expect("fuzzy 'gruvbox' should surface the Gruvbox theme");
     assert!(matches!(entry.action, Action::SetTheme(_)), "theme entries switch the theme");
+}
+
+#[test]
+fn palette_surfaces_user_defined_commands() {
+    let mut app = temp_project(&[("f.rs", "hello\n")]);
+    app.open_file(0);
+    run_cmd(&mut app, "command Greet echo 'hi'"); // :command Name expansion
+    key(&mut app, ':');
+    typ(&mut app, "Greet");
+    let results = app.palette_results();
+    let idx = results
+        .iter()
+        .position(|it| it.label == ":Greet")
+        .expect("a :command-defined name should show up in the palette");
+    assert!(matches!(&results[idx].action, Action::RunEx(name) if name == "Greet"));
+    app.palette_index = idx;
+    press(&mut app, KeyCode::Enter);
+    assert!(app.message.contains("hi"), "selecting it should run the expansion: {}", app.message);
+}
+
+#[test]
+fn palette_surfaces_plugin_registered_commands() {
+    let mut app = temp_project(&[("f.rs", "hello\n")]);
+    app.open_file(0);
+    run_cmd(
+        &mut app,
+        "lua vim.api.ctrlvim_create_user_command('Shout', function() \
+         vim.api.ctrlvim_set_current_line(vim.api.ctrlvim_get_current_line():upper()) \
+         end, { desc = 'uppercase the line' })",
+    );
+    key(&mut app, ':');
+    typ(&mut app, "Shout");
+    let results = app.palette_results();
+    let idx = results
+        .iter()
+        .position(|it| it.label == ":Shout")
+        .expect("a plugin-registered command should show up in the palette");
+    assert_eq!(results[idx].hint, "uppercase the line");
+    assert!(matches!(&results[idx].action, Action::RunPluginCommand(name) if name == "Shout"));
+    app.palette_index = idx;
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.engine.lines(), vec!["HELLO"]);
 }
 
 #[test]
@@ -809,6 +869,78 @@ fn vimgrep_with_no_matches_reports_instead_of_opening() {
     assert!(app.engine.session.quickfix().is_empty());
     assert!(!app.quickfix_open, "an empty result must not open an empty pane");
     assert!(app.message.contains("no matches"), "got {:?}", app.message);
+}
+
+// --- `:!{cmd}` shell overlay -------------------------------------------------
+
+#[test]
+fn bang_command_runs_through_the_configured_shell_and_shows_output() {
+    let mut app = temp_project(&[("a.rs", "fn one() {}\n")]);
+    app.config.shell = "sh".to_string(); // deterministic across dev machines/CI
+    typ(&mut app, ":!echo hello-ctrlvim");
+    press(&mut app, KeyCode::Enter);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !app.shell_open && Instant::now() < deadline {
+        app.poll_jobs();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(app.shell_open, "the overlay should open once the job exits");
+    assert!(
+        app.shell_output.iter().any(|l| l.contains("hello-ctrlvim")),
+        "got {:?}",
+        app.shell_output
+    );
+    assert!(app.shell_title.contains("exit 0"), "got {:?}", app.shell_title);
+
+    let out = render(&app, 120, 40);
+    assert!(out.contains("hello-ctrlvim"), "output should render in the overlay:\n{out}");
+
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.shell_open, "Esc dismisses the overlay");
+}
+
+#[test]
+fn bang_output_containing_tabs_is_expanded_before_display() {
+    // Real subprocess output (e.g. `git status`) is often tab-indented. A raw
+    // tab byte reaching the terminal is interpreted differently by different
+    // emulators — some jump the real cursor to a tab stop instead of treating
+    // it as a printable cell — which desyncs ratatui's layout from the actual
+    // screen. ctrlvim must expand tabs to spaces itself rather than ever
+    // emitting one.
+    let mut app = temp_project(&[("a.rs", "fn one() {}\n")]);
+    app.config.shell = "sh".to_string();
+    typ(&mut app, ":!printf 'a\\tb\\n'");
+    press(&mut app, KeyCode::Enter);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while !app.shell_open && Instant::now() < deadline {
+        app.poll_jobs();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    assert!(app.shell_open, "the overlay should open once the job exits");
+    assert!(
+        !app.shell_output.iter().any(|l| l.contains('\t')),
+        "no raw tab byte should reach a rendered line: {:?}",
+        app.shell_output
+    );
+    let expanded = format!("a{}b", " ".repeat(7)); // 'a' then a tab out to column 8
+    assert!(
+        app.shell_output.iter().any(|l| l.contains(&expanded)),
+        "tab should expand to a column stop: {:?}",
+        app.shell_output
+    );
+}
+
+#[test]
+fn bare_bang_with_no_command_reports_an_error_rather_than_running_the_shell() {
+    let mut app = temp_project(&[("a.rs", "fn one() {}\n")]);
+    typ(&mut app, ":!");
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.shell_open);
+    assert!(app.message.contains("E34"), "got {:?}", app.message);
 }
 
 #[test]
@@ -1216,6 +1348,30 @@ fn settings_navigation_spans_options_and_lsp() {
 }
 
 #[test]
+fn installing_an_unsupported_tool_reports_a_message_without_spawning_a_job() {
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    // lua_ls has no scripted install method — whether or not it happens to be
+    // installed on the machine running this test, no job should ever spawn.
+    let i = app.project.lsp.iter().position(|l| l.name == "lua_ls").expect("lua_ls in the registry");
+    app.install_tool(i);
+    assert!(
+        app.message.contains("already installed") || app.message.contains("no install method available"),
+        "unexpected message: {}",
+        app.message
+    );
+    assert!(!app.shell_open, "no install job should have been spawned");
+}
+
+#[test]
+fn installing_the_focused_row_is_a_noop_on_an_editor_option() {
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    assert_eq!(app.settings_index, 0); // an EDITOR option, not a tool row
+    app.install_focused_tool();
+    assert!(!app.shell_open, "installing an EDITOR option row should do nothing");
+}
+
+#[test]
 fn ctrl_tab_cycles_buffers() {
     let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n")]);
     app.open_file(0);
@@ -1323,6 +1479,31 @@ fn ex_close_quits_the_app_directly() {
     assert!(app.buffers.len() > 1);
     run_cmd(&mut app, "close"); // `:close` exits ctrlvim regardless of buffer count
     assert!(app.should_quit);
+}
+
+#[test]
+fn palette_runs_the_highlighted_command_on_a_short_prefix() {
+    // Regression: ":cl" used to show ":close" highlighted in the palette but
+    // execute the unrelated ":clist" abbreviation on Enter instead.
+    let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n")]);
+    app.open_file(0);
+    key(&mut app, ':');
+    typ(&mut app, "cl");
+    let results = app.palette_results();
+    assert_eq!(results[app.palette_index].label, ":close", "':close' should be highlighted, got {:?}", results.iter().map(|it| &it.label).collect::<Vec<_>>());
+    press(&mut app, KeyCode::Enter);
+    assert!(app.should_quit, "Enter should run the highlighted ':close', not a hidden ':clist' abbreviation");
+}
+
+#[test]
+fn palette_short_prefix_still_prefers_exact_abbreviation_over_the_fuzzy_list() {
+    // ":q" must still quit rather than running ":wq", even though "wq"
+    // contains a "q" and would otherwise sort first in the fuzzy list.
+    let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n")]);
+    app.open_file(0);
+    run_cmd(&mut app, "q"); // -> back to just Dashboard
+    assert_eq!(app.buffers.len(), 1);
+    assert!(!app.should_quit);
 }
 
 #[test]

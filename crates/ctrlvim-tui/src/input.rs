@@ -51,6 +51,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         handle_save_prompt(app, key);
         return;
     }
+    if app.shell_open {
+        handle_shell_output(app, key);
+        return;
+    }
 
     // Ctrl+Tab / Ctrl+Shift+Tab cycle through open tabs from anywhere (editor
     // or dashboard), like a browser.
@@ -140,6 +144,8 @@ fn handle_finder(app: &mut App, key: KeyEvent) {
         KeyCode::Up => app.finder_move(-1),
         KeyCode::Char('n') if ctrl => app.finder_move(1),
         KeyCode::Char('p') if ctrl => app.finder_move(-1),
+        _ if is_kill_to_start(&key) => app.finder_clear_to_start(),
+        _ if is_word_backspace(&key) => app.finder_word_backspace(),
         KeyCode::Backspace => app.finder_backspace(),
         KeyCode::Char(c) => app.finder_type(c),
         _ => {}
@@ -191,6 +197,8 @@ fn handle_replace(app: &mut App, key: KeyEvent) {
     // do with it), and the rest is plain typing.
     match key.code {
         KeyCode::Enter => app.replace_accept_all(),
+        _ if is_kill_to_start(&key) => app.replace_clear_to_start(),
+        _ if is_word_backspace(&key) => app.replace_word_backspace(),
         KeyCode::Backspace => app.replace_backspace(),
         KeyCode::Char(c) => app.replace_type(c),
         _ => {}
@@ -208,6 +216,8 @@ fn handle_palette(app: &mut App, key: KeyEvent) {
         KeyCode::Char('n') if ctrl => app.move_palette(1),
         KeyCode::Char('p') if ctrl => app.move_palette(-1),
         KeyCode::Enter => app.submit_palette(),
+        _ if is_kill_to_start(&key) => app.palette_clear_to_start(),
+        _ if is_word_backspace(&key) => app.palette_word_backspace(),
         KeyCode::Backspace => app.palette_backspace(),
         KeyCode::Char(ch) => app.palette_type(ch),
         _ => {}
@@ -220,8 +230,27 @@ fn handle_save_prompt(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.close_save_prompt(),
         KeyCode::Enter => app.save_prompt_confirm(),
+        _ if is_kill_to_start(&key) => app.save_prompt_clear_to_start(),
+        _ if is_word_backspace(&key) => app.save_prompt_word_backspace(),
         KeyCode::Backspace => app.save_prompt_backspace(),
         KeyCode::Char(c) => app.save_prompt_type(c),
+        _ => {}
+    }
+}
+
+// --- `:!{cmd}` output overlay ------------------------------------------------
+
+/// Keys while the shell-command output overlay is open: `j`/`k`/arrows scroll,
+/// `Esc`/`Enter`/`q` dismiss.
+fn handle_shell_output(app: &mut App, key: KeyEvent) {
+    let c = char_of(&key);
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => app.dispatch(Action::CloseShellOutput),
+        KeyCode::Down => app.scroll_shell_output(1),
+        KeyCode::Up => app.scroll_shell_output(-1),
+        _ if c == Some('j') => app.scroll_shell_output(1),
+        _ if c == Some('k') => app.scroll_shell_output(-1),
+        _ if c == Some('q') => app.dispatch(Action::CloseShellOutput),
         _ => {}
     }
 }
@@ -339,10 +368,12 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         if c == Some('e') || c == Some('f') { app.dispatch(Action::OpenFinder); return; }
     }
 
-    // Settings: j/k scroll continuously through the EDITOR options and the LSP
-    // list; Enter/Space toggles the focused row. `d`/`m` jump-toggle directly.
+    // Settings: j/k scroll continuously through the EDITOR options and the
+    // tools list; Enter/Space toggles the focused row. `d`/`m` jump-toggle
+    // directly, `I` installs the focused tool (rust_analyzer, stylua, …).
     if on_dashboard && app.section == DashboardSection::Settings {
         match (key.code, c) {
+            (KeyCode::Char('I'), _) => { app.install_focused_tool(); return; }
             (_, Some('d')) => { app.dispatch(Action::ToggleStartupDrawer); return; }
             (_, Some('m')) => { app.dispatch(Action::ToggleMouse); return; }
             (_, Some('i')) => { app.dispatch(Action::CycleIconMode); return; }
@@ -374,11 +405,13 @@ fn handle_drawer(app: &mut App, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => app.drawer_search = false, // back to navigation
             KeyCode::Enter => app.open_file(app.file_index),
-            KeyCode::Backspace => app.drawer_backspace(),
             KeyCode::Down => app.drawer_move(1),
             KeyCode::Up => app.drawer_move(-1),
             KeyCode::Char('n') if ctrl => app.drawer_move(1),
             KeyCode::Char('p') if ctrl => app.drawer_move(-1),
+            _ if is_kill_to_start(&key) => app.drawer_clear_to_start(),
+            _ if is_word_backspace(&key) => app.drawer_word_backspace(),
+            KeyCode::Backspace => app.drawer_backspace(),
             KeyCode::Char(c) => app.drawer_type(c),
             _ => {}
         }
@@ -399,5 +432,96 @@ fn char_of(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) => Some(c.to_ascii_lowercase()),
         _ => None,
+    }
+}
+
+// --- OS-level word/line deletion in single-line fields ----------------------
+//
+// The finder, replace, palette, save-as, and drawer-search fields are plain
+// `String`s edited only at the end, so "delete previous word" and "delete to
+// start of line" are just different truncations — but recognizing the key
+// chords takes care, because none of these arrive as a distinct "modifier +
+// Backspace" the way you'd expect:
+//
+// - macOS Option+Backspace (delete last word) decodes as `Backspace` with the
+//   Alt modifier: the terminal sends ESC + DEL, and crossterm folds a leading
+//   ESC into the Alt modifier of whatever follows.
+// - Ctrl+Backspace (delete last word, the Linux convention) shares its
+//   control byte (0x08) with Ctrl+H, so it decodes as `Char('h')` with
+//   Ctrl — there is no way to tell it apart from someone actually typing
+//   Ctrl+H, but nobody does that on purpose in a text field.
+// - macOS Cmd+Backspace (delete to start of line) never reaches the terminal
+//   as "Cmd + anything" — Cmd chords are consumed by the terminal emulator
+//   itself. Terminals that bind this at all (iTerm2/WezTerm/Ghostty's
+//   "natural text editing" presets) forward it as Ctrl+U, readline's
+//   `unix-line-discard` byte.
+//
+// Without this, all of the above used to fall through to the fields' generic
+// `KeyCode::Char(c) => type(c)` arm and insert a literal 'h' or 'u'.
+
+/// "Delete the previous word": Option+Backspace, Ctrl+Backspace, or Ctrl+W
+/// (a common terminal remap for the same thing).
+fn is_word_backspace(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace => ctrl || alt,
+        KeyCode::Char('h') | KeyCode::Char('w') => ctrl,
+        _ => false,
+    }
+}
+
+/// "Delete to the start of the line": Cmd+Backspace (forwarded as Ctrl+U by
+/// terminals that bind it) or a literal Super+Backspace, for terminals with
+/// the kitty keyboard protocol enabled that report Cmd directly.
+fn is_kill_to_start(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let super_ = key.modifiers.contains(KeyModifiers::SUPER);
+    match key.code {
+        KeyCode::Char('u') => ctrl,
+        KeyCode::Backspace => super_,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod os_keyboard_tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn option_backspace_on_macos_is_a_word_backspace() {
+        // The terminal sends ESC + DEL; crossterm folds that into Alt+Backspace.
+        assert!(is_word_backspace(&key(KeyCode::Backspace, KeyModifiers::ALT)));
+    }
+
+    #[test]
+    fn ctrl_backspace_on_linux_is_a_word_backspace() {
+        // Ctrl+Backspace shares its control byte with Ctrl+H.
+        assert!(is_word_backspace(&key(KeyCode::Char('h'), KeyModifiers::CONTROL)));
+        assert!(is_word_backspace(&key(KeyCode::Backspace, KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn ctrl_w_is_also_a_word_backspace() {
+        assert!(is_word_backspace(&key(KeyCode::Char('w'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn cmd_backspace_on_macos_kills_to_start() {
+        // Forwarded by the terminal as Ctrl+U (readline unix-line-discard).
+        assert!(is_kill_to_start(&key(KeyCode::Char('u'), KeyModifiers::CONTROL)));
+        assert!(is_kill_to_start(&key(KeyCode::Backspace, KeyModifiers::SUPER)));
+    }
+
+    #[test]
+    fn plain_backspace_and_typing_are_neither() {
+        assert!(!is_word_backspace(&key(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(!is_kill_to_start(&key(KeyCode::Backspace, KeyModifiers::NONE)));
+        assert!(!is_word_backspace(&key(KeyCode::Char('h'), KeyModifiers::NONE)));
+        assert!(!is_kill_to_start(&key(KeyCode::Char('u'), KeyModifiers::NONE)));
     }
 }

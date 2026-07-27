@@ -13,6 +13,7 @@ members = [
     "crates/ctrlvim-lua",
     "crates/ctrlvim-async",
     "crates/ctrlvim-core",
+    "crates/ctrlvim-tools",
     "crates/ctrlvim-tui",
 ]
 
@@ -35,6 +36,7 @@ ctrlvim-api = { path = "crates/ctrlvim-api" }
 ctrlvim-lua = { path = "crates/ctrlvim-lua" }
 ctrlvim-async = { path = "crates/ctrlvim-async" }
 ctrlvim-core = { path = "crates/ctrlvim-core" }
+ctrlvim-tools = { path = "crates/ctrlvim-tools" }
 
 ratatui = "0.29"
 crossterm = "0.28"

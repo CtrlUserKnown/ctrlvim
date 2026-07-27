@@ -2,9 +2,11 @@
 //!
 //! Everything here reflects the actual project the editor is launched in (the
 //! current working directory): recent files come from the filesystem, git
-//! status from the `git` CLI, LOC from counting source lines, LSP servers from
-//! probing `PATH`, and plugins from the conventional pack directory. Sources
-//! that don't exist yield truthful empty state rather than mock data.
+//! status from the `git` CLI, LOC from counting source lines, language
+//! servers/formatters/linters from `ctrlvim_tools::REGISTRY` (PATH probing
+//! plus ctrlvim's own managed tools directory), and plugins from the
+//! conventional pack directory. Sources that don't exist yield truthful empty
+//! state rather than mock data.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -344,33 +346,39 @@ fn load_git(root: &Path) -> Option<GitStatus> {
 // --- lsp / plugins / sessions ---------------------------------------------
 
 fn detect_lsp() -> Vec<LspServer> {
-    // Language servers are named after their nvim-lspconfig identifiers so the
-    // same config vocabulary carries over; build linkers are surfaced as extra
-    // rows (filetypes = "linker"). (name, filetypes, candidate binaries on PATH)
-    let known: &[(&str, &str, &[&str])] = &[
-        ("rust_analyzer", "rust", &["rust-analyzer"]),
-        ("taplo", "toml", &["taplo"]),
-        ("lua_ls", "lua", &["lua-language-server", "lua_ls"]),
-        ("marksman", "markdown", &["marksman"]),
-        ("ts_ls", "ts, tsx, js, jsx", &["typescript-language-server", "tsserver"]),
-        ("jdtls", "java (maven/gradle)", &["jdtls"]),
-        ("lemminx", "xml (pom.xml)", &["lemminx"]),
-        ("mesonlsp", "meson", &["mesonlsp", "Swift-MesonLSP"]),
-        // Build linkers.
-        ("mold", "linker", &["mold", "ld.mold"]),
-        ("lld", "linker", &["ld.lld", "lld"]),
-        ("wild", "linker", &["wild"]),
-        ("gold", "linker", &["ld.gold", "gold"]),
-        ("ld.bfd", "linker", &["ld.bfd", "ld"]),
+    // Language servers, formatters, and linters come from ctrlvim's own tool
+    // registry (see `ctrlvim_tools`), which also knows how to install the
+    // ones it can. Build linkers aren't part of that registry — they're
+    // system packages, not per-project dev tools — so they stay a handful of
+    // pure PATH-detection rows, same as before.
+    let mut tools: Vec<LspServer> = ctrlvim_tools::REGISTRY.iter().map(lsp_server_from_tool).collect();
+
+    let linkers: &[(&str, &[&str])] = &[
+        ("mold", &["mold", "ld.mold"]),
+        ("lld", &["ld.lld", "lld"]),
+        ("wild", &["wild"]),
+        ("gold", &["ld.gold", "gold"]),
+        ("ld.bfd", &["ld.bfd", "ld"]),
     ];
-    known
-        .iter()
-        .map(|(name, ft, bins)| LspServer {
-            name: name.to_string(),
-            filetypes: ft.to_string(),
-            installed: bins.iter().any(|b| on_path(b)),
-        })
-        .collect()
+    tools.extend(linkers.iter().map(|(name, bins)| LspServer {
+        name: name.to_string(),
+        filetypes: "linker".to_string(),
+        installed: bins.iter().any(|b| on_path(b)),
+        managed: false,
+        installable: false,
+    }));
+    tools
+}
+
+pub(crate) fn lsp_server_from_tool(tool: &ctrlvim_tools::Tool) -> LspServer {
+    let (installed, managed) = ctrlvim_tools::installed_and_managed(tool);
+    LspServer {
+        name: tool.name.to_string(),
+        filetypes: tool.filetypes.to_string(),
+        installed,
+        managed,
+        installable: tool.method.is_supported(),
+    }
 }
 
 /// Scan the conventional pack directory for installed plugins.
@@ -504,7 +512,7 @@ fn state_dir() -> Option<PathBuf> {
         .or_else(|| home().map(|h| h.join(".local").join("state")))
 }
 
-fn home() -> Option<PathBuf> {
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 

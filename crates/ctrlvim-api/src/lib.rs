@@ -13,6 +13,7 @@ pub mod registry;
 
 use autocmd::AutocmdStore;
 use ctrlvim_editor::{Editor, Session};
+use ctrlvim_types::object::LuaRef;
 use std::collections::HashMap;
 
 pub use registry::{call, ApiFunction};
@@ -29,6 +30,21 @@ pub struct ApiContext {
     pub autocmds: AutocmdStore,
     /// Keymaps registered from Lua (`vim.keymap.set`): (mode, lhs) -> LuaRef id.
     pub keymaps: HashMap<(String, String), i64>,
+    /// Commands registered from Lua (`vim.api.ctrlvim_create_user_command`):
+    /// name -> (callback, description, source). `source` is whatever script
+    /// was executing at registration time (see [`current_source`]), so the
+    /// frontend can attribute a command to the plugin that contributed it.
+    /// This is what makes a plugin's commands show up in the frontend's
+    /// command palette alongside the engine's own — the same unification
+    /// `:command` gets for Vimscript.
+    ///
+    /// [`current_source`]: Self::current_source
+    pub user_commands: HashMap<String, (LuaRef, String, Option<String>)>,
+    /// The script currently being sourced (a plugin's file stem, e.g.
+    /// `"my-plugin"`), if any — set by the host around a plugin load so
+    /// `ctrlvim_create_user_command` can tag its registrations. `None` for
+    /// ad hoc `:lua` chunks with no associated file.
+    pub current_source: Option<String>,
     /// Persistent Vimscript state (globals + user functions) backing `vim.fn`.
     pub script: ctrlvim_vimscript::ScriptState,
     namespaces: HashMap<String, u32>,
@@ -41,6 +57,8 @@ impl ApiContext {
             session: Session::from_editor(editor),
             autocmds: AutocmdStore::new(),
             keymaps: HashMap::new(),
+            user_commands: HashMap::new(),
+            current_source: None,
             script: ctrlvim_vimscript::ScriptState::default(),
             namespaces: HashMap::new(),
             next_namespace: 1,

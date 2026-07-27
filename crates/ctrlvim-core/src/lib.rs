@@ -64,13 +64,24 @@ impl Ctrlvim {
 
     /// Run a Lua chunk against the live buffer (syncing text in and out).
     pub fn run_lua(&mut self, code: &str) -> Result<(), String> {
+        self.run_lua_as(None, code)
+    }
+
+    /// Run a Lua chunk as a named plugin script: `source` (e.g. a plugin's
+    /// file stem) tags any `ctrlvim_create_user_command` calls it makes, so
+    /// the frontend can attribute the resulting palette entries to it. Used
+    /// by startup plugin loading; `run_lua` is the `source: None` case for
+    /// ad hoc `:lua` chunks.
+    pub fn run_lua_as(&mut self, source: Option<&str>, code: &str) -> Result<(), String> {
         if self.host.is_none() {
             self.host = Some(Host::new(Editor::new()).map_err(|e| e.to_string())?);
         }
         let host = self.host.as_ref().unwrap();
         let text = self.lines().join("\n");
         host.with_editor_mut(|ed| ed.load_str(&text, None));
+        host.set_current_source(source.map(str::to_string));
         let result = host.exec(code).map_err(|e| e.to_string());
+        host.set_current_source(None);
         let new_lines = host.with_editor(|ed| ed.cur_buffer().text.lines());
         if new_lines != self.session.editor.cur_buffer().text.lines() {
             let count = self.session.editor.cur_buffer().text.line_count();
@@ -82,6 +93,36 @@ impl Ctrlvim {
             self.session.checkpoint_undo();
         }
         result
+    }
+
+    /// Plugin-registered commands (`vim.api.ctrlvim_create_user_command`),
+    /// name, description, and source script (if any), for the frontend's
+    /// command palette. Empty until a plugin has actually run (the Lua host
+    /// is created lazily on first `:lua`/plugin load).
+    pub fn plugin_commands(&self) -> Vec<(String, String, Option<String>)> {
+        match &self.host {
+            Some(host) => host.user_commands(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Run a plugin-registered command by name (selecting it from the
+    /// palette), syncing buffer text in/out the same way [`run_lua`] does.
+    /// Returns whether a command with that name was found.
+    ///
+    /// [`run_lua`]: Self::run_lua
+    pub fn run_plugin_command(&mut self, name: &str) -> Result<bool, String> {
+        let Some(host) = self.host.as_ref() else { return Ok(false) };
+        let text = self.lines().join("\n");
+        host.with_editor_mut(|ed| ed.load_str(&text, None));
+        let ran = host.run_user_command(name).map_err(|e| e.to_string())?;
+        let new_lines = host.with_editor(|ed| ed.cur_buffer().text.lines());
+        if new_lines != self.session.editor.cur_buffer().text.lines() {
+            let count = self.session.editor.cur_buffer().text.line_count();
+            self.session.editor.cur_buffer_mut().text.set_lines(0, count, &new_lines);
+            self.session.checkpoint_undo();
+        }
+        Ok(ran)
     }
 
     /// Open a file's contents into the current buffer.
@@ -166,6 +207,49 @@ mod tests {
         ctrlvim.feed("ifoo <Esc>");
         assert_eq!(ctrlvim.lines(), vec!["foo world"]);
         assert_eq!(ctrlvim.mode(), "n");
+    }
+
+    #[test]
+    fn plugin_commands_are_empty_before_any_lua_runs() {
+        let ctrlvim = Ctrlvim::new();
+        assert_eq!(ctrlvim.plugin_commands(), Vec::<(String, String, Option<String>)>::new());
+    }
+
+    #[test]
+    fn plugin_command_registers_lists_and_edits_the_shared_buffer() {
+        let mut ctrlvim = Ctrlvim::new();
+        ctrlvim.open("hello world", Some("scratch"));
+        ctrlvim
+            .run_lua(
+                r#"
+                vim.api.ctrlvim_create_user_command('Shout', function()
+                    vim.api.ctrlvim_set_current_line(vim.api.ctrlvim_get_current_line():upper())
+                end, { desc = 'uppercase the line' })
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            ctrlvim.plugin_commands(),
+            vec![("Shout".to_string(), "uppercase the line".to_string(), None)]
+        );
+        assert!(ctrlvim.run_plugin_command("Shout").unwrap());
+        assert_eq!(ctrlvim.lines(), vec!["HELLO WORLD"]);
+        assert!(!ctrlvim.run_plugin_command("NoSuchCommand").unwrap());
+    }
+
+    #[test]
+    fn run_lua_as_tags_registered_commands_with_their_source() {
+        let mut ctrlvim = Ctrlvim::new();
+        ctrlvim
+            .run_lua_as(
+                Some("my-plugin"),
+                "vim.api.ctrlvim_create_user_command('Greet', function() end, {})",
+            )
+            .unwrap();
+        assert_eq!(
+            ctrlvim.plugin_commands(),
+            vec![("Greet".to_string(), String::new(), Some("my-plugin".to_string()))]
+        );
     }
 }
 

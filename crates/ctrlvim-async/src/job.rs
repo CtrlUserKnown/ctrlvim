@@ -96,6 +96,12 @@ impl Jobs {
 
         id
     }
+
+    /// Spawn `command` through `shell -c`, for callers holding a raw command
+    /// line (`:!{cmd}`) rather than a pre-split program and argument list.
+    pub fn spawn_shell(&mut self, shell: &str, command: &str, cwd: &Path) -> u64 {
+        self.spawn(shell, &["-c".to_string(), command.to_string()], cwd)
+    }
 }
 
 /// Forward everything a pipe produces onto the event queue.
@@ -190,6 +196,29 @@ mod tests {
         let (out, code) = run("sh", &["-c", "echo oops >&2; exit 3"]);
         assert_eq!(out.trim(), "oops", "stderr is merged into the same stream");
         assert_eq!(code, 3);
+    }
+
+    #[test]
+    fn spawn_shell_runs_a_raw_command_line() {
+        let el = EventLoop::new();
+        let svc = TimerService::new(el.sender()).unwrap();
+        let mut jobs = Jobs::new(svc.runtime().handle().clone(), el.sender());
+        jobs.spawn_shell("sh", "echo a && echo b", Path::new("."));
+
+        let mut out = String::new();
+        loop {
+            match el.wait(Duration::from_secs(10)) {
+                Some(Event::ProcessOutput { data, .. }) => {
+                    out.push_str(&String::from_utf8_lossy(&data))
+                }
+                Some(Event::ProcessExit { code, .. }) => {
+                    assert_eq!(code, 0);
+                    break;
+                }
+                _ => panic!("job produced no exit event"),
+            }
+        }
+        assert_eq!(out, "a\nb\n");
     }
 
     #[test]

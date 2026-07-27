@@ -8,6 +8,12 @@
 //!
 //! Settings here can also be flipped live from the dashboard's Settings tab,
 //! which writes the file back via [`Config::save`].
+//!
+//! `plugin = "path"` lines declare Lua scripts to run once at startup, in the
+//! order they appear, over the same `:luafile` path ([`crate::app::App`]'s
+//! `host_source`). Repeat the key for more than one plugin; there's no array
+//! syntax in this parser. Paths are resolved relative to the current
+//! directory unless absolute, and a leading `~/` expands to `$HOME`.
 
 use std::path::{Path, PathBuf};
 
@@ -26,12 +32,31 @@ pub struct Config {
     /// How file icons are drawn: Nerd Font glyphs, extension text, or auto-
     /// detect (see [`crate::icons`]).
     pub icons: IconMode,
+    /// Lua scripts to run once at startup, in file order (`plugin = "path"`
+    /// lines). Empty by default — ctrlvim loads nothing unless asked.
+    pub plugins: Vec<PathBuf>,
+    /// The shell used to run external commands (`:!`, `:make`-style jobs via
+    /// `sh -c`-style invocation). Defaults to `zsh` on macOS and `bash`
+    /// everywhere else, overridden with `shell = "fish"` in `config.toml`.
+    pub shell: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { drawer: false, mouse: true, icons: IconMode::Auto }
+        Config {
+            drawer: false,
+            mouse: true,
+            icons: IconMode::Auto,
+            plugins: Vec::new(),
+            shell: default_shell(),
+        }
     }
+}
+
+/// The shell to fall back to when `config.toml` doesn't set one: `zsh` on
+/// macOS (its login default since Catalina), `bash` elsewhere.
+fn default_shell() -> String {
+    if cfg!(target_os = "macos") { "zsh".to_string() } else { "bash".to_string() }
 }
 
 impl Config {
@@ -74,7 +99,7 @@ impl Config {
 
     /// Render the config as a TOML document.
     fn to_toml(&self) -> String {
-        format!(
+        let mut text = format!(
             "# ctrlvim config\n\n\
              # Open the file drawer on startup.\n\
              drawer = {}\n\n\
@@ -83,11 +108,25 @@ impl Config {
              mouse = {}\n\n\
              # File icons: \"auto\" (Nerd Font glyphs if one is installed),\n\
              # \"nerd\" (always glyphs), or \"text\" (a letter per filetype).\n\
-             icons = \"{}\"\n",
+             icons = \"{}\"\n\n\
+             # Shell used to run external commands. Defaults to zsh on macOS,\n\
+             # bash elsewhere.\n\
+             shell = \"{}\"\n",
             self.drawer,
             self.mouse,
-            self.icons.as_str()
-        )
+            self.icons.as_str(),
+            self.shell,
+        );
+        if !self.plugins.is_empty() {
+            text.push_str(
+                "\n# Lua plugins to run once at startup, in order (one `plugin = \"path\"`\n\
+                 # line each; see examples/plugins/ for a sample).\n",
+            );
+            for path in &self.plugins {
+                text.push_str(&format!("plugin = \"{}\"\n", path.display()));
+            }
+        }
+        text
     }
 
     /// Parse the TOML subset described in the module docs.
@@ -122,6 +161,16 @@ impl Config {
                         cfg.icons = m;
                     }
                 }
+                "plugin" => {
+                    if !value.is_empty() {
+                        cfg.plugins.push(expand_tilde(value));
+                    }
+                }
+                "shell" => {
+                    if !value.is_empty() {
+                        cfg.shell = value.to_string();
+                    }
+                }
                 _ => {}
             }
         }
@@ -134,6 +183,19 @@ fn parse_bool(v: &str) -> Option<bool> {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
+    }
+}
+
+/// Expand a leading `~/` (or bare `~`) to `$HOME`; other paths pass through
+/// unchanged (resolved relative to the current directory when read).
+fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() => crate::data::home().unwrap_or_else(|| PathBuf::from("~")),
+        Some(rest) if rest.starts_with('/') => match crate::data::home() {
+            Some(home) => home.join(rest.trim_start_matches('/')),
+            None => PathBuf::from(path),
+        },
+        _ => PathBuf::from(path),
     }
 }
 
@@ -173,6 +235,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_plugin_lines_in_order() {
+        assert!(Config::default().plugins.is_empty());
+        let text = "plugin = \"a.lua\"\nplugin = \"/abs/b.lua\"\n";
+        let plugins = Config::parse(text).plugins;
+        assert_eq!(plugins, vec![PathBuf::from("a.lua"), PathBuf::from("/abs/b.lua")]);
+    }
+
+    #[test]
+    fn expands_tilde_in_plugin_paths() {
+        // Reads the real $HOME rather than overriding it, so this can't race
+        // with other tests that read the same process-wide env var.
+        let home = crate::data::home().expect("HOME must be set to run this test");
+        assert_eq!(
+            Config::parse("plugin = \"~/plugins/hello.lua\"").plugins,
+            vec![home.join("plugins/hello.lua")]
+        );
+        // A bare `~` (no trailing slash) also resolves.
+        assert_eq!(Config::parse("plugin = \"~\"").plugins, vec![home]);
+    }
+
+    #[test]
+    fn shell_defaults_by_platform() {
+        let expected = if cfg!(target_os = "macos") { "zsh" } else { "bash" };
+        assert_eq!(Config::default().shell, expected);
+    }
+
+    #[test]
+    fn parses_shell_option() {
+        assert_eq!(Config::parse("shell = \"fish\"").shell, "fish");
+        // Empty value keeps the platform default rather than clearing it.
+        assert_eq!(Config::parse("shell = \"\"").shell, Config::default().shell);
+    }
+
+    #[test]
     fn unknown_keys_and_junk_are_ignored() {
         let text = "wat = 3\nnonsense line\ndrawer = true\n";
         assert!(Config::parse(text).drawer);
@@ -185,7 +281,13 @@ mod tests {
         // Hermetic: writes to a unique temp file, never the real config dir.
         let path = std::env::temp_dir()
             .join(format!("ctrlvim-cfg-{}-{:p}.toml", std::process::id(), &()));
-        let cfg = Config { drawer: true, mouse: true, icons: IconMode::Text };
+        let cfg = Config {
+            drawer: true,
+            mouse: true,
+            icons: IconMode::Text,
+            plugins: vec![PathBuf::from("a.lua"), PathBuf::from("/abs/b.lua")],
+            shell: "fish".to_string(),
+        };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
         // A missing file loads defaults.

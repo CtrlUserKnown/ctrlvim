@@ -8,6 +8,7 @@ description = "Ratatui frontend for the ctrlvim engine (startup dashboard + edit
 [dependencies]
 ctrlvim-core.workspace = true
 ctrlvim-markdown.workspace = true
+ctrlvim-tools.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 

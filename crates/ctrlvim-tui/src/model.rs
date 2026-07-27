@@ -60,14 +60,20 @@ pub struct Plugin {
     pub status: PluginStatus,
 }
 
-/// A language server row in the Settings tab. `installed` reflects whether the
-/// server binary was found on `PATH`; the live on/off toggle lives in
-/// [`crate::app::App`].
+/// A tool row in the Settings tab — a language server, formatter, linter, or
+/// build linker. `installed` reflects whether a binary was found at all
+/// (either on `PATH` or in ctrlvim's own tools directory, see `managed`); the
+/// live on/off toggle lives in [`crate::app::App`].
 #[derive(Clone)]
 pub struct LspServer {
     pub name: String,
     pub filetypes: String,
     pub installed: bool,
+    /// `installed` was found in ctrlvim's own tools directory rather than on
+    /// `PATH` — i.e. ctrlvim installed it itself.
+    pub managed: bool,
+    /// ctrlvim knows how to install this one (see `ctrlvim_tools::REGISTRY`).
+    pub installable: bool,
 }
 
 /// Real git status for the project root, or `None` when it isn't a repo.
