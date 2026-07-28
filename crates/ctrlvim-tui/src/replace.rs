@@ -364,8 +364,13 @@ mod tests {
     fn an_empty_find_field_compiles_to_nothing_rather_than_erroring() {
         let p = ReplacePanel::new(None);
         assert!(p.plan().is_none(), "an empty field is not an error to show");
-        let mut p = ReplacePanel::new(Some("[unclosed".into()));
+        // An unclosed group is a genuine Vim error (E54). An unclosed `[` is
+        // not: Vim reads a bracket that starts no valid collection as a
+        // literal, so `/[` searches for a bracket.
+        let mut p = ReplacePanel::new(Some(r"\(unclosed".into()));
         assert!(p.plan().unwrap().is_err());
+        p.find = "[unclosed".into();
+        assert!(p.plan().unwrap().is_ok(), "a bare [ is a literal, not an error");
         p.find = "foo".into();
         assert!(p.plan().unwrap().is_ok());
     }

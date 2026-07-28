@@ -134,9 +134,9 @@ impl QuickfixList {
 /// The engine owns pattern *semantics* (Vim's magic flavor, via
 /// [`crate::pattern`]) while the host owns the filesystem — so `:vimgrep` is
 /// split: the host walks and reads files, this decides what matches. Wrapping
-/// the regex also keeps `regex` out of the frontend's dependency list.
+/// the regex also keeps the engine out of the frontend's dependency list.
 pub struct Matcher {
-    re: regex::Regex,
+    re: ctrlvim_regex::Regex,
 }
 
 impl Matcher {
@@ -153,8 +153,7 @@ impl Matcher {
 
     /// Character column of the first match on `line`, if any.
     pub fn first_match_col(&self, line: &str) -> Option<usize> {
-        let m = self.re.find(line)?;
-        Some(line[..m.start()].chars().count())
+        Some(self.re.find(line)?.start_char())
     }
 }
 
@@ -405,7 +404,10 @@ mod tests {
 
     #[test]
     fn an_invalid_pattern_is_an_error_not_a_panic() {
-        assert!(Matcher::new("[unclosed").is_err());
+        assert!(Matcher::new(r"\(unclosed").is_err());
+        // A bare `[` starts no valid collection, so Vim reads it as a literal
+        // rather than rejecting the pattern.
+        assert!(Matcher::new("[unclosed").is_ok());
     }
 
     #[test]

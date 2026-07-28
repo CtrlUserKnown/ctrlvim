@@ -11,6 +11,8 @@ ctrlvim-markdown.workspace = true
 ctrlvim-tools.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+serde.workspace = true
+toml_edit.workspace = true
 
 [[bin]]
 name = "cvi"

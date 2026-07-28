@@ -27,26 +27,80 @@ pub enum KeymapMatch {
     None,
 }
 
-/// Normal-mode mappings. (Other modes join this table as they gain maps.)
+/// Which mode a mapping applies in — the `n`/`i`/`v` of `:nmap`/`:imap`/`:vmap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MapMode {
+    Normal,
+    Insert,
+    Visual,
+}
+
+impl MapMode {
+    /// Parse the mode letter used by `:map` commands and the config's
+    /// `[[keymap]] mode` field. Unknown letters fall back to normal, matching
+    /// how a bare `:map` behaves.
+    pub fn parse(s: &str) -> MapMode {
+        match s.trim() {
+            "i" | "insert" => MapMode::Insert,
+            "v" | "x" | "visual" => MapMode::Visual,
+            _ => MapMode::Normal,
+        }
+    }
+}
+
+/// Per-mode mapping tables.
 #[derive(Default)]
 pub struct Keymap {
     normal: Vec<Mapping>,
+    insert: Vec<Mapping>,
+    visual: Vec<Mapping>,
 }
 
 impl Keymap {
-    /// Set a normal-mode mapping, `lhs`/`rhs` written in `<...>` key notation
-    /// (`<Space>w` → `:w<CR>`). Replaces any existing mapping with the same lhs.
-    pub fn set_normal(&mut self, lhs: &str, rhs: &str) {
-        let lhs = Key::parse_sequence(lhs);
-        let rhs = Key::parse_sequence(rhs);
-        self.normal.retain(|m| m.lhs != lhs);
-        self.normal.push(Mapping { lhs, rhs });
+    fn table(&self, mode: MapMode) -> &Vec<Mapping> {
+        match mode {
+            MapMode::Normal => &self.normal,
+            MapMode::Insert => &self.insert,
+            MapMode::Visual => &self.visual,
+        }
     }
 
-    /// Match `pending` against the normal-mode mappings.
-    pub fn match_normal(&self, pending: &[Key]) -> KeymapMatch {
+    fn table_mut(&mut self, mode: MapMode) -> &mut Vec<Mapping> {
+        match mode {
+            MapMode::Normal => &mut self.normal,
+            MapMode::Insert => &mut self.insert,
+            MapMode::Visual => &mut self.visual,
+        }
+    }
+
+    /// Set a mapping in `mode`, `lhs`/`rhs` written in `<...>` key notation
+    /// (`<Space>w` → `:w<CR>`). Replaces any existing mapping with the same lhs.
+    pub fn set(&mut self, mode: MapMode, lhs: &str, rhs: &str) {
+        let lhs = Key::parse_sequence(lhs);
+        let rhs = Key::parse_sequence(rhs);
+        let table = self.table_mut(mode);
+        table.retain(|m| m.lhs != lhs);
+        table.push(Mapping { lhs, rhs });
+    }
+
+    /// Set a normal-mode mapping.
+    pub fn set_normal(&mut self, lhs: &str, rhs: &str) {
+        self.set(MapMode::Normal, lhs, rhs);
+    }
+
+    /// Remove a mapping (`:unmap`). Returns whether one was there.
+    pub fn remove(&mut self, mode: MapMode, lhs: &str) -> bool {
+        let lhs = Key::parse_sequence(lhs);
+        let table = self.table_mut(mode);
+        let before = table.len();
+        table.retain(|m| m.lhs != lhs);
+        table.len() != before
+    }
+
+    /// Match `pending` against `mode`'s mappings.
+    pub fn match_mode(&self, mode: MapMode, pending: &[Key]) -> KeymapMatch {
         let mut has_prefix = false;
-        for m in &self.normal {
+        for m in self.table(mode) {
             if m.lhs == pending {
                 return KeymapMatch::Full(m.rhs.clone());
             }
@@ -61,9 +115,24 @@ impl Keymap {
         }
     }
 
+    /// Match `pending` against the normal-mode mappings.
+    pub fn match_normal(&self, pending: &[Key]) -> KeymapMatch {
+        self.match_mode(MapMode::Normal, pending)
+    }
+
+    /// True when `key` on its own could begin a mapping in `mode`.
+    pub fn can_start(&self, mode: MapMode, key: Key) -> bool {
+        !matches!(self.match_mode(mode, &[key]), KeymapMatch::None)
+    }
+
     /// True when `key` on its own could begin a normal-mode mapping.
     pub fn can_start_normal(&self, key: Key) -> bool {
-        !matches!(self.match_normal(&[key]), KeymapMatch::None)
+        self.can_start(MapMode::Normal, key)
+    }
+
+    /// Every mapping in `mode`, for `:map` with no arguments.
+    pub fn list(&self, mode: MapMode) -> &[Mapping] {
+        self.table(mode)
     }
 }
 
@@ -89,6 +158,36 @@ mod tests {
         }
         assert!(matches!(km.match_normal(&parse("<Space>x")), KeymapMatch::None));
         assert!(matches!(km.match_normal(&parse("x")), KeymapMatch::None));
+    }
+
+    #[test]
+    fn modes_have_independent_tables() {
+        let mut km = Keymap::default();
+        km.set(MapMode::Insert, "jk", "<Esc>");
+        // The insert mapping must not leak into normal mode.
+        assert!(matches!(km.match_normal(&parse("jk")), KeymapMatch::None));
+        match km.match_mode(MapMode::Insert, &parse("jk")) {
+            KeymapMatch::Full(rhs) => assert_eq!(rhs, parse("<Esc>")),
+            _ => panic!("expected full match"),
+        }
+    }
+
+    #[test]
+    fn mode_letters_parse() {
+        assert_eq!(MapMode::parse("i"), MapMode::Insert);
+        assert_eq!(MapMode::parse("v"), MapMode::Visual);
+        assert_eq!(MapMode::parse("x"), MapMode::Visual);
+        assert_eq!(MapMode::parse("n"), MapMode::Normal);
+        assert_eq!(MapMode::parse("garbage"), MapMode::Normal);
+    }
+
+    #[test]
+    fn unmap_removes_a_mapping() {
+        let mut km = Keymap::default();
+        km.set_normal("<Space>w", ":w<CR>");
+        assert!(km.remove(MapMode::Normal, "<Space>w"));
+        assert!(!km.remove(MapMode::Normal, "<Space>w"), "already gone");
+        assert!(matches!(km.match_normal(&parse("<Space>w")), KeymapMatch::None));
     }
 
     #[test]

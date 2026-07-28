@@ -365,29 +365,27 @@ fn word_end_once(buf: &Buffer, pos: Position, big: bool) -> Position {
     let mut chars = line_chars(buf, line);
     let mut col = pos.col + 1;
 
+    // Skip blanks (and line boundaries).
     loop {
-        // Skip blanks (and line boundaries).
-        loop {
-            while col < chars.len() && class_of(chars[col], big) == CharClass::Blank {
-                col += 1;
-            }
-            if col < chars.len() {
-                break;
-            }
-            if line + 1 >= total_lines {
-                return Position::new(line, chars.len().saturating_sub(1));
-            }
-            line += 1;
-            chars = line_chars(buf, line);
-            col = 0;
-        }
-        // Advance to the end of this word.
-        let class = class_of(chars[col], big);
-        while col + 1 < chars.len() && class_of(chars[col + 1], big) == class {
+        while col < chars.len() && class_of(chars[col], big) == CharClass::Blank {
             col += 1;
         }
-        return Position::new(line, col);
+        if col < chars.len() {
+            break;
+        }
+        if line + 1 >= total_lines {
+            return Position::new(line, chars.len().saturating_sub(1));
+        }
+        line += 1;
+        chars = line_chars(buf, line);
+        col = 0;
     }
+    // Advance to the end of this word.
+    let class = class_of(chars[col], big);
+    while col + 1 < chars.len() && class_of(chars[col + 1], big) == class {
+        col += 1;
+    }
+    Position::new(line, col)
 }
 
 /// `f`/`F`/`t`/`T` — find `target` on the current line. `forward` picks the

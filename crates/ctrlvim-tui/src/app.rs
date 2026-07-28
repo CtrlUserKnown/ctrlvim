@@ -26,7 +26,8 @@ use ctrlvim_core::{
     Matcher, OutputParser, QfItem, QuickfixCmd, Selection, TagAddress, TagCmd, TimerService,
 };
 
-use crate::config::Config;
+use crate::config::{expand_tilde, Config, PluginEntry};
+use ctrlvim_core::MapMode;
 use crate::data::{list_dir, FinderEntry};
 use crate::data::Project;
 use crate::replace::{by_file, Field, ReplacePanel, MAX_HITS};
@@ -700,6 +701,101 @@ impl App {
         }
     }
 
+    /// Apply everything the config file declares: options, mappings, plugins.
+    ///
+    /// Each one is expressed as an Ex command and run through the engine, so the
+    /// config gets exactly the semantics the `:` command line has — one code
+    /// path, one source of truth for what an option or mapping means.
+    pub fn apply_config(&mut self) {
+        // `[options]` → a single `:set` with every argument.
+        if !self.config.set_args.is_empty() {
+            let args = self.config.set_args.join(" ");
+            self.run_ex_command(&format!("set {args}"));
+        }
+
+        // `[[keymap]]` → the engine's per-mode mapping table. This goes direct
+        // rather than through `:nnoremap` because the right-hand side is key
+        // *notation* (`<Esc>`, `<CR>`), which the command line would consume as
+        // real keys before the mapping was ever defined.
+        for m in self.config.keymaps.clone() {
+            self.engine
+                .session
+                .keymap
+                .set(MapMode::parse(&m.mode), &m.lhs, &m.rhs);
+        }
+
+        // `[[plugin]]` → source the plugin's entry point now, unless it asked to
+        // be loaded lazily on an event.
+        for p in self.config.plugins.clone() {
+            if p.enabled && p.event.is_none() {
+                self.load_plugin(&p);
+            }
+        }
+
+        // Config autocmds and plugins alike need the Lua host to exist before
+        // any event can reach a callback.
+        if !self.config.autocmds.is_empty() {
+            let _ = self.engine.ensure_host();
+        }
+
+        self.fire_autocmd("VimEnter");
+    }
+
+    /// Load a plugin: source its `init.lua` if present, else its `init.vim`.
+    ///
+    /// Plugins are ordinary script files; the config decides *which* ones load
+    /// and in what order, which is why there is no `runtimepath` search here.
+    fn load_plugin(&mut self, p: &crate::config::PluginEntry) {
+        let dir = expand_tilde(&p.path);
+        for entry in ["init.lua", "init.vim"] {
+            let candidate = dir.join(entry);
+            if candidate.exists() {
+                self.run_ex_command(&format!("source {}", candidate.display()));
+                return;
+            }
+        }
+        self.message = format!("plugin '{}': no init.lua or init.vim in {}", p.name, dir.display());
+    }
+
+    /// Fire an autocommand event: run every matching `[[autocmd]]` from the
+    /// config, then notify Lua callbacks registered through the API.
+    ///
+    /// The file the event is *about* is the active buffer's label, which is what
+    /// the `pattern` field matches against.
+    pub fn fire_autocmd(&mut self, event: &str) {
+        let file = self.active_buffer().label.clone();
+        let matching: Vec<String> = self
+            .config
+            .autocmds
+            .iter()
+            .filter(|a| a.event.eq_ignore_ascii_case(event) && pattern_matches(&a.pattern, &file))
+            .map(|a| a.command.clone())
+            .collect();
+        for cmd in matching {
+            self.run_ex_command(&cmd);
+        }
+        self.engine.fire_autocmd(event, &file);
+
+        // A lazily-loaded plugin waiting on this event loads now, then is
+        // marked loaded so it doesn't source twice.
+        let pending: Vec<crate::config::PluginEntry> = self
+            .config
+            .plugins
+            .iter()
+            .filter(|p| {
+                p.enabled && p.event.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(event))
+            })
+            .cloned()
+            .collect();
+        for p in pending {
+            self.load_plugin(&p);
+            if let Some(slot) = self.config.plugins.iter_mut().find(|q| q.name == p.name) {
+                slot.event = None;
+                slot.enabled = false;
+            }
+        }
+    }
+
     /// Run an Ex command through the engine, exactly as if it were typed on the
     /// `:` command line. Keeps the engine authoritative over what commands do
     /// (and what unknown ones report) — the palette is only a nicer entry point.
@@ -919,9 +1015,11 @@ impl App {
         if idx == self.active || idx >= self.buffers.len() {
             return;
         }
+        self.fire_autocmd("BufLeave");
         self.snapshot_active();
         self.active = idx;
         self.load_active_into_engine();
+        self.fire_autocmd("BufEnter");
     }
 
     /// Save the engine's current text (and dirty state) back into the active
@@ -1208,7 +1306,7 @@ impl App {
     /// [`App::poll_jobs`]).
     fn host_run_shell(&mut self, command: String) {
         let root = self.root.clone();
-        let shell = self.config.shell.clone();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string());
         let jobs = match self.jobs_mut() {
             Some(jobs) => jobs,
             None => {
@@ -1548,6 +1646,9 @@ impl App {
             self.message = "E382: Cannot write, no file for this buffer".into();
             return false;
         }
+        // `BufWritePre` runs before the text is captured, so a formatter
+        // autocmd's edits are part of what gets written.
+        self.fire_autocmd("BufWritePre");
         // Sync the engine's live text into the buffer cache, then persist it.
         self.snapshot_active();
         let Some(path) = self.buffers[self.active].path.clone() else {
@@ -1561,6 +1662,7 @@ impl App {
             Ok(()) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.message = format!("\"{name}\" {}L written", self.buffers[self.active].text.len());
+                self.fire_autocmd("BufWritePost");
                 true
             }
             Err(e) => {
@@ -2473,17 +2575,31 @@ fn sanitize_for_display(line: &str) -> String {
     out
 }
 
+/// Very small glob matcher: `*` matches any suffix, a leading `*.ext` matches by
+/// extension, otherwise exact match. Full Vim pattern matching is deferred.
+fn pattern_matches(pattern: &str, file: &str) -> bool {
+    if pattern == "*" || pattern.is_empty() {
+        return true;
+    }
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        return file.rsplit('.').next() == Some(ext);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return file.starts_with(prefix);
+    }
+    pattern == file
+}
+
 /// Run each `config.toml`-declared plugin once at startup, in order, over the
 /// same Lua path as `:luafile` (see `host_source`). A broken script doesn't
 /// stop the rest from loading; the first failure becomes the startup status
 /// message (empty if everything loaded cleanly).
-fn load_startup_plugins(engine: &mut Ctrlvim, plugins: &[PathBuf]) -> String {
+fn load_startup_plugins(engine: &mut Ctrlvim, plugins: &[PluginEntry]) -> String {
     let mut message = String::new();
-    for path in plugins {
-        // The file stem (e.g. "hello" from "hello.lua") tags any commands
-        // the script registers, so the palette can attribute them to it.
+    for p in plugins {
+        let path = PathBuf::from(expand_tilde(&p.path));
         let source = path.file_stem().and_then(|s| s.to_str());
-        let result = std::fs::read_to_string(path)
+        let result = std::fs::read_to_string(&path)
             .map_err(|e| format!("E484: Can't open file {}: {e}", path.display()))
             .and_then(|contents| {
                 engine.run_lua_as(source, &contents).map_err(|e| format!("E5108: {} ({})", first_line(&e), path.display()))
@@ -2593,7 +2709,8 @@ mod startup_plugin_tests {
         let path = example_plugin_path();
         assert!(path.is_file(), "missing example plugin at {}", path.display());
 
-        let message = load_startup_plugins(&mut engine, std::slice::from_ref(&path));
+        let entry = PluginEntry { name: "hello".into(), path: path.to_string_lossy().into(), event: None, enabled: true };
+        let message = load_startup_plugins(&mut engine, &[entry]);
         assert!(message.is_empty(), "unexpected startup error: {message}");
 
         // The plugin's global should now be callable, proving the file actually ran.
@@ -2605,8 +2722,9 @@ mod startup_plugin_tests {
     #[test]
     fn a_missing_plugin_reports_the_first_failure_but_does_not_stop_the_rest() {
         let mut engine = Ctrlvim::new();
-        let missing = PathBuf::from("/nonexistent/ctrlvim-plugin-does-not-exist.lua");
-        let good = example_plugin_path();
+        let missing = PluginEntry { name: "missing".into(), path: "/nonexistent/ctrlvim-plugin-does-not-exist.lua".into(), event: None, enabled: true };
+        let good_path = example_plugin_path();
+        let good = PluginEntry { name: "hello".into(), path: good_path.to_string_lossy().into(), event: None, enabled: true };
 
         let message = load_startup_plugins(&mut engine, &[missing, good]);
         assert!(message.starts_with("E484"), "message: {message}");

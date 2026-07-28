@@ -11,6 +11,7 @@ pub mod editor;
 pub mod ex;
 pub mod fold;
 pub mod input;
+pub mod jumps;
 pub mod keymap;
 pub mod mode;
 pub mod motion;

@@ -8,23 +8,70 @@
 use crate::editor::Editor;
 use crate::ex::{parse_ex, ExEffect, ExParsed, QuickfixCmd, TagCmd};
 use crate::input::Key;
-use crate::keymap::{Keymap, KeymapMatch};
+use crate::jumps::Jump;
+use crate::keymap::{Keymap, KeymapMatch, MapMode};
 use crate::mode::{Mode, Selection, VisualKind};
 use crate::motion::{self, MotionKind, MotionResult};
 use crate::operator::{apply_operator, Operator, OperatorSpan};
 use crate::range::{self, Addr, Address, RangeSpec};
 use crate::textobject;
-use ctrlvim_text::{MotionType, YankReg};
+use ctrlvim_text::{Gravity, MotionType, YankReg, NS_LEGACY_MARKS};
 use ctrlvim_types::Position;
-use crate::pattern::{compile as compile_pattern, compile_opts as compile_pattern_opts};
+use crate::pattern::{compile_with as compile_pattern_with, line_context, Replacement};
 // `:s` and the project-wide replace panel must translate replacements the same
 // way, so both use the one in `replace`.
-use crate::replace::vim_replacement;
+use ctrlvim_regex::Offset;
+
+/// The last `/` or `?`: the pattern, the direction, and the offset.
+///
+/// The offset rides along because `n` and `N` repeat it — `/foo/e` then `n`
+/// lands on the end of the next match, not its start.
+#[derive(Debug, Clone)]
+struct LastSearch {
+    pattern: String,
+    forward: bool,
+    offset: Offset,
+}
+
+/// One search match. The end column is kept because `/pat/e` needs it.
+#[derive(Debug, Clone, Copy)]
+struct SearchHit {
+    pos: Position,
+    end_col: usize,
+}
+
+/// Split a search command line into its pattern and its offset.
+///
+/// The pattern ends at the first *unescaped* delimiter; everything after it is
+/// the offset spec. A command line with no closing delimiter is all pattern,
+/// which is the common case (`/foo`).
+fn split_search_offset(input: &str, delim: char) -> (String, Offset) {
+    let mut pattern = String::new();
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            pattern.push(c);
+            if let Some(next) = chars.next() {
+                pattern.push(next);
+            }
+            continue;
+        }
+        if c == delim {
+            return (pattern, Offset::parse(chars.as_str()));
+        }
+        pattern.push(c);
+    }
+    (pattern, Offset::None)
+}
 
 /// Pending command-accumulation state (`cmdarg_T`/`oparg_T` in C).
 #[derive(Default)]
 struct Pending {
     count: Option<usize>,
+    /// The count typed *before* an operator (`2` in `2d3w`), moved here when the
+    /// operator is accepted so a second count can accumulate independently.
+    /// Vim multiplies the two: `2d3w` deletes six words, not twenty-three.
+    op_count: Option<usize>,
     register: Option<char>,
     operator: Option<Operator>,
     /// True after `g` was pressed (awaiting the second char of `gg`/`g-`/`g+`).
@@ -41,14 +88,53 @@ struct Pending {
     await_replace: bool,
     /// After an operator + `i`/`a`: `around`, awaiting the object char.
     await_textobject: Option<bool>,
+    /// After `m`/`` ` ``/`'`: what to do with the mark char that follows.
+    await_mark: Option<MarkAction>,
+    /// After `q`/`@`: what to do with the register name that follows.
+    await_macro: Option<MacroAction>,
+}
+
+/// What the character following `q`/`@` is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacroAction {
+    /// `q{reg}` — start recording into that register.
+    Record,
+    /// `@{reg}` — replay that register.
+    Play,
+}
+
+/// What the character following `m`/`` ` ``/`'` is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkAction {
+    /// `m{c}` — set the mark at the cursor.
+    Set,
+    /// `` `{c} `` — jump to the mark's exact position (charwise-exclusive).
+    JumpExact,
+    /// `'{c}` — jump to the first non-blank of the mark's line (linewise).
+    JumpLine,
 }
 
 impl Pending {
     fn clear(&mut self) {
         *self = Pending::default();
     }
+    /// The effective repeat count: the operator count times the motion count
+    /// (Vim's `{count}op{count}motion` rule), defaulting each to 1.
+    ///
+    /// Note this is a *multiplier*. Motions whose count is an address rather
+    /// than a repeat — `G`, `gg`, `gt` — read [`Pending::count`] directly.
     fn count_or(&self, default: usize) -> usize {
-        self.count.unwrap_or(default)
+        match (self.op_count, self.count) {
+            (None, None) => default,
+            (a, b) => a.unwrap_or(1).saturating_mul(b.unwrap_or(1)),
+        }
+    }
+
+    /// Accept an operator, banking any count typed before it so a second count
+    /// can be accumulated for the motion.
+    fn begin_operator(&mut self, op: Operator) {
+        self.op_count = self.count.take();
+        self.operator = Some(op);
     }
 }
 
@@ -72,8 +158,8 @@ pub struct Session {
     insert_start: Option<Position>,
     /// Last `f`/`F`/`t`/`T`: `(target, forward, till)`, for `;`/`,`.
     last_find: Option<(char, bool, bool)>,
-    /// Last `/`/`?` search: `(pattern, forward)`, for `n`/`N` and `:s//`.
-    last_search: Option<(String, bool)>,
+    /// Last `/`/`?` search, for `n`/`N` and `:s//`.
+    last_search: Option<LastSearch>,
     /// Last `:s` `(pattern, replacement, flags)`, for a bare `:s` repeat.
     last_subst: Option<(String, String, String)>,
     /// User commands (`:command Name expansion`), keyed by name.
@@ -89,7 +175,19 @@ pub struct Session {
     dot_replaying: bool,
     cmd_first: Option<Key>,
     change_tick_at_start: u64,
+    /// `q{reg}`: the register being recorded into, and the keys captured so far.
+    /// Macros live in the ordinary registers, so `qa` overwrites register `a`.
+    macro_recording: Option<(char, Vec<Key>)>,
+    /// Register replayed by the last `@`, so `@@` can repeat it.
+    last_macro: Option<char>,
+    /// Nesting depth while replaying, so a macro that invokes itself hits a
+    /// bound instead of hanging the editor.
+    macro_depth: u32,
 }
+
+/// How deep `@` replays may nest before we refuse to go further. Vim relies on
+/// `'maxfuncdepth'`; this is the same idea with a fixed ceiling.
+const MAX_MACRO_DEPTH: u32 = 64;
 
 impl Session {
     pub fn new() -> Self {
@@ -119,6 +217,9 @@ impl Session {
             dot_replaying: false,
             cmd_first: None,
             change_tick_at_start: 0,
+            macro_recording: None,
+            last_macro: None,
+            macro_depth: 0,
         }
     }
 
@@ -148,6 +249,14 @@ impl Session {
         }
         if record {
             self.recording.push(key);
+        }
+        // Capture into an active `q` recording. Mapping expansions and `.`
+        // replays are excluded for the same reason as dot-repeat: the macro
+        // should hold what the user typed, not what it expanded to.
+        if record {
+            if let Some((_, keys)) = self.macro_recording.as_mut() {
+                keys.push(key);
+            }
         }
 
         let ticks_before = self.editor.cur_buffer().changedtick;
@@ -221,6 +330,31 @@ impl Session {
             return;
         }
 
+        // `m{c}` / `` `{c} `` / `'{c}` — the mark char that follows. This has to
+        // be consumed before the operator-pending block below, or `d'a` would
+        // be swallowed by that block's `a`-starts-a-text-object rule.
+        if let Some(action) = self.pending.await_mark.take() {
+            if let Key::Char(c) = key {
+                self.handle_mark(action, c);
+            } else {
+                self.pending.clear();
+            }
+            return;
+        }
+
+        // `q{reg}` / `@{reg}` — the register name that follows.
+        if let Some(action) = self.pending.await_macro.take() {
+            if let Key::Char(c) = key {
+                match action {
+                    MacroAction::Record => self.start_recording(c),
+                    MacroAction::Play => self.play_macro(c),
+                }
+            } else {
+                self.pending.clear();
+            }
+            return;
+        }
+
         // Doubled case operator (`guu`/`gUU`/`g~~`) → linewise over `count`.
         if let Some(op) = self.pending.operator {
             let doubled = matches!(
@@ -287,6 +421,23 @@ impl Session {
             Key::Char('"') => {
                 self.pending.await_register = true;
             }
+            // Macros: `q{reg}` records (a second `q` stops), `@{reg}` replays.
+            Key::Char('q') => {
+                if self.macro_recording.is_some() {
+                    self.stop_recording();
+                } else {
+                    self.pending.await_macro = Some(MacroAction::Record);
+                }
+            }
+            Key::Char('@') => self.pending.await_macro = Some(MacroAction::Play),
+            // Marks: set (`m`), jump exact (`` ` ``), jump linewise (`'`).
+            Key::Char('m') => self.pending.await_mark = Some(MarkAction::Set),
+            Key::Char('`') => self.pending.await_mark = Some(MarkAction::JumpExact),
+            Key::Char('\'') => self.pending.await_mark = Some(MarkAction::JumpLine),
+            // Jumplist traversal. `<C-i>` and Tab are the same key in a
+            // terminal, which is why Vim treats them as one command.
+            Key::Ctrl('o') => self.jump_history(false),
+            Key::Ctrl('i') | Key::Tab => self.jump_history(true),
             // Count accumulation. A leading 0 is the `0` motion, not a count.
             Key::Char(c @ '1'..='9') => {
                 let d = c.to_digit(10).unwrap() as usize;
@@ -400,18 +551,31 @@ impl Session {
             && self.pending.await_find.is_none()
             && !self.pending.await_replace
             && self.pending.await_textobject.is_none()
+            && self.pending.await_mark.is_none()
+            && self.pending.await_macro.is_none()
     }
 
     /// Feed `key` into the mapping matcher. Returns `true` when the key was
     /// consumed by the mapping layer (buffered, expanded, or replayed here).
     fn consult_keymap(&mut self, key: Key) -> bool {
+        // Mappings are per-mode; cmdline entry deliberately has none, so a
+        // `<leader>` chord can't fire while typing a `:` command.
+        let mode = match &self.mode {
+            Mode::Normal => MapMode::Normal,
+            Mode::Insert => MapMode::Insert,
+            Mode::Visual { .. } => MapMode::Visual,
+            Mode::Cmdline { .. } => return false,
+        };
         // Only start buffering from a clean state, and only if `key` could
-        // actually begin a mapping.
-        if self.map_pending.is_empty() && (!self.map_ready() || !self.keymap.can_start_normal(key)) {
+        // actually begin a mapping. `map_ready` guards the half-typed
+        // normal-mode commands (counts, operators); other modes have no such
+        // pending state to protect.
+        let ready = mode != MapMode::Normal || self.map_ready();
+        if self.map_pending.is_empty() && (!ready || !self.keymap.can_start(mode, key)) {
             return false;
         }
         self.map_pending.push(key);
-        match self.keymap.match_normal(&self.map_pending) {
+        match self.keymap.match_mode(mode, &self.map_pending) {
             KeymapMatch::Full(rhs) => {
                 self.map_pending.clear();
                 self.replay(rhs);
@@ -439,14 +603,24 @@ impl Session {
     /// `<C-w>{cmd}` window management: `s` split, `v` vsplit, `w` cycle,
     /// `q`/`c` close.
     fn handle_window_command(&mut self, key: Key) {
+        use crate::editor::Dir;
         match key {
-            Key::Char('s') => {
-                self.editor.split_current(false);
-            }
-            Key::Char('v') => {
-                self.editor.split_current(true);
-            }
+            Key::Char('s') | Key::Char('S') => self.split_window(false),
+            Key::Char('v') => self.split_window(true),
             Key::Char('w') => self.editor.focus_next(),
+            Key::Char('h') => {
+                self.editor.focus_dir(Dir::Left);
+            }
+            Key::Char('j') => {
+                self.editor.focus_dir(Dir::Down);
+            }
+            Key::Char('k') => {
+                self.editor.focus_dir(Dir::Up);
+            }
+            Key::Char('l') => {
+                self.editor.focus_dir(Dir::Right);
+            }
+            Key::Char('o') => self.editor.only_current_window(),
             Key::Char('q') | Key::Char('c') => {
                 let cur = self.editor.current_window_id();
                 self.editor.close_window(cur);
@@ -456,10 +630,26 @@ impl Session {
         self.pending.clear();
     }
 
+    /// Split the current window, honoring `'splitbelow'`/`'splitright'` and
+    /// focusing the new window as Vim does. Shared by `<C-w>s`/`<C-w>v` and
+    /// `:split`/`:vsplit`.
+    fn split_window(&mut self, vertical: bool) {
+        let before = if vertical {
+            !self.editor.options().splitright()
+        } else {
+            !self.editor.options().splitbelow()
+        };
+        let new_id = self.editor.split_current_placed(vertical, before);
+        self.editor.focus_window(new_id);
+    }
+
     fn handle_g_command(&mut self, key: Key) {
         match key {
             Key::Char('g') => {
                 let m = motion::goto_line_first(&self.editor.cur_buffer().text, self.pending.count);
+                if self.pending.operator.is_none() {
+                    self.record_jump();
+                }
                 self.apply_motion_or_operator(m);
             }
             // `gt`/`gT` switch tabs (`{count}gt` jumps to tab N). Emitted as a
@@ -477,9 +667,9 @@ impl Session {
                 self.pending.clear();
             }
             // Case operators await a motion (`guw`) or double (`guu`).
-            Key::Char('u') => self.pending.operator = Some(Operator::Lower),
-            Key::Char('U') => self.pending.operator = Some(Operator::Upper),
-            Key::Char('~') => self.pending.operator = Some(Operator::ToggleCase),
+            Key::Char('u') => self.pending.begin_operator(Operator::Lower),
+            Key::Char('U') => self.pending.begin_operator(Operator::Upper),
+            Key::Char('~') => self.pending.begin_operator(Operator::ToggleCase),
             Key::Char('-') => self.undo_time(),
             Key::Char('+') => self.redo_time(),
             _ => self.pending.clear(),
@@ -517,6 +707,12 @@ impl Session {
 
     fn motion_key(&mut self, key: Key) {
         if let Some(m) = self.resolve_motion(key) {
+            // Vim records a jumplist entry for "far" motions only, and only
+            // when they actually move the cursor rather than feed an operator.
+            let is_jump = matches!(key, Key::Char('G') | Key::Char('{') | Key::Char('}'));
+            if is_jump && self.pending.operator.is_none() {
+                self.record_jump();
+            }
             self.apply_motion_or_operator(m);
         } else {
             // Unknown command: reset pending state.
@@ -574,7 +770,174 @@ impl Session {
             return;
         }
         let _ = ch;
-        self.pending.operator = Some(op);
+        self.pending.begin_operator(op);
+    }
+
+    /// `q{reg}` — begin recording keystrokes into a register.
+    fn start_recording(&mut self, reg: char) {
+        if !reg.is_ascii_alphanumeric() {
+            self.pending.clear();
+            return;
+        }
+        self.macro_recording = Some((reg, Vec::new()));
+        self.pending.clear();
+    }
+
+    /// `q` while recording — stop and store the macro in its register.
+    fn stop_recording(&mut self) {
+        let Some((reg, mut keys)) = self.macro_recording.take() else {
+            return;
+        };
+        // The `q` that ended the recording was itself captured; drop it.
+        keys.pop();
+        let text: String = keys.iter().map(|k| k.notation()).collect();
+        self.editor
+            .registers
+            .write(reg, YankReg::new(vec![text], MotionType::Char));
+        self.pending.clear();
+    }
+
+    /// `@{reg}` — replay a register's contents as keystrokes. `@@` repeats the
+    /// last replayed register.
+    fn play_macro(&mut self, reg: char) {
+        let reg = if reg == '@' {
+            match self.last_macro {
+                Some(r) => r,
+                None => {
+                    self.effects
+                        .push(ExEffect::Message("E748: No previously used register".into()));
+                    self.pending.clear();
+                    return;
+                }
+            }
+        } else {
+            reg
+        };
+        let count = self.pending.count_or(1);
+        self.pending.clear();
+
+        if self.macro_depth >= MAX_MACRO_DEPTH {
+            self.effects
+                .push(ExEffect::Message("E169: Command too recursive".into()));
+            return;
+        }
+        let Some(text) = self
+            .editor
+            .registers
+            .read(reg)
+            .map(|r| r.lines.join("\n"))
+        else {
+            return;
+        };
+        self.last_macro = Some(reg);
+
+        let keys = Key::parse_sequence(&text);
+        self.macro_depth += 1;
+        for _ in 0..count {
+            for key in &keys {
+                self.feed(*key);
+            }
+        }
+        self.macro_depth -= 1;
+    }
+
+    /// Record the cursor's current position on the jumplist, so `<C-o>` can
+    /// come back to it. Called *before* any far motion (`G`, `gg`, a search, a
+    /// mark jump, `:{line}`) — exactly the set Vim treats as a jump.
+    fn record_jump(&mut self) {
+        let jump = Jump::new(self.editor.current_buffer_id(), self.editor.cursor());
+        self.editor.cur_window_mut().jumps.push(jump);
+    }
+
+    /// `<C-o>` / `<C-i>` — walk back and forward through the jumplist.
+    fn jump_history(&mut self, forward: bool) {
+        let here = Jump::new(self.editor.current_buffer_id(), self.editor.cursor());
+        let target = {
+            let jumps = &mut self.editor.cur_window_mut().jumps;
+            if forward {
+                jumps.forward()
+            } else {
+                jumps.back(here)
+            }
+        };
+        if let Some(j) = target {
+            // Only same-buffer jumps can be honored entirely in the engine;
+            // crossing files needs the host to open the buffer first.
+            if j.buffer == self.editor.current_buffer_id() {
+                self.editor.set_cursor(j.pos);
+            }
+        }
+        self.pending.clear();
+    }
+
+    /// Look up a named mark in the current buffer.
+    fn mark_position(&self, c: char) -> Option<Position> {
+        // `'<`/`'>` come from the last visual selection rather than the store.
+        match c {
+            '<' => return self.last_visual.map(|(s, _)| s),
+            '>' => return self.last_visual.map(|(_, e)| e),
+            _ => {}
+        }
+        self.editor
+            .cur_buffer()
+            .marks
+            .get(NS_LEGACY_MARKS, c as u32)
+    }
+
+    /// `m{c}` sets a mark; `` `{c} `` and `'{c}` jump to one. The jump forms are
+    /// motions, so they compose with a pending operator (`d'a`, `y\`b`).
+    fn handle_mark(&mut self, action: MarkAction, c: char) {
+        match action {
+            MarkAction::Set => {
+                // Only letters are user-settable; `'<`/`'>` and friends are
+                // maintained by the editor itself.
+                if c.is_ascii_alphabetic() {
+                    let pos = self.editor.cursor();
+                    self.editor.cur_buffer_mut().marks.set(
+                        NS_LEGACY_MARKS,
+                        c as u32,
+                        pos,
+                        Gravity::Right,
+                    );
+                }
+                self.pending.clear();
+            }
+            MarkAction::JumpExact | MarkAction::JumpLine => {
+                let Some(pos) = self.mark_position(c) else {
+                    // E20: no such mark. Leave the cursor alone.
+                    self.effects
+                        .push(ExEffect::Message("E20: Mark not set".into()));
+                    self.pending.clear();
+                    return;
+                };
+                // Only a bare jump is a jumplist entry; as an operator target
+                // (`d'a`) nothing moves, so nothing is recorded.
+                let has_operator = self.pending.operator.is_some();
+                if !has_operator {
+                    self.record_jump();
+                }
+                if action == MarkAction::JumpExact {
+                    let m = MotionResult { target: pos, kind: MotionKind::CharExclusive };
+                    self.apply_motion_or_operator(m);
+                    return;
+                }
+                let text = &self.editor.cur_buffer().text;
+                let line = pos.line.min(text.line_count().saturating_sub(1));
+                let target = motion::first_non_blank(text, Position::new(line, 0)).target;
+                if has_operator {
+                    // As an operator target `'a` sweeps whole lines.
+                    self.apply_motion_or_operator(MotionResult {
+                        target,
+                        kind: MotionKind::Linewise,
+                    });
+                } else {
+                    // As a movement it lands *on* the first non-blank, rather
+                    // than keeping the current column the way `j`/`k` do.
+                    self.editor.set_cursor(target);
+                    self.pending.clear();
+                }
+            }
+        }
     }
 
     /// `f{c}`/`t{c}` (and backward variants): resolve the target char into a
@@ -781,6 +1144,11 @@ impl Session {
     // --- Insert mode ---
 
     fn feed_insert(&mut self, key: Key) {
+        // Insert-mode mappings (`jk` → `<Esc>` and friends) get first refusal,
+        // exactly as in Normal mode.
+        if self.no_remap == 0 && self.consult_keymap(key) {
+            return;
+        }
         match key {
             Key::Esc => {
                 // Commit one undo step for the whole insertion, move cursor left.
@@ -1013,10 +1381,19 @@ impl Session {
             return;
         }
 
+        if self.run_window_command(&name, &arg) {
+            return;
+        }
+
+        if self.run_listing_command(&name) {
+            return;
+        }
+
         // Non-range commands (file/quit/buffer/options/…).
         match parse_ex(&rest) {
             ExParsed::GotoLine(line) => {
                 let target = line.saturating_sub(1).min(self.editor.cur_buffer().text.line_count() - 1);
+                self.record_jump();
                 self.editor.set_cursor(Position::new(target, 0));
             }
             ExParsed::GotoLast => {
@@ -1033,8 +1410,14 @@ impl Session {
                     self.redo();
                 }
             }
-            ExParsed::Set(items) => self.apply_set(items),
-            ExParsed::Map { lhs, rhs } => self.keymap.set_normal(&lhs, &rhs),
+            ExParsed::Set { scope, items } => self.apply_set(scope, items),
+            ExParsed::Map { mode, lhs, rhs } => self.keymap.set(mode, &lhs, &rhs),
+            ExParsed::Unmap { mode, lhs } => {
+                if !self.keymap.remove(mode, &lhs) {
+                    self.effects
+                        .push(ExEffect::Message(format!("E31: No such mapping: {lhs}")));
+                }
+            }
             ExParsed::DefineCommand { name, repl } => {
                 self.user_commands.insert(name, repl);
             }
@@ -1057,6 +1440,99 @@ impl Session {
     /// Navigation happens here because the engine owns the list; the resulting
     /// jump, and anything needing the filesystem or a process, goes out as an
     /// [`ExEffect::Quickfix`] for the host.
+    /// Introspection commands over engine-owned state (`:marks`, `:jumps`,
+    /// `:registers`). Each renders a listing and hands it to the host as a
+    /// message; the engine owns the data, the host owns the display.
+    fn run_listing_command(&mut self, name: &str) -> bool {
+        let msg = match name {
+            "marks" => {
+                let mut rows: Vec<(char, Position)> = self
+                    .editor
+                    .cur_buffer()
+                    .marks
+                    .all_in(NS_LEGACY_MARKS)
+                    .into_iter()
+                    .filter_map(|(id, pos)| char::from_u32(id).map(|c| (c, pos)))
+                    .collect();
+                rows.sort_by_key(|(c, _)| *c);
+                if rows.is_empty() {
+                    "No marks set".to_string()
+                } else {
+                    let body = rows
+                        .iter()
+                        .map(|(c, p)| format!(" {c}  {:>5}  {:>3}", p.line + 1, p.col))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("mark line  col\n{body}")
+                }
+            }
+            "jumps" => {
+                let jumps = &self.editor.cur_window().jumps;
+                if jumps.is_empty() {
+                    "No jumps".to_string()
+                } else {
+                    let cur = jumps.current_index();
+                    let body = jumps
+                        .entries()
+                        .iter()
+                        .enumerate()
+                        .map(|(i, j)| {
+                            let marker = if i == cur { '>' } else { ' ' };
+                            format!("{marker} {:>4}  {:>3}", j.pos.line + 1, j.pos.col)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(" jump line  col\n{body}")
+                }
+            }
+            "registers" | "reg" | "display" => {
+                let mut rows = self.editor.registers.list();
+                rows.sort_by_key(|(c, _)| *c);
+                if rows.is_empty() {
+                    "No registers".to_string()
+                } else {
+                    let body = rows
+                        .iter()
+                        .map(|(c, text)| {
+                            // Registers can hold newlines; show them escaped so
+                            // the listing stays one row per register.
+                            format!("\"{c}   {}", text.replace('\n', "^J"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("Type Name Content\n{body}")
+                }
+            }
+            _ => return false,
+        };
+        self.queue_effect(ExEffect::Message(msg));
+        true
+    }
+
+    /// Window-splitting Ex commands. These stay engine-side because the layout
+    /// tree is engine state; only opening a *file* into the split is a host
+    /// effect, which is queued separately.
+    fn run_window_command(&mut self, name: &str, arg: &str) -> bool {
+        let vertical = match name {
+            "sp" | "spl" | "spli" | "split" => false,
+            "vs" | "vsp" | "vspl" | "vsplit" => true,
+            "winc" | "wincmd" => {
+                // `:wincmd {key}` is the Ex spelling of `<C-w>{key}`.
+                if let Some(c) = arg.trim().chars().next() {
+                    self.handle_window_command(Key::Char(c));
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        self.split_window(vertical);
+        // `:split {file}` opens that file in the new window.
+        if !arg.trim().is_empty() {
+            self.queue_effect(ExEffect::Edit(arg.trim().to_string()));
+        }
+        true
+    }
+
     fn run_quickfix_command(&mut self, name: &str, arg: &str) -> bool {
         let count = arg.trim().parse::<usize>().ok();
         match name {
@@ -1355,7 +1831,7 @@ impl Session {
         match key {
             // `zf{motion}` — the motion decides the range, so this waits.
             Key::Char('f') => {
-                self.pending.operator = Some(Operator::Fold);
+                self.pending.begin_operator(Operator::Fold);
                 return true;
             }
             Key::Char('a') => {
@@ -1549,8 +2025,9 @@ impl Session {
             Addr::Line(n) => n.saturating_sub(1),
             Addr::Mark('<') => self.last_visual?.0.line,
             Addr::Mark('>') => self.last_visual?.1.line,
-            Addr::Mark(_) => return None,
-            Addr::Search { pattern, forward } => self.find_match(pattern, *forward)?.line,
+            // Named marks are addressable too: `:'a,'bd` deletes between them.
+            Addr::Mark(c) => self.mark_position(*c)?.line,
+            Addr::Search { pattern, forward } => self.find_match(pattern, *forward)?.pos.line,
         };
         Some((base as i64 + a.offset).clamp(0, last as i64) as usize)
     }
@@ -1587,50 +2064,92 @@ impl Session {
     // --- search ---
 
     /// Run a `/`/`?` search: remember the pattern and jump to the next match.
-    fn do_search(&mut self, pattern: &str, forward: bool) {
+    ///
+    /// `input` is the whole command line, so it may carry an offset
+    /// (`/foo/e+1`). An empty pattern reuses the last one but takes the *new*
+    /// offset, which is how `//e` re-runs the previous search landing on the
+    /// match's end.
+    fn do_search(&mut self, input: &str, forward: bool) {
+        let delim = if forward { '/' } else { '?' };
+        let (pattern, offset) = split_search_offset(input, delim);
         let pattern = if pattern.is_empty() {
             match &self.last_search {
-                Some((p, _)) => p.clone(),
+                Some(s) => s.pattern.clone(),
                 None => return,
             }
         } else {
-            pattern.to_string()
+            pattern
         };
-        self.last_search = Some((pattern.clone(), forward));
+        self.last_search = Some(LastSearch { pattern, forward, offset });
         self.search_highlight = true;
-        self.jump_to_search(&pattern, forward);
+        self.jump_to_search(forward);
     }
 
     /// `n` (same direction) / `N` (reversed) — repeat the last search.
     fn search_next(&mut self, same_dir: bool) {
-        let Some((pattern, fwd)) = self.last_search.clone() else { return };
-        let forward = if same_dir { fwd } else { !fwd };
+        let Some(last) = self.last_search.clone() else { return };
+        let forward = if same_dir { last.forward } else { !last.forward };
         self.search_highlight = true;
-        self.jump_to_search(&pattern, forward);
+        self.jump_to_search(forward);
     }
 
-    /// Move the cursor to the next match of `pattern` from the cursor, wrapping.
-    fn jump_to_search(&mut self, pattern: &str, forward: bool) {
-        if let Some(pos) = self.find_match(pattern, forward) {
-            self.editor.set_cursor(pos);
-        } else {
-            self.effects.push(ExEffect::Message(format!("E486: Pattern not found: {pattern}")));
+    /// Move the cursor to the next match of the last pattern, wrapping.
+    fn jump_to_search(&mut self, forward: bool) {
+        let Some(last) = self.last_search.clone() else { return };
+        let Some(hit) = self.find_match(&last.pattern, forward) else {
+            let p = &last.pattern;
+            self.effects.push(ExEffect::Message(format!("E486: Pattern not found: {p}")));
+            return;
+        };
+        // A search is a jump: `<C-o>` returns to where it was launched.
+        self.record_jump();
+        self.editor.set_cursor(self.offset_target(hit, last.offset));
+    }
+
+    /// Where an offset puts the cursor for a given match.
+    ///
+    /// A line offset moves whole lines and then to the first non-blank, exactly
+    /// as `:h search-offset` describes; the character offsets stay on the
+    /// match's own line and are clamped to it.
+    fn offset_target(&self, hit: SearchHit, offset: Offset) -> Position {
+        let text = &self.editor.cur_buffer().text;
+        let last_line = text.line_count().saturating_sub(1);
+        match offset.apply(hit.pos.col, hit.end_col) {
+            Some(col) => {
+                let line_len = text.line(hit.pos.line).unwrap_or_default().chars().count();
+                Position::new(hit.pos.line, col.min(line_len.saturating_sub(1)))
+            }
+            None => {
+                let Offset::Line(n) = offset else { return hit.pos };
+                let line = if n >= 0 {
+                    hit.pos.line.saturating_add(n as usize).min(last_line)
+                } else {
+                    hit.pos.line.saturating_sub(n.unsigned_abs())
+                };
+                let s = text.line(line).unwrap_or_default();
+                let col = s.chars().take_while(|c| c.is_whitespace()).count();
+                Position::new(line, col)
+            }
         }
     }
 
     /// Find the next/previous match of a Vim `pattern` from the cursor (with
-    /// wrap-around). Returns the match's start position.
-    fn find_match(&self, pattern: &str, forward: bool) -> Option<Position> {
-        let re = compile_pattern(pattern).ok()?;
+    /// wrap-around).
+    fn find_match(&self, pattern: &str, forward: bool) -> Option<SearchHit> {
+        let re = compile_pattern_with(pattern, &self.editor.global_options, false).ok()?;
         let text = &self.editor.cur_buffer().text;
         let n = text.line_count();
         let cur = self.editor.cursor();
-        // All match start positions, in buffer order.
-        let mut matches: Vec<Position> = Vec::new();
+        let tabstop = self.editor.global_options.tabstop;
+        // All matches, in buffer order.
+        let mut matches: Vec<SearchHit> = Vec::new();
         for line in 0..n {
             let s = text.line(line).unwrap_or_default();
-            for m in re.find_iter(&s) {
-                matches.push(Position::new(line, m.start()));
+            for m in re.find_iter_ctx(&s, line_context(line, n, tabstop)) {
+                matches.push(SearchHit {
+                    pos: Position::new(line, m.start_char()),
+                    end_col: m.end_char(),
+                });
             }
         }
         if matches.is_empty() {
@@ -1639,14 +2158,14 @@ impl Session {
         if forward {
             matches
                 .iter()
-                .find(|p| **p > cur)
+                .find(|h| h.pos > cur)
                 .or_else(|| matches.first())
                 .copied()
         } else {
             matches
                 .iter()
                 .rev()
-                .find(|p| **p < cur)
+                .find(|h| h.pos < cur)
                 .or_else(|| matches.last())
                 .copied()
         }
@@ -1659,16 +2178,16 @@ impl Session {
         if !self.search_highlight {
             return Vec::new();
         }
-        let Some((pattern, _)) = &self.last_search else { return Vec::new() };
-        let Ok(re) = compile_pattern(pattern) else { return Vec::new() };
+        let Some(last) = &self.last_search else { return Vec::new() };
+        let Ok(re) = compile_pattern_with(&last.pattern, &self.editor.global_options, false) else {
+            return Vec::new();
+        };
+        let count = self.editor.cur_buffer().text.line_count();
         let Some(text) = self.editor.cur_buffer().text.line(line) else { return Vec::new() };
-        re.find_iter(&text)
-            .filter(|m| m.start() != m.end()) // skip empty matches
-            .map(|m| {
-                let start = text[..m.start()].chars().count();
-                let end = text[..m.end()].chars().count();
-                (start, end)
-            })
+        let ctx = line_context(line, count, self.editor.global_options.tabstop);
+        re.find_iter_ctx(&text, ctx)
+            .filter(|m| !m.is_empty()) // skip empty matches
+            .map(|m| (m.start_char(), m.end_char()))
             .collect()
     }
 
@@ -1685,30 +2204,38 @@ impl Session {
         };
         let pattern = if pat.is_empty() {
             match &self.last_search {
-                Some((p, _)) => p.clone(),
+                Some(s) => s.pattern.clone(),
                 None => return,
             }
         } else {
             pat.clone()
         };
-        self.last_search = Some((pattern.clone(), true));
+        // `~` in the replacement stands for the *previous* replacement, so it
+        // has to be read before `last_subst` is overwritten.
+        let prev_rep = self.last_subst.as_ref().map(|(_, r, _)| r.clone()).unwrap_or_default();
+        // A `:s` sets the search pattern but never inherits a search offset.
+        self.last_search =
+            Some(LastSearch { pattern: pattern.clone(), forward: true, offset: Offset::None });
         self.last_subst = Some((pattern.clone(), rep.clone(), flags.clone()));
 
-        let ignorecase = flags.contains('i');
+        let force_ic = flags.contains('i');
         let global = flags.contains('g');
-        let re = match compile_pattern_opts(&pattern, ignorecase) {
+        let re = match compile_pattern_with(&pattern, &self.editor.global_options, force_ic) {
             Ok(re) => re,
             Err(_) => {
                 self.effects.push(ExEffect::Message(format!("E486: Pattern error: {pattern}")));
                 return;
             }
         };
-        let replacement = vim_replacement(&rep);
+        let replacement = Replacement::parse(&rep, &prev_rep);
+        let limit = if global { usize::MAX } else { 1 };
 
         let (start, end) = range;
         let text = &self.editor.cur_buffer().text;
         let last = text.line_count().saturating_sub(1);
         let end = end.min(last);
+        let count = text.line_count();
+        let tabstop = self.editor.global_options.tabstop;
         let mut out: Vec<String> = Vec::new();
         let mut changed = 0usize;
         let mut last_hit = start;
@@ -1717,11 +2244,8 @@ impl Session {
             if re.is_match(&line) {
                 changed += 1;
                 last_hit = i;
-                let new = if global {
-                    re.replace_all(&line, replacement.as_str())
-                } else {
-                    re.replace(&line, replacement.as_str())
-                };
+                let ctx = line_context(i, count, tabstop);
+                let new = re.replace_n_ctx(&line, &replacement, limit, ctx);
                 for piece in new.split('\n') {
                     out.push(piece.to_string());
                 }
@@ -1748,7 +2272,7 @@ impl Session {
             None => return,
         };
         let cmd = if cmd.trim().is_empty() { "p".to_string() } else { cmd };
-        let re = match compile_pattern(&pattern) {
+        let re = match compile_pattern_with(&pattern, &self.editor.global_options, false) {
             Ok(re) => re,
             Err(_) => {
                 self.effects.push(ExEffect::Message(format!("E486: Pattern error: {pattern}")));
@@ -1983,25 +2507,91 @@ impl Session {
 
     /// Apply `:set` option changes to the editor's global options, reporting the
     /// first unknown option as an error message (like Neovim's `E518`).
-    fn apply_set(&mut self, items: Vec<crate::ex::SetItem>) {
+    fn apply_set(&mut self, scope: crate::ex::SetScope, items: Vec<crate::ex::SetItem>) {
         use crate::ex::SetItem;
         for item in items {
-            // Each arm re-borrows rather than holding `global_options` across
-            // the loop, since the fold options also touch window state.
-            let opts = &mut self.editor.global_options;
             match item {
-                SetItem::Number(v) => opts.number = v,
-                SetItem::Wrap(v) => opts.wrap = v,
-                SetItem::Expandtab(v) => opts.expandtab = v,
-                SetItem::Tabstop(n) => opts.tabstop = n.max(1),
-                SetItem::Shiftwidth(n) => opts.shiftwidth = n.max(0),
-                SetItem::Scrolloff(n) => opts.scrolloff = n.max(0),
-                SetItem::Foldcolumn(n) => opts.foldcolumn = n.clamp(0, 9),
-                SetItem::Foldenable(v) => {
-                    opts.foldenable = v;
+                // Window-local booleans.
+                SetItem::Number(op) => {
+                    let v = op.apply(self.editor.options().number());
+                    self.set_window_opt(scope, v, |g| &mut g.number, |w| &mut w.number);
+                }
+                SetItem::Relativenumber(op) => {
+                    let v = op.apply(self.editor.options().relativenumber());
+                    self.set_window_opt(
+                        scope,
+                        v,
+                        |g| &mut g.relativenumber,
+                        |w| &mut w.relativenumber,
+                    );
+                }
+                SetItem::Wrap(op) => {
+                    let v = op.apply(self.editor.options().wrap());
+                    self.set_window_opt(scope, v, |g| &mut g.wrap, |w| &mut w.wrap);
+                }
+                SetItem::Foldenable(op) => {
+                    let v = op.apply(self.editor.options().foldenable());
+                    self.set_window_opt(scope, v, |g| &mut g.foldenable, |w| &mut w.foldenable);
+                    // The window's live fold state tracks the resolved value.
                     self.folds_mut().enabled = v;
                 }
-                SetItem::Foldmethod(m) => opts.foldmethod = m,
+                // Buffer-local booleans.
+                SetItem::Expandtab(op) => {
+                    let v = op.apply(self.editor.options().expandtab());
+                    self.set_buffer_opt(scope, v, |g| &mut g.expandtab, |b| &mut b.expandtab);
+                }
+                SetItem::Autoindent(op) => {
+                    let v = op.apply(self.editor.options().autoindent());
+                    self.set_buffer_opt(scope, v, |g| &mut g.autoindent, |b| &mut b.autoindent);
+                }
+                // Global-only booleans. Vim treats `:setlocal` on a global
+                // option as writing the global, so scope is irrelevant here.
+                SetItem::Ignorecase(op) => {
+                    let g = &mut self.editor.global_options;
+                    g.ignorecase = op.apply(g.ignorecase);
+                }
+                SetItem::Smartcase(op) => {
+                    let g = &mut self.editor.global_options;
+                    g.smartcase = op.apply(g.smartcase);
+                }
+                SetItem::Hlsearch(op) => {
+                    let g = &mut self.editor.global_options;
+                    g.hlsearch = op.apply(g.hlsearch);
+                }
+                SetItem::Splitbelow(op) => {
+                    let g = &mut self.editor.global_options;
+                    g.splitbelow = op.apply(g.splitbelow);
+                }
+                SetItem::Splitright(op) => {
+                    let g = &mut self.editor.global_options;
+                    g.splitright = op.apply(g.splitright);
+                }
+                // Numeric / enum options.
+                SetItem::Tabstop(n) => {
+                    self.set_buffer_opt(scope, n.max(1), |g| &mut g.tabstop, |b| &mut b.tabstop);
+                }
+                SetItem::Shiftwidth(n) => {
+                    self.set_buffer_opt(
+                        scope,
+                        n.max(0),
+                        |g| &mut g.shiftwidth,
+                        |b| &mut b.shiftwidth,
+                    );
+                }
+                SetItem::Scrolloff(n) => {
+                    self.set_window_opt(scope, n.max(0), |g| &mut g.scrolloff, |w| &mut w.scrolloff);
+                }
+                SetItem::Foldcolumn(n) => {
+                    self.set_window_opt(
+                        scope,
+                        n.clamp(0, 9),
+                        |g| &mut g.foldcolumn,
+                        |w| &mut w.foldcolumn,
+                    );
+                }
+                SetItem::Foldmethod(m) => {
+                    self.set_window_opt(scope, m, |g| &mut g.foldmethod, |w| &mut w.foldmethod);
+                }
                 SetItem::Unknown(name) => {
                     self.effects.push(ExEffect::Message(format!(
                         "E518: Unknown option: {name}"
@@ -2013,6 +2603,49 @@ impl Session {
         // also `shiftwidth`, which decides what counts as one level), so
         // re-derive once at the end rather than per option. No-op for `manual`.
         self.refresh_folds();
+    }
+
+    /// Write a window-local option through the layer `scope` selects.
+    ///
+    /// `:set` writes the global *and clears the local override*, so the new
+    /// global actually shows through in the current window — otherwise a stale
+    /// `:setlocal` would silently mask every later `:set`.
+    fn set_window_opt<T: Copy>(
+        &mut self,
+        scope: crate::ex::SetScope,
+        value: T,
+        global: impl Fn(&mut ctrlvim_options::GlobalOptions) -> &mut T,
+        local: impl Fn(&mut ctrlvim_options::WindowOptions) -> &mut Option<T>,
+    ) {
+        use crate::ex::SetScope;
+        match scope {
+            SetScope::Auto => {
+                *global(&mut self.editor.global_options) = value;
+                *local(&mut self.editor.cur_window_mut().options) = None;
+            }
+            SetScope::Local => *local(&mut self.editor.cur_window_mut().options) = Some(value),
+            SetScope::Global => *global(&mut self.editor.global_options) = value,
+        }
+    }
+
+    /// Write a buffer-local option through the layer `scope` selects. Mirrors
+    /// [`Session::set_window_opt`] for the buffer layer.
+    fn set_buffer_opt<T: Copy>(
+        &mut self,
+        scope: crate::ex::SetScope,
+        value: T,
+        global: impl Fn(&mut ctrlvim_options::GlobalOptions) -> &mut T,
+        local: impl Fn(&mut ctrlvim_options::BufferOptions) -> &mut Option<T>,
+    ) {
+        use crate::ex::SetScope;
+        match scope {
+            SetScope::Auto => {
+                *global(&mut self.editor.global_options) = value;
+                *local(&mut self.editor.cur_buffer_mut().options) = None;
+            }
+            SetScope::Local => *local(&mut self.editor.cur_buffer_mut().options) = Some(value),
+            SetScope::Global => *global(&mut self.editor.global_options) = value,
+        }
     }
 
     /// Queue an Ex effect, applying the modified-buffer semantics the engine
@@ -2480,6 +3113,281 @@ mod tests {
     }
 
     #[test]
+    fn insert_mode_mappings_fire_only_in_insert_mode() {
+        let mut s = Session::with_text("hello");
+        s.keymap.set(MapMode::Insert, "jk", "<Esc>");
+        s.feed_str("A world");
+        assert_eq!(s.editor.cur_buffer().text.line(0).as_deref(), Some("hello world"));
+        // `jk` in insert mode leaves insert rather than typing the letters.
+        s.feed_str("jk");
+        assert_eq!(s.mode.short_name(), "n");
+        assert_eq!(s.editor.cur_buffer().text.line(0).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn a_normal_mapping_does_not_fire_in_insert_mode() {
+        let mut s = Session::with_text("x");
+        // A normal-mode mapping on `zz` must not swallow `zz` while inserting.
+        s.keymap.set(MapMode::Normal, "zz", ":dash<CR>");
+        s.feed_str("izz<Esc>");
+        assert_eq!(s.editor.cur_buffer().text.line(0).as_deref(), Some("zzx"));
+    }
+
+    #[test]
+    fn unmap_removes_a_mapping() {
+        let mut s = Session::with_text("x");
+        s.keymap.set(MapMode::Normal, "gx", ":dash<CR>");
+        s.feed_str(":unmap gx<CR>");
+        assert!(!s.take_effects().iter().any(|e| matches!(
+            e,
+            crate::ex::ExEffect::Message(m) if m.contains("E31")
+        )), "the first unmap removed it");
+        // A second one has nothing left to remove and says so.
+        s.feed_str(":unmap gx<CR>");
+        assert!(s.take_effects().iter().any(|e| matches!(
+            e,
+            crate::ex::ExEffect::Message(m) if m.contains("E31")
+        )));
+    }
+
+    #[test]
+    fn record_and_replay_a_macro() {
+        let mut s = Session::with_text("a\nb\nc\nd");
+        // Record "prefix the line with x, go down" into register q.
+        s.feed_str("qqI x<Esc>jq");
+        assert!(s.macro_recording.is_none(), "second q stopped the recording");
+        assert_eq!(s.editor.cur_buffer().text.line(0).as_deref(), Some(" xa"));
+        // Replay it on the remaining lines.
+        s.feed_str("@q");
+        assert_eq!(s.editor.cur_buffer().text.line(1).as_deref(), Some(" xb"));
+        // `@@` repeats the last register used.
+        s.feed_str("@@");
+        assert_eq!(s.editor.cur_buffer().text.line(2).as_deref(), Some(" xc"));
+    }
+
+    #[test]
+    fn a_macro_replay_honors_a_count() {
+        let mut s = Session::with_text("a\nb\nc\nd\ne");
+        s.feed_str("qwI-<Esc>jq");
+        s.feed_str("3@w");
+        let text = s.editor.cur_buffer().text.to_string();
+        assert_eq!(text.trim_end(), "-a\n-b\n-c\n-d\ne");
+    }
+
+    #[test]
+    fn a_recorded_macro_is_stored_in_its_register_as_text() {
+        let mut s = Session::with_text("hello");
+        s.feed_str("qadwq");
+        // Vim stores macros as ordinary register text, so it can be pasted out
+        // and edited. The trailing `q` must not be part of it.
+        let reg = s.editor.registers.read('a').map(|r| r.lines.join("\n"));
+        assert_eq!(reg.as_deref(), Some("dw"));
+    }
+
+    #[test]
+    fn a_self_recursive_macro_terminates() {
+        let mut s = Session::with_text("x");
+        // Register `r` invokes itself; the depth guard must stop it.
+        s.editor
+            .registers
+            .write('r', YankReg::new(vec!["@r".to_string()], MotionType::Char));
+        s.feed_str("@r");
+        assert!(s.take_effects().iter().any(|e| matches!(
+            e,
+            crate::ex::ExEffect::Message(m) if m.contains("E169")
+        )));
+    }
+
+    #[test]
+    fn set_and_jump_to_a_named_mark() {
+        let mut s = Session::with_text("one\ntwo\nthree\nfour\nfive");
+        s.feed_str("3Gma");
+        s.feed_str("gg");
+        assert_eq!(s.editor.cursor().line, 0);
+        // Backtick jumps to the exact position, quote to the line.
+        s.feed_str("`a");
+        assert_eq!(s.editor.cursor().line, 2);
+        s.feed_str("gg'a");
+        assert_eq!(s.editor.cursor().line, 2);
+    }
+
+    #[test]
+    fn quote_mark_lands_on_first_non_blank() {
+        let mut s = Session::with_text("one\n    indented\nthree");
+        s.feed_str("2Gmb");
+        s.feed_str("gg'b");
+        assert_eq!(s.editor.cursor(), Position::new(1, 4));
+    }
+
+    #[test]
+    fn a_mark_is_a_valid_operator_target() {
+        let mut s = Session::with_text("a\nb\nc\nd");
+        s.feed_str("3Gmagg");
+        // `d'a` is linewise from the cursor through the mark's line.
+        s.feed_str("d'a");
+        assert_eq!(s.editor.cur_buffer().text.to_string().trim_end(), "d");
+    }
+
+    #[test]
+    fn jumping_to_an_unset_mark_reports_e20() {
+        let mut s = Session::with_text("one\ntwo");
+        s.feed_str("`z");
+        assert!(s.take_effects().iter().any(|e| matches!(
+            e,
+            crate::ex::ExEffect::Message(m) if m.contains("E20")
+        )));
+        // The cursor stayed put.
+        assert_eq!(s.editor.cursor().line, 0);
+    }
+
+    #[test]
+    fn ctrl_o_and_ctrl_i_walk_the_jumplist() {
+        let mut s = Session::with_text("1\n2\n3\n4\n5\n6\n7\n8");
+        s.feed_str("G"); // jump to last line, recording line 0
+        assert_eq!(s.editor.cursor().line, 7);
+        s.feed_str("<C-o>");
+        assert_eq!(s.editor.cursor().line, 0, "<C-o> returned to the start");
+        s.feed_str("<C-i>");
+        assert_eq!(s.editor.cursor().line, 7, "<C-i> went forward again");
+    }
+
+    #[test]
+    fn a_search_records_a_jump() {
+        let mut s = Session::with_text("alpha\nbeta\ngamma\ndelta");
+        s.feed_str("/delta<CR>");
+        assert_eq!(s.editor.cursor().line, 3);
+        s.feed_str("<C-o>");
+        assert_eq!(s.editor.cursor().line, 0);
+    }
+
+    #[test]
+    fn named_marks_are_addressable_in_ex_ranges() {
+        let mut s = Session::with_text("a\nb\nc\nd\ne");
+        s.feed_str("2Gma4Gmb");
+        s.feed_str(":'a,'bd<CR>");
+        assert_eq!(s.editor.cur_buffer().text.to_string().trim_end(), "a\ne");
+    }
+
+    #[test]
+    fn ex_marks_listing_reports_set_marks() {
+        let mut s = Session::with_text("one\ntwo\nthree");
+        s.feed_str("2Gma");
+        s.feed_str(":marks<CR>");
+        let effects = s.take_effects();
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            crate::ex::ExEffect::Message(m) if m.contains(" a ")
+        )), "listing should mention mark a: {effects:?}");
+    }
+
+    #[test]
+    fn ex_split_and_vsplit_create_windows() {
+        let mut s = Session::with_text("x");
+        assert_eq!(s.editor.window_ids().len(), 1);
+        s.feed_str(":split<CR>");
+        assert_eq!(s.editor.window_ids().len(), 2);
+        s.feed_str(":vsplit<CR>");
+        assert_eq!(s.editor.window_ids().len(), 3);
+        // A split focuses the new window, as Vim does.
+        s.feed_str(":sp<CR>");
+        assert_eq!(s.editor.window_ids().len(), 4);
+    }
+
+    #[test]
+    fn splitbelow_controls_where_the_new_window_lands() {
+        // Vim's default ('nosplitbelow') puts the new window *above*.
+        let mut s = Session::with_text("x");
+        s.feed_str(":split<CR>");
+        let first = s.editor.window_ids()[0];
+        assert_eq!(s.editor.current_window_id(), first, "new window is on top");
+
+        let mut s = Session::with_text("x");
+        s.feed_str(":set splitbelow<CR>:split<CR>");
+        let last = *s.editor.window_ids().last().unwrap();
+        assert_eq!(s.editor.current_window_id(), last, "new window is below");
+    }
+
+    #[test]
+    fn ctrl_w_directional_focus_moves_between_splits() {
+        let mut s = Session::with_text("x");
+        // A vertical split with 'nosplitright' puts the new window on the left
+        // and focuses it; `<C-w>l` should move back to the right-hand one.
+        s.feed_str(":vsplit<CR>");
+        let left = s.editor.current_window_id();
+        s.feed_str("<C-w>l");
+        let right = s.editor.current_window_id();
+        assert_ne!(left, right, "<C-w>l moved focus right");
+        s.feed_str("<C-w>h");
+        assert_eq!(s.editor.current_window_id(), left, "<C-w>h moved focus back");
+    }
+
+    #[test]
+    fn ctrl_w_o_closes_other_windows() {
+        let mut s = Session::with_text("x");
+        s.feed_str(":split<CR>:vsplit<CR>");
+        assert_eq!(s.editor.window_ids().len(), 3);
+        s.feed_str("<C-w>o");
+        assert_eq!(s.editor.window_ids().len(), 1);
+    }
+
+    #[test]
+    fn ex_set_inv_actually_toggles() {
+        let mut s = Session::with_text("x");
+        assert!(!s.editor.options().number());
+        s.feed_str(":set invnumber<CR>");
+        assert!(s.editor.options().number(), "invnumber should turn it on");
+        // The bug this guards: `inv` used to be hardcoded to "on", so a second
+        // `:set invnumber` was a no-op instead of turning it back off.
+        s.feed_str(":set invnumber<CR>");
+        assert!(!s.editor.options().number(), "invnumber should turn it back off");
+        // `{opt}!` is the same toggle spelled differently.
+        s.feed_str(":set number!<CR>");
+        assert!(s.editor.options().number());
+    }
+
+    #[test]
+    fn ex_setlocal_and_setglobal_scope_separately() {
+        let mut s = Session::with_text("x");
+        // `:setlocal` writes only the window override; the global is untouched.
+        s.feed_str(":setlocal number<CR>");
+        assert!(s.editor.options().number(), "local override is in effect");
+        assert!(!s.editor.global_options.number, "global must be unchanged");
+
+        // `:setglobal` writes only the global; the local override still wins.
+        s.feed_str(":setglobal nonumber<CR>");
+        assert!(s.editor.options().number(), "local override still masks global");
+
+        // Plain `:set` writes the global *and* clears the override, so the new
+        // value actually shows through rather than being silently masked.
+        s.feed_str(":set nonumber<CR>");
+        assert!(!s.editor.options().number());
+        assert!(s.editor.cur_window().options.number.is_none(), "override cleared");
+    }
+
+    #[test]
+    fn operator_and_motion_counts_multiply() {
+        // Vim's `{count}op{count}motion` rule: the counts multiply. This used to
+        // accumulate into a single number, so `2d3w` deleted 23 words, not 6.
+        let mut s = Session::with_text("a b c d e f g h i j");
+        s.feed_str("2d3w");
+        assert_eq!(s.editor.cur_buffer().text.line(0).as_deref(), Some("g h i j"));
+    }
+
+    #[test]
+    fn operator_count_alone_still_applies() {
+        let mut s = Session::with_text("a b c d e");
+        s.feed_str("3dw");
+        assert_eq!(s.editor.cur_buffer().text.line(0).as_deref(), Some("d e"));
+    }
+
+    #[test]
+    fn doubled_operator_multiplies_counts_too() {
+        let mut s = Session::with_text("1\n2\n3\n4\n5\n6\n7");
+        s.feed_str("2d3d");
+        assert_eq!(s.editor.cur_buffer().text.line_count(), 1);
+    }
+
+    #[test]
     fn ex_set_options() {
         let mut s = Session::with_text("x");
         assert!(!s.editor.global_options.number);
@@ -2518,6 +3426,107 @@ mod tests {
         assert!(s.search_highlight);
         s.feed_str(":noh<CR>");
         assert!(!s.search_highlight);
+    }
+
+    #[test]
+    fn a_search_offset_puts_the_cursor_where_vim_puts_it() {
+        // `e` lands on the match's last character, not its first.
+        let mut s = Session::with_text("hello world");
+        s.feed_str("/world/e<CR>");
+        assert_eq!(s.cursor(), Position::new(0, 10));
+
+        let mut s = Session::with_text("hello world");
+        s.feed_str("/world/s+1<CR>");
+        assert_eq!(s.cursor(), Position::new(0, 7));
+
+        // A line offset moves whole lines, then to the first non-blank.
+        let mut s = Session::with_text("aaa\nbbb\n   ccc");
+        s.feed_str("/bbb/+1<CR>");
+        assert_eq!(s.cursor(), Position::new(2, 3));
+    }
+
+    #[test]
+    fn n_carries_the_offset_along() {
+        let mut s = Session::with_text("xay\nxay");
+        s.feed_str("/a/e<CR>");
+        assert_eq!(s.cursor(), Position::new(0, 1));
+        s.feed_str("n");
+        assert_eq!(s.cursor(), Position::new(1, 1));
+    }
+
+    #[test]
+    fn search_columns_are_characters_not_bytes() {
+        // Three 3-byte characters and a space precede the match.
+        let mut s = Session::with_text("日本語 target");
+        s.feed_str("/target<CR>");
+        assert_eq!(s.cursor(), Position::new(0, 4));
+    }
+
+    #[test]
+    fn substitute_understands_backreferences() {
+        let mut s = Session::with_text("the the end");
+        s.feed_str(r":s/\(\w\+\) \1/one/<CR>");
+        assert_eq!(s.lines()[0], "one end");
+    }
+
+    #[test]
+    fn substitute_honors_zs_so_only_the_tail_is_replaced() {
+        let mut s = Session::with_text("foobar");
+        s.feed_str(r":s/foo\zsbar/BAZ/<CR>");
+        assert_eq!(s.lines()[0], "fooBAZ");
+    }
+
+    #[test]
+    fn substitute_honors_lookaround() {
+        let mut s = Session::with_text("foobar foobaz");
+        s.feed_str(r":s/foo\(bar\)\@=/X/g<CR>");
+        assert_eq!(s.lines()[0], "Xbar foobaz");
+    }
+
+    #[test]
+    fn a_lazy_repeat_stops_at_the_first_match() {
+        let mut s = Session::with_text("xaayaay");
+        s.feed_str(r":s/x.\{-}y/X/<CR>");
+        assert_eq!(s.lines()[0], "Xaay");
+    }
+
+    #[test]
+    fn the_replacement_can_change_case() {
+        let mut s = Session::with_text("hello world");
+        s.feed_str(r":s/\(\w\+\)/\u\1/g<CR>");
+        assert_eq!(s.lines()[0], "Hello World");
+    }
+
+    #[test]
+    fn a_line_atom_restricts_the_substitution_to_that_line() {
+        let mut s = Session::with_text("foo\nfoo\nfoo");
+        s.feed_str(r":%s/\%2lfoo/X/<CR>");
+        assert_eq!(s.lines(), vec!["foo", "X", "foo"]);
+    }
+
+    #[test]
+    fn smartcase_only_bites_when_the_pattern_has_a_capital() {
+        let mut s = Session::with_text("abc ABC");
+        s.feed_str(":set ignorecase<CR>");
+        s.feed_str(":set smartcase<CR>");
+        // All lowercase: 'ignorecase' still applies, so both forms match.
+        s.feed_str(":s/abc/X/g<CR>");
+        assert_eq!(s.lines()[0], "X X");
+
+        let mut s = Session::with_text("abc ABC");
+        s.feed_str(":set ignorecase<CR>");
+        s.feed_str(":set smartcase<CR>");
+        // A typed capital means the user meant it.
+        s.feed_str(":s/ABC/Y/g<CR>");
+        assert_eq!(s.lines()[0], "abc Y");
+    }
+
+    #[test]
+    fn ignorecase_alone_still_folds_the_search() {
+        let mut s = Session::with_text("abc ABC");
+        s.feed_str(":set ignorecase<CR>");
+        s.feed_str(":s/ABC/Y/g<CR>");
+        assert_eq!(s.lines()[0], "Y Y");
     }
 
     #[test]

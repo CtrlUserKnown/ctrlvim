@@ -24,6 +24,20 @@ impl Key {
         Key::Char(c)
     }
 
+    /// Render a key back into [`Key::parse_sequence`] notation. Recorded macros
+    /// are stored in registers as text, exactly as Vim does — so a macro can be
+    /// pasted out with `"ap`, edited by hand, and yanked back in.
+    pub fn notation(self) -> String {
+        match self {
+            Key::Char(c) => c.to_string(),
+            Key::Ctrl(c) => format!("<C-{c}>"),
+            Key::Esc => "<Esc>".to_string(),
+            Key::Enter => "<CR>".to_string(),
+            Key::Backspace => "<BS>".to_string(),
+            Key::Tab => "<Tab>".to_string(),
+        }
+    }
+
     /// Translate a string into a key sequence, using `<...>` for specials:
     /// `<Esc>`, `<CR>`, `<BS>`, `<Tab>`, `<C-r>`. Everything else is a literal
     /// char. This lets tests and scripts write `"dw<Esc>"` style input.

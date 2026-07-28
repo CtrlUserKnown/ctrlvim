@@ -29,6 +29,8 @@ pub struct Window {
     pub options: WindowOptions,
     /// Folds are per-window in Vim: two splits on one buffer fold separately.
     pub folds: Folds,
+    /// The jumplist is per-window too (`<C-o>`/`<C-i>`).
+    pub jumps: crate::jumps::Jumplist,
 }
 
 impl Window {
@@ -43,6 +45,7 @@ impl Window {
             width: 80,
             options: WindowOptions::default(),
             folds: Folds::new(),
+            jumps: crate::jumps::Jumplist::default(),
         }
     }
 

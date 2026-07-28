@@ -876,7 +876,6 @@ fn vimgrep_with_no_matches_reports_instead_of_opening() {
 #[test]
 fn bang_command_runs_through_the_configured_shell_and_shows_output() {
     let mut app = temp_project(&[("a.rs", "fn one() {}\n")]);
-    app.config.shell = "sh".to_string(); // deterministic across dev machines/CI
     typ(&mut app, ":!echo hello-ctrlvim");
     press(&mut app, KeyCode::Enter);
 
@@ -910,7 +909,6 @@ fn bang_output_containing_tabs_is_expanded_before_display() {
     // screen. ctrlvim must expand tabs to spaces itself rather than ever
     // emitting one.
     let mut app = temp_project(&[("a.rs", "fn one() {}\n")]);
-    app.config.shell = "sh".to_string();
     typ(&mut app, ":!printf 'a\\tb\\n'");
     press(&mut app, KeyCode::Enter);
 
@@ -947,7 +945,9 @@ fn bare_bang_with_no_command_reports_an_error_rather_than_running_the_shell() {
 fn an_invalid_pattern_reports_rather_than_panicking() {
     let mut app = temp_project(&[("a.rs", "x\n")]);
     app.open_file(0);
-    vimgrep(&mut app, ":vimgrep /[unclosed/");
+    // An unclosed group, not an unclosed `[` — Vim reads a bare bracket as a
+    // literal, so it is a valid pattern rather than an error.
+    vimgrep(&mut app, r":vimgrep /\(unclosed/");
     assert!(app.message.contains("E486"), "got {:?}", app.message);
 }
 
@@ -1763,7 +1763,7 @@ fn an_invalid_pattern_shows_an_error_instead_of_results() {
     let mut app = replace_project();
     app.open_replace(Some("widget".into()));
     assert_eq!(app.replace.as_ref().unwrap().hits.len(), 3);
-    typ(&mut app, "["); // `widget[` — an unterminated class
+    typ(&mut app, r"\("); // `widget\(` — an unclosed group
     let panel = app.replace.as_ref().unwrap();
     assert!(panel.error.is_some());
     assert!(panel.hits.is_empty(), "stale hits must not survive a broken pattern");

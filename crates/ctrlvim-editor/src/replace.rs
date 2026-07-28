@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
+use ctrlvim_regex::{Regex, Replacement};
 
 /// One matching line: where it is, what it says now, and what it would say.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,12 +36,12 @@ pub struct ReplaceHit {
 
 /// A compiled find & replace: a Vim pattern plus its replacement.
 ///
-/// Both halves go through the same translation `:s` uses — [`crate::pattern`]
-/// for the pattern's "magic" flavor, [`vim_replacement`] for `\1`/`&`/`\n` in
-/// the replacement — so a pattern that works at `:s` works here unchanged.
+/// Both halves go through the same engine `:s` uses — [`crate::pattern`] for
+/// the pattern's "magic" flavor, [`Replacement`] for `\1`/`&`/`\u` in the
+/// replacement — so a pattern that works at `:s` works here unchanged.
 pub struct ReplacePlan {
     re: Regex,
-    replacement: String,
+    replacement: Replacement,
 }
 
 impl ReplacePlan {
@@ -56,7 +56,7 @@ impl ReplacePlan {
         }
         let re = crate::pattern::compile_opts(pattern, ignorecase)
             .map_err(|e| format!("E486: invalid pattern: {e}"))?;
-        Ok(ReplacePlan { re, replacement: vim_replacement(replacement) })
+        Ok(ReplacePlan { re, replacement: Replacement::parse(replacement, "") })
     }
 
     /// Every match on `line`, as `(start, end)` char columns.
@@ -66,16 +66,14 @@ impl ReplacePlan {
     pub fn match_cols(&self, line: &str) -> Vec<(usize, usize)> {
         self.re
             .find_iter(line)
-            .filter(|m| m.start() != m.end())
-            .map(|m| (line[..m.start()].chars().count(), line[..m.end()].chars().count()))
+            .filter(|m| !m.is_empty())
+            .map(|m| (m.start_char(), m.end_char()))
             .collect()
     }
 
     /// The line with every match replaced, or `None` when nothing matched.
     pub fn apply_line(&self, line: &str) -> Option<String> {
-        self.re
-            .is_match(line)
-            .then(|| self.re.replace_all(line, self.replacement.as_str()).into_owned())
+        self.re.is_match(line).then(|| self.re.replace_all(line, &self.replacement))
     }
 
     /// The line with only the match starting at char column `col` replaced —
@@ -84,12 +82,11 @@ impl ReplacePlan {
     /// Returns `None` when no match starts exactly there, so a stale hit (the
     /// file changed under us) is a no-op rather than a wrong edit.
     pub fn apply_match_at(&self, line: &str, col: usize) -> Option<String> {
-        let byte = char_to_byte(line, col)?;
         // Captures rather than plain matches, so `\1` in the replacement still
         // resolves for the one occurrence being accepted.
         let caps = self.re.captures_iter(line).find(|c| {
             let m = c.get(0).expect("group 0 always matches");
-            m.start() == byte && m.start() != m.end()
+            m.start_char() == col && !m.is_empty()
         })?;
         let m = caps.get(0).expect("group 0 always matches");
         let mut out = String::with_capacity(line.len());
@@ -142,48 +139,6 @@ impl ReplacePlan {
         }
         (replaced > 0).then_some((out, replaced))
     }
-}
-
-/// Byte offset of char column `col`, or `None` when the line is shorter.
-fn char_to_byte(line: &str, col: usize) -> Option<usize> {
-    if col == 0 {
-        return Some(0);
-    }
-    line.char_indices().nth(col).map(|(b, _)| b).or_else(|| {
-        (line.chars().count() == col).then_some(line.len())
-    })
-}
-
-/// Translate a Vim `:s` replacement into `regex` crate syntax: `\1`…`\9` and
-/// `&` become capture references, `\r`/`\n` a newline, and a literal `$` is
-/// escaped so it isn't read as one.
-///
-/// Shared with [`crate::session`], which uses it for `:s` itself — the two must
-/// agree or the panel's preview would drift from what `:s` produces.
-pub fn vim_replacement(rep: &str) -> String {
-    let mut out = String::new();
-    let mut chars = rep.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some(d @ '0'..='9') => {
-                    out.push_str("${");
-                    out.push(d);
-                    out.push('}');
-                }
-                Some('r') | Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('&') => out.push('&'),
-                Some('\\') => out.push('\\'),
-                Some(other) => out.push(other),
-                None => {}
-            },
-            '&' => out.push_str("${0}"),
-            '$' => out.push_str("$$"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -281,7 +236,9 @@ mod tests {
     #[test]
     fn empty_and_invalid_patterns_are_errors_not_panics() {
         assert!(ReplacePlan::new("", "x", false).is_err());
-        assert!(ReplacePlan::new("[unclosed", "x", false).is_err());
+        assert!(ReplacePlan::new(r"\(unclosed", "x", false).is_err());
+        // A bare `[` is a literal in Vim, so this one is a valid pattern.
+        assert!(ReplacePlan::new("[unclosed", "x", false).is_ok());
     }
 
     #[test]

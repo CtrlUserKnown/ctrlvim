@@ -32,6 +32,10 @@ pub struct Host {
     timer_handles: Rc<RefCell<HashMap<u64, TimerHandle>>>,
     /// Registered treesitter grammars (`vim.treesitter.language.add`).
     ts: Rc<RefCell<ctrlvim_treesitter::LanguageRegistry>>,
+    /// Messages queued by `vim.notify`, drained by the frontend.
+    notices: Rc<RefCell<Vec<(i64, String)>>>,
+    /// LuaRef ids queued by `vim.schedule`, run at the next safe point.
+    scheduled: Rc<RefCell<Vec<i64>>>,
 }
 
 impl Host {
@@ -53,6 +57,8 @@ impl Host {
             timer_cbs: Rc::new(RefCell::new(HashMap::new())),
             timer_handles: Rc::new(RefCell::new(HashMap::new())),
             ts: Rc::new(RefCell::new(ctrlvim_treesitter::LanguageRegistry::new())),
+            notices: Rc::new(RefCell::new(Vec::new())),
+            scheduled: Rc::new(RefCell::new(Vec::new())),
         };
         host.install()?;
         Ok(host)
@@ -129,6 +135,10 @@ impl Host {
         self.install_fn(&vim)?;
         self.install_keymap(&vim)?;
         self.install_treesitter(&vim)?;
+        self.install_opt(&vim)?;
+        self.install_vars(&vim)?;
+        self.install_cmd(&vim)?;
+        self.install_stdlib(&vim)?;
         vim.set("NIL", Value::Nil)?; // `vim.NIL` sentinel
         self.lua.globals().set("vim", vim)?;
         Ok(())
@@ -440,6 +450,251 @@ impl Host {
         })
     }
 
+    /// `vim.opt` / `vim.o` — option access from Lua.
+    ///
+    /// Both are the same metatable-backed proxy: reads go through
+    /// `ctrlvim_get_option_value`, writes go through the engine's `:set`, so
+    /// Lua and the command line share one notion of what an option means.
+    fn install_opt(&self, vim: &Table) -> mlua::Result<()> {
+        let proxy = self.lua.create_table()?;
+        let meta = self.lua.create_table()?;
+
+        let ctx = self.ctx.clone();
+        let store = self.store.clone();
+        let index = self
+            .lua
+            .create_function(move |lua, (_t, key): (Table, String)| {
+                let mut c = ctx.borrow_mut();
+                let value = ctrlvim_api::registry::call(
+                    &mut c,
+                    "ctrlvim_get_option_value",
+                    &[ctrlvim_types::Object::str(key)],
+                )
+                .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                crate::convert::to_lua(lua, &value, &store)
+            })?;
+        meta.set("__index", index)?;
+
+        let ctx = self.ctx.clone();
+        let newindex = self
+            .lua
+            .create_function(move |_, (_t, key, value): (Table, String, Value)| {
+                // Render the assignment as a `:set` argument and let the engine
+                // parse it — same path, same validation, same errors.
+                let arg = match value {
+                    Value::Boolean(true) => key,
+                    Value::Boolean(false) => format!("no{key}"),
+                    Value::Integer(n) => format!("{key}={n}"),
+                    Value::Number(n) => format!("{key}={n}"),
+                    Value::String(s) => format!("{key}={}", s.to_str()?),
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "vim.opt.{key}: unsupported value type"
+                        )))
+                    }
+                };
+                ctx.borrow_mut().exec_ex(&format!("set {arg}"));
+                Ok(())
+            })?;
+        meta.set("__newindex", newindex)?;
+        proxy.set_metatable(Some(meta));
+
+        vim.set("opt", proxy.clone())?;
+        vim.set("o", proxy)?;
+        Ok(())
+    }
+
+    /// `vim.g` — global variables, shared with Vimscript's `g:` scope so
+    /// `vim.g.x` and `:let g:x` are the same variable.
+    fn install_vars(&self, vim: &Table) -> mlua::Result<()> {
+        let proxy = self.lua.create_table()?;
+        let meta = self.lua.create_table()?;
+
+        let ctx = self.ctx.clone();
+        let store = self.store.clone();
+        let index = self
+            .lua
+            .create_function(move |lua, (_t, key): (Table, String)| {
+                let c = ctx.borrow();
+                match c.get_global(&key) {
+                    Some(v) => crate::convert::to_lua(lua, &v, &store),
+                    // An unset global reads as nil, as it does in Neovim.
+                    None => Ok(Value::Nil),
+                }
+            })?;
+        meta.set("__index", index)?;
+
+        let ctx = self.ctx.clone();
+        let newindex = self
+            .lua
+            .create_function(move |_, (_t, key, value): (Table, String, Value)| {
+                let obj = match value {
+                    Value::Boolean(b) => ctrlvim_types::Object::Boolean(b),
+                    Value::Integer(n) => ctrlvim_types::Object::Integer(n),
+                    Value::Number(n) => ctrlvim_types::Object::Integer(n as i64),
+                    Value::String(s) => ctrlvim_types::Object::str(s.to_str()?.to_string()),
+                    Value::Nil => ctrlvim_types::Object::Nil,
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "vim.g.{key}: unsupported value type"
+                        )))
+                    }
+                };
+                ctx.borrow_mut().set_global(&key, obj);
+                Ok(())
+            })?;
+        meta.set("__newindex", newindex)?;
+        proxy.set_metatable(Some(meta));
+        vim.set("g", proxy)?;
+        Ok(())
+    }
+
+    /// `vim.cmd` — run an Ex command / Vimscript line from Lua.
+    fn install_cmd(&self, vim: &Table) -> mlua::Result<()> {
+        let ctx = self.ctx.clone();
+        let cmd = self.lua.create_function(move |_, src: String| {
+            let line = src.trim().trim_start_matches(':').to_string();
+            let mut c = ctx.borrow_mut();
+            // Ex commands go through the session; anything the Ex layer doesn't
+            // recognize is Vimscript (`let`, `call`, `echo`, …).
+            if ctrlvim_editor::is_ex_command(&line) {
+                c.exec_ex(&line);
+            } else {
+                c.exec_vimscript(&line)
+                    .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+            }
+            Ok(())
+        })?;
+        vim.set("cmd", cmd)?;
+        Ok(())
+    }
+
+    /// The small `vim.*` stdlib helpers plugins reach for constantly.
+    fn install_stdlib(&self, vim: &Table) -> mlua::Result<()> {
+        let lua = &self.lua;
+
+        // `vim.notify(msg, level)` — collected for the frontend to display.
+        let notices = self.notices.clone();
+        let notify = lua.create_function(move |_, (msg, level): (String, Option<i64>)| {
+            notices.borrow_mut().push((level.unwrap_or(2), msg));
+            Ok(())
+        })?;
+        vim.set("notify", notify)?;
+
+        // `vim.schedule(fn)` — defer until the editor is back at a safe point.
+        // Callbacks queue here and the host drains them via `run_scheduled`.
+        let store = self.store.clone();
+        let scheduled = self.scheduled.clone();
+        let schedule = lua.create_function(move |lua, cb: Function| {
+            let id = store.store(lua, cb)?;
+            scheduled.borrow_mut().push(id);
+            Ok(())
+        })?;
+        vim.set("schedule", schedule)?;
+
+        // `vim.split(s, sep)`
+        let split = lua.create_function(|lua, (s, sep): (String, Option<String>)| {
+            let sep = sep.unwrap_or_else(|| " ".to_string());
+            let out = lua.create_table()?;
+            if sep.is_empty() {
+                out.set(1, s)?;
+                return Ok(out);
+            }
+            for (i, part) in s.split(sep.as_str()).enumerate() {
+                out.set(i + 1, part)?;
+            }
+            Ok(out)
+        })?;
+        vim.set("split", split)?;
+
+        // `vim.trim(s)`
+        let trim = lua.create_function(|_, s: String| Ok(s.trim().to_string()))?;
+        vim.set("trim", trim)?;
+
+        // `vim.startswith` / `vim.endswith`
+        let startswith =
+            lua.create_function(|_, (s, prefix): (String, String)| Ok(s.starts_with(&prefix)))?;
+        vim.set("startswith", startswith)?;
+        let endswith =
+            lua.create_function(|_, (s, suffix): (String, String)| Ok(s.ends_with(&suffix)))?;
+        vim.set("endswith", endswith)?;
+
+        // `vim.tbl_count`
+        let tbl_count = lua.create_function(|_, t: Table| {
+            let mut n = 0;
+            for pair in t.pairs::<Value, Value>() {
+                pair?;
+                n += 1;
+            }
+            Ok(n)
+        })?;
+        vim.set("tbl_count", tbl_count)?;
+
+        // `vim.tbl_isempty`
+        let tbl_isempty =
+            lua.create_function(|_, t: Table| Ok(t.pairs::<Value, Value>().next().is_none()))?;
+        vim.set("tbl_isempty", tbl_isempty)?;
+
+        // `vim.tbl_keys` / `vim.tbl_values`
+        let tbl_keys = lua.create_function(|lua, t: Table| {
+            let out = lua.create_table()?;
+            for (i, pair) in t.pairs::<Value, Value>().enumerate() {
+                out.set(i + 1, pair?.0)?;
+            }
+            Ok(out)
+        })?;
+        vim.set("tbl_keys", tbl_keys)?;
+        let tbl_values = lua.create_function(|lua, t: Table| {
+            let out = lua.create_table()?;
+            for (i, pair) in t.pairs::<Value, Value>().enumerate() {
+                out.set(i + 1, pair?.1)?;
+            }
+            Ok(out)
+        })?;
+        vim.set("tbl_values", tbl_values)?;
+
+        // `vim.tbl_extend(behavior, a, b)` — "force" or "keep" on conflict.
+        let tbl_extend =
+            lua.create_function(|lua, (behavior, a, b): (String, Table, Table)| {
+                let out = lua.create_table()?;
+                for pair in a.pairs::<Value, Value>() {
+                    let (k, v) = pair?;
+                    out.set(k, v)?;
+                }
+                let force = behavior == "force";
+                for pair in b.pairs::<Value, Value>() {
+                    let (k, v) = pair?;
+                    if force || out.get::<Value, Value>(k.clone())? == Value::Nil {
+                        out.set(k, v)?;
+                    }
+                }
+                Ok(out)
+            })?;
+        vim.set("tbl_extend", tbl_extend)?;
+
+        Ok(())
+    }
+
+    /// Drain queued `vim.notify` messages as `(level, text)`.
+    pub fn take_notices(&self) -> Vec<(i64, String)> {
+        std::mem::take(&mut self.notices.borrow_mut())
+    }
+
+    /// Run everything queued with `vim.schedule`. The frontend calls this at a
+    /// safe point in its loop — that deferral is the entire purpose of
+    /// `vim.schedule`, so running the callbacks inline would defeat it.
+    pub fn run_scheduled(&self) -> mlua::Result<usize> {
+        let ids = std::mem::take(&mut *self.scheduled.borrow_mut());
+        let count = ids.len();
+        for id in ids {
+            if let Some(func) = self.store.get(&self.lua, id)? {
+                func.call::<_, ()>(())?;
+            }
+            self.store.remove(&self.lua, id)?;
+        }
+        Ok(count)
+    }
+
     /// Number of live Lua callbacks held (for leak checks in tests).
     pub fn callback_count(&self) -> usize {
         self.store.len()
@@ -717,5 +972,117 @@ mod tests {
             }
             _ => panic!("expected response"),
         }
+    }
+}
+
+#[cfg(test)]
+mod stdlib_tests {
+    use super::*;
+
+    fn host() -> Host {
+        Host::new(Editor::new()).unwrap()
+    }
+
+    #[test]
+    fn vim_opt_reads_and_writes_options() {
+        let h = host();
+        h.exec("assert(vim.opt.number == false)").unwrap();
+        h.exec("vim.opt.number = true").unwrap();
+        h.exec("assert(vim.opt.number == true, 'number should be on')")
+            .unwrap();
+        // `vim.o` is the same proxy.
+        h.exec("assert(vim.o.number == true)").unwrap();
+        // Numeric and string options round-trip too.
+        h.exec("vim.opt.tabstop = 2").unwrap();
+        h.exec("assert(vim.opt.tabstop == 2, 'tabstop should be 2')")
+            .unwrap();
+        h.exec("vim.opt.foldmethod = 'indent'").unwrap();
+        h.exec("assert(vim.opt.foldmethod == 'indent')").unwrap();
+    }
+
+    #[test]
+    fn writing_an_option_goes_through_the_engines_set() {
+        let h = host();
+        h.exec("vim.opt.number = false").unwrap();
+        // `false` must become `:set nonumber`, not `:set number=false`.
+        h.exec("assert(vim.opt.number == false)").unwrap();
+    }
+
+    #[test]
+    fn vim_g_stores_globals() {
+        let h = host();
+        h.exec("assert(vim.g.missing == nil, 'unset globals read as nil')")
+            .unwrap();
+        h.exec("vim.g.mapleader = ' '").unwrap();
+        h.exec("assert(vim.g.mapleader == ' ')").unwrap();
+        h.exec("vim.g.count = 7").unwrap();
+        h.exec("assert(vim.g.count == 7)").unwrap();
+    }
+
+    #[test]
+    fn vim_g_is_shared_with_vimscript() {
+        let h = host();
+        h.exec("vim.g.shared = 42").unwrap();
+        // The same variable is visible as `g:shared` to the interpreter.
+        h.exec("assert(vim.fn.string(vim.g.shared) == '42')").unwrap();
+    }
+
+    #[test]
+    fn vim_cmd_runs_ex_commands() {
+        let h = host();
+        h.exec("vim.cmd('set number')").unwrap();
+        h.exec("assert(vim.opt.number == true, 'vim.cmd ran :set')")
+            .unwrap();
+        // A leading colon is accepted too.
+        h.exec("vim.cmd(':set nonumber')").unwrap();
+        h.exec("assert(vim.opt.number == false)").unwrap();
+    }
+
+    #[test]
+    fn vim_notify_queues_messages_for_the_frontend() {
+        let h = host();
+        h.exec("vim.notify('hello')").unwrap();
+        h.exec("vim.notify('bad', 4)").unwrap();
+        let notices = h.take_notices();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].1, "hello");
+        assert_eq!(notices[1], (4, "bad".to_string()));
+        assert!(h.take_notices().is_empty(), "draining clears the queue");
+    }
+
+    #[test]
+    fn vim_schedule_defers_until_run() {
+        let h = host();
+        h.exec("ran = false; vim.schedule(function() ran = true end)")
+            .unwrap();
+        h.exec("assert(ran == false, 'must not run inline')").unwrap();
+        assert_eq!(h.run_scheduled().unwrap(), 1);
+        h.exec("assert(ran == true, 'runs when drained')").unwrap();
+        // The queue is empty afterwards, and the callback ref was released.
+        assert_eq!(h.run_scheduled().unwrap(), 0);
+    }
+
+    #[test]
+    fn string_and_table_helpers() {
+        let h = host();
+        h.exec("local p = vim.split('a,b,c', ','); assert(#p == 3 and p[2] == 'b')")
+            .unwrap();
+        h.exec("assert(vim.trim('  x  ') == 'x')").unwrap();
+        h.exec("assert(vim.startswith('foobar', 'foo'))").unwrap();
+        h.exec("assert(vim.endswith('foobar', 'bar'))").unwrap();
+        h.exec("assert(vim.tbl_count({a=1, b=2}) == 2)").unwrap();
+        h.exec("assert(vim.tbl_isempty({}))").unwrap();
+        h.exec("assert(not vim.tbl_isempty({1}))").unwrap();
+        h.exec("assert(#vim.tbl_keys({a=1, b=2}) == 2)").unwrap();
+        h.exec("assert(#vim.tbl_values({a=1, b=2}) == 2)").unwrap();
+    }
+
+    #[test]
+    fn tbl_extend_honors_force_and_keep() {
+        let h = host();
+        h.exec("local m = vim.tbl_extend('force', {a=1}, {a=2, b=3}); assert(m.a == 2 and m.b == 3)")
+            .unwrap();
+        h.exec("local m = vim.tbl_extend('keep', {a=1}, {a=2, b=3}); assert(m.a == 1 and m.b == 3)")
+            .unwrap();
     }
 }

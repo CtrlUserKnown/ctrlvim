@@ -16,12 +16,14 @@ pub use ctrlvim_editor::{
     ex_commands, is_ex_command, BufferCmd, Editor, ExCommand, ExEffect, Fold, Folds, Frame, Key,
     Mode, QfItem, QfKind, QuickfixCmd, QuickfixList, Selection, Session, TagCmd, VisualKind,
 };
+pub use ctrlvim_editor::keymap::MapMode;
 pub use ctrlvim_editor::fold::fold_text;
 pub use ctrlvim_editor::tags::{resolve_address as resolve_tag_address, TagAddress, TagTable};
 pub use ctrlvim_editor::quickfix::{grep_text, Matcher, OutputParser};
 pub use ctrlvim_editor::replace::{ReplaceHit, ReplacePlan};
 pub use ctrlvim_lua::Host;
 pub use ctrlvim_types::{BufferId, Object, Position, WindowId};
+pub use ctrlvim_text::{char_index_at, char_width, display_width, width_upto};
 
 /// A convenience entry point: an editor session with Lua available.
 ///
@@ -123,6 +125,33 @@ impl Ctrlvim {
             self.session.checkpoint_undo();
         }
         Ok(ran)
+    }
+
+    /// Fire an autocommand event at the Lua host, so callbacks registered with
+    /// `ctrlvim_create_autocmd` actually run.
+    ///
+    /// This is a no-op when no Lua has been executed yet: the host is created
+    /// lazily, and with no host there are no callbacks to notify. It must be
+    /// called from the *real* editing paths (write, buffer switch, startup) —
+    /// autocmds that only fire from a demo binary are not a feature.
+    pub fn fire_autocmd(&mut self, event: &str, file: &str) {
+        if let Some(host) = self.host.as_ref() {
+            let _ = host.fire_autocmd(event, file);
+        }
+    }
+
+    /// Whether a Lua host exists yet (i.e. any Lua has run).
+    pub fn has_host(&self) -> bool {
+        self.host.is_some()
+    }
+
+    /// Create the Lua host if it doesn't exist, so plugins can be loaded and
+    /// autocmds registered before any `:lua` is typed.
+    pub fn ensure_host(&mut self) -> Result<(), String> {
+        if self.host.is_none() {
+            self.host = Some(Host::new(Editor::new()).map_err(|e| e.to_string())?);
+        }
+        Ok(())
     }
 
     /// Open a file's contents into the current buffer.

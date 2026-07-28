@@ -8,7 +8,7 @@
 //! the markup. One source line is always one screen row, so the cursor/scroll
 //! math is identical whether rendering is on or off.
 
-use ctrlvim_core::{HlSpan, Selection, VisualKind};
+use ctrlvim_core::{char_width, width_upto, HlSpan, Selection, VisualKind};
 use ctrlvim_markdown::{analyze, MdLine};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -105,9 +105,11 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
         if let Some(sel) = selection {
             if let Some((lo, hi)) = selection_cols(&sel, i, raw.chars().count()) {
                 let right = area.x + area.width;
-                let x0 = text_x + lo as u16;
+                // Selection bounds are *character* indices; the screen is in
+                // cells, which differ as soon as the line holds a wide glyph.
+                let x0 = text_x + width_upto(&raw, lo) as u16;
                 if x0 < right {
-                    let x1 = (text_x + hi as u16).min(right);
+                    let x1 = (text_x + width_upto(&raw, hi) as u16).min(right);
                     let w = x1.saturating_sub(x0);
                     if w > 0 {
                         f.buffer_mut().set_style(
@@ -122,12 +124,12 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
         // `hlsearch`: paint a background over every match of the active search
         // pattern on this row (dark text on the search color, Vim-style).
         for (lo, hi) in app.editor_search_matches(i) {
-            let x0 = text_x + lo as u16;
+            let x0 = text_x + width_upto(&raw, lo) as u16;
             let right = area.x + area.width;
             if x0 >= right {
                 continue;
             }
-            let x1 = (text_x + hi as u16).min(right);
+            let x1 = (text_x + width_upto(&raw, hi) as u16).min(right);
             let w = x1.saturating_sub(x0);
             if w > 0 {
                 f.buffer_mut().set_style(
@@ -140,15 +142,19 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
         // Block cursor on the active line. The cursor line renders raw (markup
         // visible), so source columns line up with the screen 1:1.
         if i == cur_line {
-            let cx = text_x + cur_col as u16;
+            let cx = text_x + width_upto(&raw, cur_col) as u16;
             if cx < area.x + area.width {
                 let ch = raw.chars().nth(cur_col).unwrap_or(' ');
+                // A wide glyph needs a two-cell cursor, or the block sits on
+                // half a character and the other half keeps the normal colors.
+                let w = char_width(ch) as u16;
+                let w = w.min((area.x + area.width).saturating_sub(cx)).max(1);
                 f.render_widget(
                     Paragraph::new(Span::styled(
                         ch.to_string(),
                         Style::default().fg(theme::bg()).bg(cursor_color),
                     )),
-                    Rect { x: cx, y, width: 1, height: 1 },
+                    Rect { x: cx, y, width: w, height: 1 },
                 );
             }
         }

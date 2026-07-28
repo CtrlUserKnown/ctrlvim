@@ -120,6 +120,17 @@ impl Registers {
 
     /// Read a register by name. `"` reads whatever the unnamed register points
     /// at.
+    /// Every non-empty register as `(name, contents)`, for `:registers`. The
+    /// unnamed register is reported under the slot it points at rather than
+    /// duplicated, matching what Vim's listing shows.
+    pub fn list(&self) -> Vec<(char, String)> {
+        self.regs
+            .iter()
+            .filter(|(_, r)| !r.lines.is_empty())
+            .map(|(name, reg)| (*name, reg.lines.join("\n")))
+            .collect()
+    }
+
     pub fn read(&self, name: char) -> Option<&YankReg> {
         let key = if name == '"' {
             self.unnamed_points_to?

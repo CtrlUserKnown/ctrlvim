@@ -1,0 +1,105 @@
+# ctrlvim configuration — copy to ~/.config/ctrlvim/config.toml
+#
+# ctrlvim is configured in TOML, not in a config script. TOML expresses the
+# *wiring* (options, mappings, event bindings, plugins); anything that needs
+# actual logic lives in a plugin, which this file then refers to by name.
+#
+# The bridge is the Ex command: a keymap's `rhs` and an autocmd's `command` are
+# ordinary `:` commands, so a plugin contributes behaviour by registering
+# `:Format` and the config just names it.
+
+
+# ---------------------------------------------------------------------------
+# [ui] — the editor shell itself.
+# ---------------------------------------------------------------------------
+[ui]
+# Open the file drawer (Ctrl-B sidebar) on startup.
+drawer = false
+# Mouse wheel scrolling. Turn off to give the wheel back to the terminal.
+mouse = true
+# "auto" (Nerd Font glyphs if installed), "nerd" (always), "text" (letters).
+icons = "auto"
+# Any theme name: Terminal, Tokyo Night, Catppuccin, Noir-cat, Rosé Pine,
+# Gruvbox, Habamax.
+theme = "Tokyo Night"
+
+
+# ---------------------------------------------------------------------------
+# [options] — anything `:set` understands.
+#
+# `true` sets the option, `false` becomes its `no`-prefixed form, and numbers
+# and strings become `name=value`. This table is untyped on purpose: every
+# option the engine gains works here immediately.
+# ---------------------------------------------------------------------------
+[options]
+number = true
+relativenumber = true
+ignorecase = true
+smartcase = true
+hlsearch = true
+expandtab = true
+autoindent = true
+splitbelow = true
+splitright = true
+tabstop = 4
+shiftwidth = 4
+scrolloff = 5
+foldmethod = "indent"
+
+
+# ---------------------------------------------------------------------------
+# [[keymap]] — one table per mapping.
+#
+# `mode` is "n" (default), "i", or "v". Both sides use `<...>` key notation.
+# ---------------------------------------------------------------------------
+[[keymap]]
+mode = "n"
+lhs = "<Space>f"
+rhs = ":Files<CR>"
+
+[[keymap]]
+mode = "n"
+lhs = "<Space>g"
+rhs = ":Find<CR>"
+
+[[keymap]]
+mode = "i"
+lhs = "jk"
+rhs = "<Esc>"
+
+[[keymap]]
+mode = "v"
+lhs = "<"
+rhs = "<gv"
+
+
+# ---------------------------------------------------------------------------
+# [[autocmd]] — run an Ex command when an event fires.
+#
+# `pattern` matches the buffer's name: "*", "*.rs", "test_*", or an exact name.
+# Events currently fired by the editor: VimEnter, BufEnter, BufLeave,
+# BufWritePre, BufWritePost.
+# ---------------------------------------------------------------------------
+[[autocmd]]
+event = "BufWritePre"
+pattern = "*.rs"
+command = "set expandtab"
+
+[[autocmd]]
+event = "VimEnter"
+pattern = "*"
+command = "set number"
+
+
+# ---------------------------------------------------------------------------
+# [[plugin]] — a directory holding an `init.lua` or `init.vim`.
+#
+# Load order is the order declared here, which is why there is no runtimepath
+# search: what loads, and when, is explicit rather than emergent.
+# Give `event` to defer loading until that event first fires.
+# ---------------------------------------------------------------------------
+# [[plugin]]
+# name = "example"
+# path = "~/.config/ctrlvim/pack/example"
+# event = "BufWritePre"   # omit to load at startup
+# enabled = true

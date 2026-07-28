@@ -19,6 +19,11 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Namespace(pub u32);
 
+/// The namespace holding classic named marks (`ma`, `` `a ``, `'a`). Ids in it
+/// are the mark character's code point, so `'a'` is id 97. Reserved: plugin
+/// namespaces are allocated from 1 upward by `ctrlvim_create_namespace`.
+pub const NS_LEGACY_MARKS: Namespace = Namespace(0);
+
 /// Which way a mark moves when text is inserted exactly at its position.
 /// Neovim's extmarks call this "gravity": right-gravity marks stay after
 /// inserted text, left-gravity marks stay before it.

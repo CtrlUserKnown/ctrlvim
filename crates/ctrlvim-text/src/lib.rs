@@ -7,10 +7,12 @@
 
 pub mod buffer;
 pub mod marks;
+pub mod width;
 pub mod register;
 pub mod undo;
 
 pub use buffer::Buffer;
-pub use marks::{Gravity, MarkStore, Namespace};
+pub use marks::{Gravity, MarkStore, Namespace, NS_LEGACY_MARKS};
+pub use width::{char_index_at, char_width, display_width, width_upto};
 pub use register::{MotionType, Registers, YankReg};
 pub use undo::UndoTree;

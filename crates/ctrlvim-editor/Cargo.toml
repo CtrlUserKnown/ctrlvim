@@ -8,4 +8,4 @@ license.workspace = true
 ctrlvim-types.workspace = true
 ctrlvim-text.workspace = true
 ctrlvim-options.workspace = true
-regex.workspace = true
+ctrlvim-regex.workspace = true

@@ -120,16 +120,60 @@ pub enum BufferCmd {
     List,
 }
 
+/// How a boolean option is being changed. `:set inv{opt}` and `:set {opt}!`
+/// can only be resolved against the option's *current* value, which parsing
+/// has no access to — so the parser records the intent and [`SetItem`] is
+/// resolved later, against live state, by the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoolOp {
+    On,
+    Off,
+    Toggle,
+}
+
+impl BoolOp {
+    /// Resolve against the option's current effective value.
+    pub(crate) fn apply(self, current: bool) -> bool {
+        match self {
+            BoolOp::On => true,
+            BoolOp::Off => false,
+            BoolOp::Toggle => !current,
+        }
+    }
+}
+
+/// Which layer of the option model a `:set` family command writes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetScope {
+    /// `:set` — write the global value *and* clear any local override, so the
+    /// new global actually shows through. This is Neovim's behaviour for
+    /// options that have both a global and a local layer.
+    Auto,
+    /// `:setlocal` — write the buffer/window-local override only, leaving the
+    /// global alone.
+    Local,
+    /// `:setglobal` — write the global only, leaving local overrides intact
+    /// (so the current buffer/window may not visibly change).
+    Global,
+}
+
 /// A single option change from `:set` (`:set number`, `:set ts=4`, …).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetItem {
-    Number(bool),
-    Wrap(bool),
-    Expandtab(bool),
+    Number(BoolOp),
+    Relativenumber(BoolOp),
+    Wrap(BoolOp),
+    Expandtab(BoolOp),
+    Autoindent(BoolOp),
+    Ignorecase(BoolOp),
+    Smartcase(BoolOp),
+    Hlsearch(BoolOp),
+    Splitbelow(BoolOp),
+    Splitright(BoolOp),
+    Foldenable(BoolOp),
     Tabstop(i64),
     Shiftwidth(i64),
     Scrolloff(i64),
-    Foldenable(bool),
     Foldmethod(ctrlvim_options::FoldMethod),
     Foldcolumn(i64),
     /// An unrecognized option name, reported as an error.
@@ -313,10 +357,12 @@ pub(crate) enum ExParsed {
     Undo(usize),
     /// Redo `n` changes (`:redo`, `:later N`).
     Redo(usize),
-    /// Apply option changes (`:set …`).
-    Set(Vec<SetItem>),
-    /// Define a Normal-mode mapping (`:map`/`:nnoremap` …).
-    Map { lhs: String, rhs: String },
+    /// Apply option changes (`:set …`/`:setlocal …`/`:setglobal …`).
+    Set { scope: SetScope, items: Vec<SetItem> },
+    /// Define a mapping (`:map`/`:nnoremap`/`:imap`/`:vmap` …).
+    Map { mode: crate::keymap::MapMode, lhs: String, rhs: String },
+    /// Remove a mapping (`:unmap`/`:iunmap`/`:vunmap`).
+    Unmap { mode: crate::keymap::MapMode, lhs: String },
     /// Define a user command (`:command Name expansion`).
     DefineCommand { name: String, repl: String },
     /// Remove all user-defined commands (`:comclear`).
@@ -361,21 +407,30 @@ fn parse_set(arg: &str) -> Vec<SetItem> {
                     _ => SetItem::Unknown(name.to_string()),
                 };
             }
-            // Boolean options: `name`, `noname`, `invname`/`name!`.
-            let (base, value) = if let Some(rest) = tok.strip_prefix("no") {
-                (rest, false)
-            } else if let Some(rest) = tok.strip_prefix("inv") {
-                (rest, true) // toggle; treated as "on" (no query state here)
+            // Boolean options: `name`, `noname`, `invname`/`name!`. The `inv`
+            // and `!` forms are genuine toggles — they need the current value,
+            // so they resolve later against live option state.
+            let (base, op) = if let Some(rest) = tok.strip_prefix("inv") {
+                (rest, BoolOp::Toggle)
             } else if let Some(rest) = tok.strip_suffix('!') {
-                (rest, true)
+                (rest, BoolOp::Toggle)
+            } else if let Some(rest) = tok.strip_prefix("no") {
+                (rest, BoolOp::Off)
             } else {
-                (tok, true)
+                (tok, BoolOp::On)
             };
             match base {
-                "number" | "nu" => SetItem::Number(value),
-                "wrap" => SetItem::Wrap(value),
-                "expandtab" | "et" => SetItem::Expandtab(value),
-                "foldenable" | "fen" => SetItem::Foldenable(value),
+                "number" | "nu" => SetItem::Number(op),
+                "relativenumber" | "rnu" => SetItem::Relativenumber(op),
+                "wrap" => SetItem::Wrap(op),
+                "expandtab" | "et" => SetItem::Expandtab(op),
+                "autoindent" | "ai" => SetItem::Autoindent(op),
+                "ignorecase" | "ic" => SetItem::Ignorecase(op),
+                "smartcase" | "scs" => SetItem::Smartcase(op),
+                "hlsearch" | "hls" => SetItem::Hlsearch(op),
+                "splitbelow" | "sb" => SetItem::Splitbelow(op),
+                "splitright" | "spr" => SetItem::Splitright(op),
+                "foldenable" | "fen" => SetItem::Foldenable(op),
                 other => SetItem::Unknown(other.to_string()),
             }
         })
@@ -411,16 +466,39 @@ pub(crate) fn parse_ex(cmd: &str) -> ExParsed {
         "red" | "redo" => return ExParsed::Redo(1),
         "ea" | "earlier" => return ExParsed::Undo(count_arg(arg, 1)),
         "lat" | "later" => return ExParsed::Redo(count_arg(arg, 1)),
-        "se" | "set" | "setl" | "setlocal" | "setg" | "setglobal" => {
-            return ExParsed::Set(parse_set(arg));
+        "se" | "set" => return ExParsed::Set { scope: SetScope::Auto, items: parse_set(arg) },
+        "setl" | "setlocal" => {
+            return ExParsed::Set { scope: SetScope::Local, items: parse_set(arg) }
         }
-        // Normal-mode mappings (variants collapse to normal mode for now).
-        "map" | "nmap" | "nnoremap" | "noremap" | "nore" => {
+        "setg" | "setglobal" => {
+            return ExParsed::Set { scope: SetScope::Global, items: parse_set(arg) }
+        }
+        // Mappings. `:map`/`:noremap` without a mode letter apply to normal
+        // mode, matching how a bare `:map` behaves here.
+        "map" | "nmap" | "nnoremap" | "noremap" | "nore" | "imap" | "inoremap" | "vmap"
+        | "vnoremap" | "xmap" | "xnoremap" => {
+            let mode = match name {
+                "imap" | "inoremap" => crate::keymap::MapMode::Insert,
+                "vmap" | "vnoremap" | "xmap" | "xnoremap" => crate::keymap::MapMode::Visual,
+                _ => crate::keymap::MapMode::Normal,
+            };
             let (lhs, rhs) = split_first_word(arg);
             if !lhs.is_empty() && !rhs.is_empty() {
-                return ExParsed::Map { lhs, rhs };
+                return ExParsed::Map { mode, lhs, rhs };
             }
             return ExParsed::Nop;
+        }
+        "unmap" | "nunmap" | "iunmap" | "vunmap" | "xunmap" => {
+            let mode = match name {
+                "iunmap" => crate::keymap::MapMode::Insert,
+                "vunmap" | "xunmap" => crate::keymap::MapMode::Visual,
+                _ => crate::keymap::MapMode::Normal,
+            };
+            let lhs = arg.trim().to_string();
+            if lhs.is_empty() {
+                return ExParsed::Nop;
+            }
+            return ExParsed::Unmap { mode, lhs };
         }
         "command" | "com" | "comm" => {
             // Skip attribute flags like `-nargs=1` before the command name.
@@ -643,12 +721,61 @@ mod tests {
         assert!(matches!(parse_ex("earlier 3"), ExParsed::Undo(3)));
         assert!(matches!(parse_ex("later 2"), ExParsed::Redo(2)));
         match parse_ex("set number ts=4 nowrap") {
-            ExParsed::Set(items) => {
-                assert_eq!(items[0], SetItem::Number(true));
+            ExParsed::Set { scope, items } => {
+                assert_eq!(scope, SetScope::Auto);
+                assert_eq!(items[0], SetItem::Number(BoolOp::On));
                 assert_eq!(items[1], SetItem::Tabstop(4));
-                assert_eq!(items[2], SetItem::Wrap(false));
+                assert_eq!(items[2], SetItem::Wrap(BoolOp::Off));
             }
             _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn map_commands_select_their_mode() {
+        use crate::keymap::MapMode;
+        for (cmd, want) in [
+            ("nnoremap gx :dash<CR>", MapMode::Normal),
+            ("map gx :dash<CR>", MapMode::Normal),
+            ("inoremap jk <Esc>", MapMode::Insert),
+            ("vnoremap gx :dash<CR>", MapMode::Visual),
+            ("xnoremap gx :dash<CR>", MapMode::Visual),
+        ] {
+            match parse_ex(cmd) {
+                ExParsed::Map { mode, .. } => assert_eq!(mode, want, "{cmd}"),
+                _ => panic!("expected Map for {cmd}"),
+            }
+        }
+        match parse_ex("iunmap jk") {
+            ExParsed::Unmap { mode, lhs } => {
+                assert_eq!(mode, MapMode::Insert);
+                assert_eq!(lhs, "jk");
+            }
+            _ => panic!("expected Unmap"),
+        }
+    }
+
+    #[test]
+    fn set_scope_and_toggle_forms_parse() {
+        // `inv{opt}` and `{opt}!` are toggles, not "set to on".
+        for form in ["set invnumber", "set number!"] {
+            match parse_ex(form) {
+                ExParsed::Set { items, .. } => {
+                    assert_eq!(items[0], SetItem::Number(BoolOp::Toggle), "{form}")
+                }
+                _ => panic!("expected Set for {form}"),
+            }
+        }
+        // The three spellings select three different write targets.
+        for (form, want) in [
+            ("set nu", SetScope::Auto),
+            ("setlocal nu", SetScope::Local),
+            ("setglobal nu", SetScope::Global),
+        ] {
+            match parse_ex(form) {
+                ExParsed::Set { scope, .. } => assert_eq!(scope, want, "{form}"),
+                _ => panic!("expected Set for {form}"),
+            }
         }
     }
 }

@@ -1,23 +1,79 @@
 //! User configuration, read from `~/.config/ctrlvim/config.toml` on startup.
 //!
-//! ctrlvim has no config crate dependency, so this parses the small subset of
-//! TOML the config actually uses — `key = value` lines (`true`/`false`, quoted
-//! strings, integers), `# comments`, and `[section]` headers (which are
-//! accepted and ignored; keys are matched by name). Anything unrecognized is
-//! skipped, so an over-rich file never breaks startup.
+//! ctrlvim is configured in TOML rather than a config *script*. The split that
+//! makes this work is declarative-vs-imperative: TOML expresses the wiring —
+//! which options are set, which key runs which command, which event triggers
+//! which command, which plugins to load — and anything that needs actual logic
+//! lives in a plugin that TOML then refers to *by name*.
+//!
+//! The bridge is the Ex command. A keymap's `rhs` and an autocmd's `command`
+//! are ordinary `:` commands, so a plugin contributes behaviour by registering
+//! `:Format` (via `:command`) and the config just names it. That keeps the
+//! config free of embedded code without losing extensibility.
+//!
+//! `[options]` is deliberately untyped: every key becomes a `:set` argument, so
+//! any option the engine gains works here immediately with no change to this
+//! file.
 //!
 //! Settings here can also be flipped live from the dashboard's Settings tab,
-//! which writes the file back via [`Config::save`].
-//!
-//! `plugin = "path"` lines declare Lua scripts to run once at startup, in the
-//! order they appear, over the same `:luafile` path ([`crate::app::App`]'s
-//! `host_source`). Repeat the key for more than one plugin; there's no array
-//! syntax in this parser. Paths are resolved relative to the current
-//! directory unless absolute, and a leading `~/` expands to `$HOME`.
+//! which writes the file back via [`Config::save`]. That write goes through
+//! `toml_edit`, so a hand-written config keeps its comments, ordering, and
+//! formatting — and, critically, keeps the sections this file does not manage.
 
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::icons::IconMode;
+
+/// A key mapping declared in the config (`[[keymap]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct KeymapEntry {
+    /// Mode the mapping applies in: `n`, `i`, `v`, … Defaults to normal.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    /// Left-hand side, in `<...>` notation (`<leader>f`, `<C-p>`).
+    pub lhs: String,
+    /// Right-hand side — keys to replay, usually an Ex command.
+    pub rhs: String,
+}
+
+/// An autocommand declared in the config (`[[autocmd]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AutocmdEntry {
+    /// Event name, e.g. `BufWritePre`.
+    pub event: String,
+    /// File pattern the event must match. Defaults to every file.
+    #[serde(default = "default_pattern")]
+    pub pattern: String,
+    /// Ex command to run when it fires.
+    pub command: String,
+}
+
+/// A plugin declared in the config (`[[plugin]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PluginEntry {
+    /// Display name.
+    pub name: String,
+    /// Directory holding the plugin. `~` is expanded.
+    pub path: String,
+    /// Load lazily on this event instead of at startup.
+    #[serde(default)]
+    pub event: Option<String>,
+    /// Set false to keep the plugin declared but not loaded.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_mode() -> String {
+    "n".to_string()
+}
+fn default_pattern() -> String {
+    "*".to_string()
+}
+fn default_true() -> bool {
+    true
+}
 
 /// Parsed user configuration. Every field has a sensible default so a missing
 /// or partial file still yields a usable config.
@@ -32,13 +88,14 @@ pub struct Config {
     /// How file icons are drawn: Nerd Font glyphs, extension text, or auto-
     /// detect (see [`crate::icons`]).
     pub icons: IconMode,
-    /// Lua scripts to run once at startup, in file order (`plugin = "path"`
-    /// lines). Empty by default — ctrlvim loads nothing unless asked.
-    pub plugins: Vec<PathBuf>,
-    /// The shell used to run external commands (`:!`, `:make`-style jobs via
-    /// `sh -c`-style invocation). Defaults to `zsh` on macOS and `bash`
-    /// everywhere else, overridden with `shell = "fish"` in `config.toml`.
-    pub shell: String,
+    /// Theme name from `[ui] theme`. `None` leaves the persisted choice alone.
+    pub theme: Option<String>,
+    /// `[options]` flattened into `:set` arguments, in file order — e.g.
+    /// `number = true` becomes `number`, `tabstop = 4` becomes `tabstop=4`.
+    pub set_args: Vec<String>,
+    pub keymaps: Vec<KeymapEntry>,
+    pub autocmds: Vec<AutocmdEntry>,
+    pub plugins: Vec<PluginEntry>,
 }
 
 impl Default for Config {
@@ -47,16 +104,57 @@ impl Default for Config {
             drawer: false,
             mouse: true,
             icons: IconMode::Auto,
+            theme: None,
+            set_args: Vec::new(),
+            keymaps: Vec::new(),
+            autocmds: Vec::new(),
             plugins: Vec::new(),
-            shell: default_shell(),
         }
     }
 }
 
-/// The shell to fall back to when `config.toml` doesn't set one: `zsh` on
-/// macOS (its login default since Catalina), `bash` elsewhere.
-fn default_shell() -> String {
-    if cfg!(target_os = "macos") { "zsh".to_string() } else { "bash".to_string() }
+/// The on-disk shape, before defaults are resolved. Kept separate from
+/// [`Config`] so the runtime struct has no `Option`s to unwrap at every use.
+#[derive(Debug, Default, Deserialize)]
+struct RawConfig {
+    // Legacy top-level keys, still honored so configs written before the
+    // sectioned schema keep working untouched.
+    drawer: Option<bool>,
+    sidebar: Option<bool>,
+    mouse: Option<bool>,
+    icons: Option<String>,
+    nerd_font: Option<String>,
+    nerd_fonts: Option<String>,
+
+    #[serde(default)]
+    ui: UiSection,
+    /// Untyped on purpose — see the module docs.
+    #[serde(default)]
+    options: std::collections::BTreeMap<String, OptionValue>,
+    #[serde(default)]
+    keymap: Vec<KeymapEntry>,
+    #[serde(default)]
+    autocmd: Vec<AutocmdEntry>,
+    #[serde(default)]
+    plugin: Vec<PluginEntry>,
+}
+
+/// The value shapes `[options]` accepts, mirroring what `:set` can express.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+enum OptionValue {
+    Bool(bool),
+    Int(i64),
+    Str(String),
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UiSection {
+    drawer: Option<bool>,
+    sidebar: Option<bool>,
+    mouse: Option<bool>,
+    icons: Option<String>,
+    theme: Option<String>,
 }
 
 impl Config {
@@ -82,6 +180,40 @@ impl Config {
         }
     }
 
+    /// Parse a config document. A malformed file yields defaults rather than a
+    /// hard failure, so a typo never leaves the user without an editor.
+    pub fn parse(text: &str) -> Self {
+        let raw: RawConfig = match toml_edit::de::from_str(text) {
+            Ok(r) => r,
+            Err(_) => return Config::default(),
+        };
+        let d = Config::default();
+        // `[ui]` wins over the legacy top-level spelling when both are present.
+        Config {
+            drawer: raw
+                .ui
+                .drawer
+                .or(raw.ui.sidebar)
+                .or(raw.drawer)
+                .or(raw.sidebar)
+                .unwrap_or(d.drawer),
+            mouse: raw.ui.mouse.or(raw.mouse).unwrap_or(d.mouse),
+            icons: raw
+                .ui
+                .icons
+                .or(raw.icons)
+                .or(raw.nerd_font)
+                .or(raw.nerd_fonts)
+                .and_then(|v| IconMode::parse(&v))
+                .unwrap_or(d.icons),
+            theme: raw.ui.theme,
+            set_args: set_args_from(&raw.options),
+            keymaps: raw.keymap,
+            autocmds: raw.autocmd,
+            plugins: raw.plugin,
+        }
+    }
+
     /// Persist the config back to disk (best-effort; failures are ignored).
     pub fn save(&self) {
         if let Some(path) = Self::path() {
@@ -89,106 +221,76 @@ impl Config {
         }
     }
 
-    /// Serialize and write to a specific path, creating parent dirs.
+    /// Write the three UI settings back, leaving every other part of the file —
+    /// comments, ordering, `[options]`, `[[keymap]]`, … — exactly as it was.
+    ///
+    /// This is why the write path goes through `toml_edit` rather than
+    /// re-serializing [`Config`]: the Settings tab must not be able to delete a
+    /// hand-written config just by toggling a checkbox.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, self.to_toml())
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc = existing
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|_| Self::template().parse().expect("template is valid TOML"));
+        if doc.as_table().is_empty() {
+            doc = Self::template().parse().expect("template is valid TOML");
+        }
+
+        // Write into `[ui]` if the file already uses it, otherwise keep the
+        // legacy top-level keys where the user put them.
+        if doc.get("ui").is_some() {
+            let ui = &mut doc["ui"];
+            ui["drawer"] = toml_edit::value(self.drawer);
+            ui["mouse"] = toml_edit::value(self.mouse);
+            ui["icons"] = toml_edit::value(self.icons.as_str());
+        } else {
+            doc["drawer"] = toml_edit::value(self.drawer);
+            doc["mouse"] = toml_edit::value(self.mouse);
+            doc["icons"] = toml_edit::value(self.icons.as_str());
+        }
+        std::fs::write(path, doc.to_string())
     }
 
-    /// Render the config as a TOML document.
-    fn to_toml(&self) -> String {
-        let mut text = format!(
-            "# ctrlvim config\n\n\
-             # Open the file drawer on startup.\n\
-             drawer = {}\n\n\
-             # Mouse wheel scrolling in the editor. Turn this off to give the\n\
-             # wheel back to the terminal's own scrollback.\n\
-             mouse = {}\n\n\
-             # File icons: \"auto\" (Nerd Font glyphs if one is installed),\n\
-             # \"nerd\" (always glyphs), or \"text\" (a letter per filetype).\n\
-             icons = \"{}\"\n\n\
-             # Shell used to run external commands. Defaults to zsh on macOS,\n\
-             # bash elsewhere.\n\
-             shell = \"{}\"\n",
-            self.drawer,
-            self.mouse,
-            self.icons.as_str(),
-            self.shell,
-        );
-        if !self.plugins.is_empty() {
-            text.push_str(
-                "\n# Lua plugins to run once at startup, in order (one `plugin = \"path\"`\n\
-                 # line each; see examples/plugins/ for a sample).\n",
-            );
-            for path in &self.plugins {
-                text.push_str(&format!("plugin = \"{}\"\n", path.display()));
-            }
-        }
-        text
-    }
-
-    /// Parse the TOML subset described in the module docs.
-    pub fn parse(text: &str) -> Self {
-        let mut cfg = Config::default();
-        for line in text.lines() {
-            // Strip comments and skip blanks / section headers.
-            let line = match line.find('#') {
-                Some(i) => &line[..i],
-                None => line,
-            };
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('[') {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else { continue };
-            let key = key.trim();
-            let value = value.trim().trim_matches('"');
-            match key {
-                "drawer" | "sidebar" => {
-                    if let Some(b) = parse_bool(value) {
-                        cfg.drawer = b;
-                    }
-                }
-                "mouse" => {
-                    if let Some(b) = parse_bool(value) {
-                        cfg.mouse = b;
-                    }
-                }
-                "icons" | "nerd_font" | "nerd_fonts" => {
-                    if let Some(m) = IconMode::parse(value) {
-                        cfg.icons = m;
-                    }
-                }
-                "plugin" => {
-                    if !value.is_empty() {
-                        cfg.plugins.push(expand_tilde(value));
-                    }
-                }
-                "shell" => {
-                    if !value.is_empty() {
-                        cfg.shell = value.to_string();
-                    }
-                }
-                _ => {}
-            }
-        }
-        cfg
+    /// The starter config written when none exists yet.
+    fn template() -> &'static str {
+        "# ctrlvim config\n\
+         \n\
+         # Open the file drawer on startup.\n\
+         drawer = false\n\
+         \n\
+         # Mouse wheel scrolling in the editor. Turn this off to give the\n\
+         # wheel back to the terminal's own scrollback.\n\
+         mouse = true\n\
+         \n\
+         # File icons: \"auto\" (Nerd Font glyphs if one is installed),\n\
+         # \"nerd\" (always glyphs), or \"text\" (a letter per filetype).\n\
+         icons = \"auto\"\n"
     }
 }
 
-fn parse_bool(v: &str) -> Option<bool> {
-    match v {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
+/// Flatten an `[options]` table into `:set` arguments.
+///
+/// `true` becomes a bare option name and `false` its `no`-prefixed form, which
+/// is exactly what `:set` already understands — so this needs no knowledge of
+/// which options exist, and picks up new ones for free.
+fn set_args_from(table: &std::collections::BTreeMap<String, OptionValue>) -> Vec<String> {
+    table
+        .iter()
+        .map(|(key, value)| match value {
+            OptionValue::Bool(true) => key.clone(),
+            OptionValue::Bool(false) => format!("no{key}"),
+            OptionValue::Int(n) => format!("{key}={n}"),
+            OptionValue::Str(s) => format!("{key}={s}"),
+        })
+        .collect()
 }
 
 /// Expand a leading `~/` (or bare `~`) to `$HOME`; other paths pass through
 /// unchanged (resolved relative to the current directory when read).
-fn expand_tilde(path: &str) -> PathBuf {
+pub fn expand_tilde(path: &str) -> PathBuf {
     match path.strip_prefix('~') {
         Some(rest) if rest.is_empty() => crate::data::home().unwrap_or_else(|| PathBuf::from("~")),
         Some(rest) if rest.starts_with('/') => match crate::data::home() {
@@ -209,19 +311,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_drawer_option() {
+    fn parses_legacy_top_level_keys() {
         assert!(Config::parse("drawer = true").drawer);
         assert!(!Config::parse("drawer = false").drawer);
-        // Alias, plus a comment and a section header are tolerated.
-        let text = "# my config\n[ui]\nsidebar = true # open it\n";
-        assert!(Config::parse(text).drawer);
+        assert!(Config::parse("# my config\nsidebar = true\n").drawer);
     }
 
     #[test]
-    fn parses_mouse_option() {
-        assert!(Config::parse("mouse = true").mouse);
-        assert!(!Config::parse("mouse = false").mouse);
-        assert!(Config::default().mouse, "on by default, as in Neovim");
+    fn parses_ui_section() {
+        let cfg = Config::parse("[ui]\ndrawer = true\nmouse = false\ntheme = \"Gruvbox\"\n");
+        assert!(cfg.drawer);
+        assert!(!cfg.mouse);
+        assert_eq!(cfg.theme.as_deref(), Some("Gruvbox"));
     }
 
     #[test]
@@ -229,69 +330,109 @@ mod tests {
         assert_eq!(Config::default().icons, IconMode::Auto);
         assert_eq!(Config::parse("icons = \"nerd\"").icons, IconMode::Nerd);
         assert_eq!(Config::parse("icons = \"text\"").icons, IconMode::Text);
-        // Alias, and an unparseable value keeps the default.
-        assert_eq!(Config::parse("nerd_font = true").icons, IconMode::Nerd);
         assert_eq!(Config::parse("icons = \"wat\"").icons, IconMode::Auto);
     }
 
     #[test]
-    fn parses_plugin_lines_in_order() {
-        assert!(Config::default().plugins.is_empty());
-        let text = "plugin = \"a.lua\"\nplugin = \"/abs/b.lua\"\n";
-        let plugins = Config::parse(text).plugins;
-        assert_eq!(plugins, vec![PathBuf::from("a.lua"), PathBuf::from("/abs/b.lua")]);
-    }
-
-    #[test]
-    fn expands_tilde_in_plugin_paths() {
-        // Reads the real $HOME rather than overriding it, so this can't race
-        // with other tests that read the same process-wide env var.
-        let home = crate::data::home().expect("HOME must be set to run this test");
-        assert_eq!(
-            Config::parse("plugin = \"~/plugins/hello.lua\"").plugins,
-            vec![home.join("plugins/hello.lua")]
+    fn options_become_set_arguments() {
+        let cfg = Config::parse(
+            "[options]\nnumber = true\nwrap = false\ntabstop = 4\nfoldmethod = \"indent\"\n",
         );
-        // A bare `~` (no trailing slash) also resolves.
-        assert_eq!(Config::parse("plugin = \"~\"").plugins, vec![home]);
+        assert!(cfg.set_args.contains(&"number".to_string()));
+        assert!(cfg.set_args.contains(&"nowrap".to_string()), "false → no-prefix");
+        assert!(cfg.set_args.contains(&"tabstop=4".to_string()));
+        assert!(cfg.set_args.contains(&"foldmethod=indent".to_string()));
     }
 
     #[test]
-    fn shell_defaults_by_platform() {
-        let expected = if cfg!(target_os = "macos") { "zsh" } else { "bash" };
-        assert_eq!(Config::default().shell, expected);
+    fn parses_keymaps_autocmds_and_plugins() {
+        let text = "\
+[[keymap]]
+lhs = \"<leader>f\"
+rhs = \":Files<CR>\"
+
+[[keymap]]
+mode = \"i\"
+lhs = \"jk\"
+rhs = \"<Esc>\"
+
+[[autocmd]]
+event = \"BufWritePre\"
+pattern = \"*.rs\"
+command = \"Format\"
+
+[[plugin]]
+name = \"demo\"
+path = \"~/.config/ctrlvim/pack/demo\"
+event = \"BufWritePre\"
+";
+        let cfg = Config::parse(text);
+        assert_eq!(cfg.keymaps.len(), 2);
+        assert_eq!(cfg.keymaps[0].mode, "n", "mode defaults to normal");
+        assert_eq!(cfg.keymaps[1].mode, "i");
+        assert_eq!(cfg.autocmds.len(), 1);
+        assert_eq!(cfg.autocmds[0].pattern, "*.rs");
+        assert_eq!(cfg.plugins.len(), 1);
+        assert!(cfg.plugins[0].enabled, "plugins are enabled unless told otherwise");
+        assert_eq!(cfg.plugins[0].event.as_deref(), Some("BufWritePre"));
     }
 
     #[test]
-    fn parses_shell_option() {
-        assert_eq!(Config::parse("shell = \"fish\"").shell, "fish");
-        // Empty value keeps the platform default rather than clearing it.
-        assert_eq!(Config::parse("shell = \"\"").shell, Config::default().shell);
+    fn an_autocmd_pattern_defaults_to_everything() {
+        let cfg = Config::parse("[[autocmd]]\nevent = \"BufEnter\"\ncommand = \"echo hi\"\n");
+        assert_eq!(cfg.autocmds[0].pattern, "*");
     }
 
     #[test]
-    fn unknown_keys_and_junk_are_ignored() {
-        let text = "wat = 3\nnonsense line\ndrawer = true\n";
-        assert!(Config::parse(text).drawer);
-        // Missing key → default.
-        assert!(!Config::parse("theme = \"Gruvbox\"").drawer);
+    fn a_malformed_file_falls_back_to_defaults() {
+        assert_eq!(Config::parse("this is not = = toml ["), Config::default());
     }
 
     #[test]
-    fn save_load_roundtrip() {
-        // Hermetic: writes to a unique temp file, never the real config dir.
+    fn saving_preserves_sections_it_does_not_manage() {
+        // The regression this guards: the Settings tab used to rewrite the file
+        // from scratch, which would silently delete a user's keymaps.
         let path = std::env::temp_dir()
             .join(format!("ctrlvim-cfg-{}-{:p}.toml", std::process::id(), &()));
-        let cfg = Config {
-            drawer: true,
-            mouse: true,
-            icons: IconMode::Text,
-            plugins: vec![PathBuf::from("a.lua"), PathBuf::from("/abs/b.lua")],
-            shell: "fish".to_string(),
-        };
+        let original = "\
+# keep me
+drawer = false
+mouse = true
+icons = \"auto\"
+
+[options]
+number = true
+
+[[keymap]]
+lhs = \"<leader>f\"
+rhs = \":Files<CR>\"
+";
+        std::fs::write(&path, original).unwrap();
+
+        let mut cfg = Config::load_from(&path);
+        cfg.drawer = true;
         cfg.save_to(&path).unwrap();
-        assert_eq!(Config::load_from(&path), cfg);
-        // A missing file loads defaults.
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# keep me"), "comments survive");
+        assert!(written.contains("[[keymap]]"), "keymaps survive");
+        assert!(written.contains("number = true"), "options survive");
+
+        let reloaded = Config::load_from(&path);
+        assert!(reloaded.drawer, "the toggled setting was persisted");
+        assert_eq!(reloaded.keymaps.len(), 1);
+        assert_eq!(reloaded.set_args, vec!["number".to_string()]);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(Config::load_from(&path), Config::default());
+    }
+
+    #[test]
+    fn save_creates_a_starter_file_when_none_exists() {
+        let path = std::env::temp_dir()
+            .join(format!("ctrlvim-new-{}-{:p}.toml", std::process::id(), &()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config { drawer: true, ..Config::default() };
+        cfg.save_to(&path).unwrap();
+        assert!(Config::load_from(&path).drawer);
+        let _ = std::fs::remove_file(&path);
     }
 }

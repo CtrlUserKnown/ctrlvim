@@ -4,6 +4,7 @@ members = [
     "crates/ctrlvim-types",
     "crates/ctrlvim-text",
     "crates/ctrlvim-options",
+    "crates/ctrlvim-regex",
     "crates/ctrlvim-editor",
     "crates/ctrlvim-vimscript",
     "crates/ctrlvim-treesitter",
@@ -27,6 +28,7 @@ rust-version = "1.80"
 ctrlvim-types = { path = "crates/ctrlvim-types" }
 ctrlvim-text = { path = "crates/ctrlvim-text" }
 ctrlvim-options = { path = "crates/ctrlvim-options" }
+ctrlvim-regex = { path = "crates/ctrlvim-regex" }
 ctrlvim-editor = { path = "crates/ctrlvim-editor" }
 ctrlvim-vimscript = { path = "crates/ctrlvim-vimscript" }
 ctrlvim-treesitter = { path = "crates/ctrlvim-treesitter" }
@@ -40,8 +42,10 @@ ctrlvim-tools = { path = "crates/ctrlvim-tools" }
 
 ratatui = "0.29"
 crossterm = "0.28"
-regex = "1"
 ropey = "1.6"
+unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml_edit = { version = "0.22", features = ["serde"] }
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "net", "io-util", "macros"] }
 rmpv = "1"

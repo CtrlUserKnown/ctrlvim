@@ -179,18 +179,47 @@ impl Editor {
     /// Split the current window, updating the layout tree. `vertical` chooses a
     /// Row (side-by-side) vs Col (stacked) split. Returns the new window id.
     pub fn split_current(&mut self, vertical: bool) -> WindowId {
+        self.split_current_placed(vertical, false)
+    }
+
+    /// Split the current window, placing the new one *before* the current one
+    /// (above for a horizontal split, left for a vertical one) when `before` is
+    /// set. That is Vim's default; `'splitbelow'`/`'splitright'` invert it.
+    pub fn split_current_placed(&mut self, vertical: bool, before: bool) -> WindowId {
         let cur = self.current_window;
         let bufid = self.window(cur).unwrap().buffer;
         let new_id = WindowId(self.windows.len() as u32);
         self.windows.push(Some(Window::new(bufid)));
-        self.layout = Self::split_in_frame(std::mem::replace(&mut self.layout, Frame::Leaf(cur)), cur, new_id, vertical);
+        // The new window inherits the current one's cursor, as Vim does — a
+        // split shows the same view twice rather than jumping to the top.
+        let cursor = self.window(cur).unwrap().cursor;
+        if let Some(w) = self.window_mut(new_id) {
+            w.cursor = cursor;
+        }
+        self.layout = Self::split_in_frame(
+            std::mem::replace(&mut self.layout, Frame::Leaf(cur)),
+            cur,
+            new_id,
+            vertical,
+            before,
+        );
         new_id
     }
 
-    fn split_in_frame(frame: Frame, target: WindowId, new_id: WindowId, vertical: bool) -> Frame {
+    fn split_in_frame(
+        frame: Frame,
+        target: WindowId,
+        new_id: WindowId,
+        vertical: bool,
+        before: bool,
+    ) -> Frame {
         match frame {
             Frame::Leaf(id) if id == target => {
-                let pair = vec![Frame::Leaf(id), Frame::Leaf(new_id)];
+                let pair = if before {
+                    vec![Frame::Leaf(new_id), Frame::Leaf(id)]
+                } else {
+                    vec![Frame::Leaf(id), Frame::Leaf(new_id)]
+                };
                 if vertical {
                     Frame::Row(pair)
                 } else {
@@ -201,13 +230,13 @@ impl Editor {
             Frame::Row(children) => Frame::Row(
                 children
                     .into_iter()
-                    .map(|c| Self::split_in_frame(c, target, new_id, vertical))
+                    .map(|c| Self::split_in_frame(c, target, new_id, vertical, before))
                     .collect(),
             ),
             Frame::Col(children) => Frame::Col(
                 children
                     .into_iter()
-                    .map(|c| Self::split_in_frame(c, target, new_id, vertical))
+                    .map(|c| Self::split_in_frame(c, target, new_id, vertical, before))
                     .collect(),
             ),
         }
@@ -269,10 +298,72 @@ impl Editor {
         self.layout.layout(0, 0, width, height)
     }
 
+    /// Move focus to the nearest window in `dir` (`<C-w>h/j/k/l`).
+    ///
+    /// Geometry is computed against a reference grid rather than the real
+    /// terminal size: the layout tree is proportional, so relative position —
+    /// which is all "is that window to my left" needs — is size-independent.
+    pub fn focus_dir(&mut self, dir: Dir) -> bool {
+        const REF: usize = 1000;
+        let rects = self.layout_rects(REF, REF);
+        let Some(&(_, cx, cy, cw, ch)) = rects.iter().find(|(id, ..)| *id == self.current_window)
+        else {
+            return false;
+        };
+        let (ccx, ccy) = (cx + cw / 2, cy + ch / 2);
+
+        // Candidates strictly beyond the current window's edge in `dir`, ranked
+        // by how close that edge is, then by centre-line offset on the other
+        // axis — so `<C-w>j` from a tall left column lands in the window
+        // directly below rather than one off to the side.
+        let best = rects
+            .iter()
+            .filter(|(id, ..)| *id != self.current_window)
+            .filter_map(|&(id, x, y, w, h)| {
+                let (primary, secondary) = match dir {
+                    Dir::Left if x + w <= cx => (cx - (x + w), (y + h / 2).abs_diff(ccy)),
+                    Dir::Right if x >= cx + cw => (x - (cx + cw), (y + h / 2).abs_diff(ccy)),
+                    Dir::Up if y + h <= cy => (cy - (y + h), (x + w / 2).abs_diff(ccx)),
+                    Dir::Down if y >= cy + ch => (y - (cy + ch), (x + w / 2).abs_diff(ccx)),
+                    _ => return None,
+                };
+                Some((primary, secondary, id))
+            })
+            .min();
+
+        match best {
+            Some((_, _, id)) => {
+                self.current_window = id;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Close every window except the current one (`<C-w>o` / `:only`).
+    pub fn only_current_window(&mut self) {
+        let cur = self.current_window;
+        for id in self.window_ids() {
+            if id != cur {
+                self.windows[id.0 as usize] = None;
+            }
+        }
+        self.layout = Frame::Leaf(cur);
+    }
+
     /// Dump the current buffer as a string (for demos/tests).
     pub fn dump(&self) -> String {
         self.cur_buffer().text.to_string()
     }
+}
+
+/// A window-navigation direction (`<C-w>h/j/k/l`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 impl Default for Editor {

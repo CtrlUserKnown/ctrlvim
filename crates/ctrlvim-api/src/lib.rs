@@ -82,6 +82,29 @@ impl ApiContext {
         interp.run(src)
     }
 
+    /// Run an Ex command through the session, exactly as typing it would.
+    ///
+    /// `:set` and `:map` are Ex commands, not Vimscript, so they must go here
+    /// rather than through [`Self::exec_vimscript`] — the interpreter would
+    /// treat `set number` as an expression and fail.
+    pub fn exec_ex(&mut self, cmd: &str) {
+        self.session.feed_str(":");
+        for c in cmd.chars() {
+            self.session.feed(ctrlvim_editor::Key::Char(c));
+        }
+        self.session.feed(ctrlvim_editor::Key::Enter);
+    }
+
+    /// Read a Vimscript global (`g:name`), backing `vim.g.name`.
+    pub fn get_global(&self, name: &str) -> Option<ctrlvim_types::Object> {
+        self.script.globals.get(name).cloned()
+    }
+
+    /// Set a Vimscript global, backing `vim.g.name = value`.
+    pub fn set_global(&mut self, name: &str, value: ctrlvim_types::Object) {
+        self.script.globals.insert(name.to_string(), value);
+    }
+
     /// Shared read access to the editor.
     pub fn editor(&self) -> &Editor {
         &self.session.editor

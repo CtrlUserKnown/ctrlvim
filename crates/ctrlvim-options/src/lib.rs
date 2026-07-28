@@ -46,12 +46,22 @@ pub struct GlobalOptions {
     pub shiftwidth: i64,
     pub expandtab: bool,
     pub number: bool,
+    pub relativenumber: bool,
     pub wrap: bool,
     pub scrolloff: i64,
     pub iskeyword: String,
     pub foldenable: bool,
     pub foldmethod: FoldMethod,
     pub foldcolumn: i64,
+    pub autoindent: bool,
+    // Search behaviour. `'hlsearch'` is the master switch; whether matches are
+    // *currently* lit is separate transient state owned by the session (`:noh`).
+    pub ignorecase: bool,
+    pub smartcase: bool,
+    pub hlsearch: bool,
+    // Where `:split`/`:vsplit` put the new window.
+    pub splitbelow: bool,
+    pub splitright: bool,
 }
 
 impl Default for GlobalOptions {
@@ -62,12 +72,20 @@ impl Default for GlobalOptions {
             shiftwidth: 8,
             expandtab: false,
             number: false,
+            relativenumber: false,
             wrap: true,
             scrolloff: 0,
             iskeyword: "@,48-57,_,192-255".to_string(),
             foldenable: true,
             foldmethod: FoldMethod::Manual,
             foldcolumn: 0,
+            autoindent: false,
+            ignorecase: false,
+            smartcase: false,
+            // Neovim defaults 'hlsearch' on; Vim defaults it off.
+            hlsearch: true,
+            splitbelow: false,
+            splitright: false,
         }
     }
 }
@@ -79,12 +97,14 @@ pub struct BufferOptions {
     pub shiftwidth: Option<i64>,
     pub expandtab: Option<bool>,
     pub iskeyword: Option<String>,
+    pub autoindent: Option<bool>,
 }
 
 /// Window-local option overrides. `None` means "inherit from global".
 #[derive(Debug, Clone, Default)]
 pub struct WindowOptions {
     pub number: Option<bool>,
+    pub relativenumber: Option<bool>,
     pub wrap: Option<bool>,
     pub scrolloff: Option<i64>,
     pub foldenable: Option<bool>,
@@ -123,10 +143,35 @@ impl OptionContext<'_> {
             .as_deref()
             .unwrap_or(&self.global.iskeyword)
     }
+    pub fn autoindent(&self) -> bool {
+        self.buffer.autoindent.unwrap_or(self.global.autoindent)
+    }
+
+    // Global-only.
+    pub fn ignorecase(&self) -> bool {
+        self.global.ignorecase
+    }
+    pub fn smartcase(&self) -> bool {
+        self.global.smartcase
+    }
+    pub fn hlsearch(&self) -> bool {
+        self.global.hlsearch
+    }
+    pub fn splitbelow(&self) -> bool {
+        self.global.splitbelow
+    }
+    pub fn splitright(&self) -> bool {
+        self.global.splitright
+    }
 
     // Window-local-with-global-fallback.
     pub fn number(&self) -> bool {
         self.window.number.unwrap_or(self.global.number)
+    }
+    pub fn relativenumber(&self) -> bool {
+        self.window
+            .relativenumber
+            .unwrap_or(self.global.relativenumber)
     }
     pub fn wrap(&self) -> bool {
         self.window.wrap.unwrap_or(self.global.wrap)

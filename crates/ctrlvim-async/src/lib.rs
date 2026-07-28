@@ -15,8 +15,11 @@
 pub mod event;
 pub mod job;
 pub mod rpc;
+pub mod server;
 pub mod timer;
 
 pub use event::{Event, EventLoop};
 pub use job::{Jobs, LineBuffer};
 pub use timer::{TimerHandle, TimerService};
+
+pub use server::{Connection, RpcServer};
