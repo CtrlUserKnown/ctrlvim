@@ -55,3 +55,12 @@ thiserror = "1"
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }
+
+# `cargo run` is how ctrlvim is developed, and an editor that stutters while you
+# type is not testable. Almost all of the per-keystroke cost sits in
+# dependencies — the tree-sitter grammars (C) and ropey — where an unoptimized
+# build is 3-4x slower than a release one for no debugging benefit: nobody steps
+# through a generated parser. Our own crates stay unoptimized so breakpoints and
+# backtraces still work.
+[profile.dev.package."*"]
+opt-level = 2

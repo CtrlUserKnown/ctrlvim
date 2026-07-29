@@ -27,6 +27,10 @@ pub enum Operator {
     Lower,
     Upper,
     ToggleCase,
+    /// Visual `r{c}` — overwrite every character in the span with `c`. It is a
+    /// per-character rewrite like the case operators, not a delete-and-insert,
+    /// which is why line structure survives a multi-line selection.
+    Replace(char),
     /// `zf` — fold the swept lines. Unlike the others this changes no text; the
     /// session applies it, because folds are window state this layer can't see.
     Fold,
@@ -123,10 +127,13 @@ pub fn apply_operator(
     span: OperatorSpan,
     reg: Option<char>,
 ) -> OperatorOutcome {
-    // Indent and case transforms don't yank/delete; handle them separately.
+    // Indent and the per-character rewrites don't yank/delete; handle them
+    // separately.
     match op {
         Operator::Indent { right } => return apply_indent(editor, span, right),
-        Operator::Lower | Operator::Upper | Operator::ToggleCase => return apply_case(editor, op, span),
+        Operator::Lower | Operator::Upper | Operator::ToggleCase | Operator::Replace(_) => {
+            return apply_transform(editor, op, span)
+        }
         // Handled by the session (it owns the window's folds); reaching here
         // means nothing to do to the text.
         Operator::Fold => {
@@ -166,11 +173,16 @@ fn apply_indent(editor: &mut Editor, span: OperatorSpan, right: bool) -> Operato
     OperatorOutcome { cursor, enter_insert: false }
 }
 
-/// `gu`/`gU`/`g~` — transform the case of the spanned characters in place.
-fn apply_case(editor: &mut Editor, op: Operator, span: OperatorSpan) -> OperatorOutcome {
+/// `gu`/`gU`/`g~` and visual `r{c}` — rewrite the spanned characters in place.
+///
+/// These share one implementation because they are the same operation with a
+/// different per-character function: no text is added or removed, so a span
+/// crossing lines keeps its line breaks rather than joining anything.
+fn apply_transform(editor: &mut Editor, op: Operator, span: OperatorSpan) -> OperatorOutcome {
     let transform = |c: char| match op {
         Operator::Lower => c.to_lowercase().next().unwrap_or(c),
         Operator::Upper => c.to_uppercase().next().unwrap_or(c),
+        Operator::Replace(to) => to,
         _ => {
             if c.is_uppercase() {
                 c.to_lowercase().next().unwrap_or(c)
@@ -181,9 +193,9 @@ fn apply_case(editor: &mut Editor, op: Operator, span: OperatorSpan) -> Operator
     };
     let buf = &editor.cur_buffer().text;
     let last = buf.line_count().saturating_sub(1);
+    let (l0, l1) = (span.start.line.min(last), span.end.line.min(last));
     match span.kind {
         MotionKind::Linewise => {
-            let (l0, l1) = (span.start.line.min(last), span.end.line.min(last));
             let new: Vec<String> = (l0..=l1)
                 .map(|i| buf.line(i).unwrap_or_default().chars().map(transform).collect())
                 .collect();
@@ -192,21 +204,28 @@ fn apply_case(editor: &mut Editor, op: Operator, span: OperatorSpan) -> Operator
             OperatorOutcome { cursor: Position::new(l0, 0), enter_insert: false }
         }
         kind => {
-            // Charwise: single line only (multi-line case is rare; extend later).
+            // Charwise: the first line runs from the start column, the last to
+            // the end column, and every line between is covered whole — the
+            // same shape the renderer paints a multi-line Visual selection in.
             let inclusive = matches!(kind, MotionKind::CharInclusive);
-            let line = buf.line(span.start.line).unwrap_or_default();
-            let chars: Vec<char> = line.chars().collect();
-            let s = span.start.col.min(chars.len());
-            let mut e = span.end.col.min(chars.len());
-            if inclusive {
-                e = (e + 1).min(chars.len());
-            }
-            let new_line: String = chars
-                .iter()
-                .enumerate()
-                .map(|(i, &c)| if i >= s && i < e { transform(c) } else { c })
+            let new: Vec<String> = (l0..=l1)
+                .map(|i| {
+                    let chars: Vec<char> = buf.line(i).unwrap_or_default().chars().collect();
+                    let s = if i == l0 { span.start.col.min(chars.len()) } else { 0 };
+                    let e = if i == l1 {
+                        let e = span.end.col.min(chars.len());
+                        if inclusive { (e + 1).min(chars.len()) } else { e }
+                    } else {
+                        chars.len()
+                    };
+                    chars
+                        .iter()
+                        .enumerate()
+                        .map(|(c, &ch)| if c >= s && c < e { transform(ch) } else { ch })
+                        .collect()
+                })
                 .collect();
-            replace_lines(editor, span.start.line, span.start.line + 1, &[new_line]);
+            replace_lines(editor, l0, l1 + 1, &new);
             commit_undo(editor, span.start);
             OperatorOutcome { cursor: span.start, enter_insert: false }
         }

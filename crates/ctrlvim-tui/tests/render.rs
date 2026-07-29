@@ -223,6 +223,71 @@ fn expand_git_reveals_more_when_repo() {
     contains_all(&expanded, &["untracked", "last commit", "remote"]);
 }
 
+/// An app rooted at a fresh repo whose only file is mid-merge-conflict.
+fn conflicted_project() -> App {
+    use std::process::Command;
+    let app = temp_project(&[("f.txt", "one\n")]);
+    let dir = app.root.clone();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(&dir).args(args).output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.email", "t@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-q", "-b", "other"]);
+    fs::write(dir.join("f.txt"), "theirs\n").unwrap();
+    git(&["commit", "-qam", "theirs"]);
+    git(&["checkout", "-q", "main"]);
+    fs::write(dir.join("f.txt"), "ours\n").unwrap();
+    git(&["commit", "-qam", "ours"]);
+    // Expected to fail — this is the conflict under test.
+    let _ = Command::new("git").arg("-C").arg(&dir).args(["merge", "other"]).output();
+    // Re-read now that the directory is a repo.
+    App::with_root(dir, Instant::now())
+}
+
+#[test]
+fn a_conflicted_repo_says_so_instead_of_showing_zeroes() {
+    let app = conflicted_project();
+    assert!(app.project.git.is_some(), "the temp dir is a repo");
+    let out = render(&app, 130, 44);
+    // The regression: git reports unmerged files as neither staged nor
+    // modified, so the panel used to show 0/0 and read as a clean tree.
+    contains_all(&out, &["conflicts", "1 unresolved"]);
+}
+
+#[test]
+fn the_git_panel_offers_its_actions() {
+    let app = conflicted_project();
+    let out = render(&app, 130, 44);
+    // The legend is what makes these discoverable at all — the keys are
+    // otherwise invisible, which was the whole complaint about the dashboard.
+    contains_all(&out, &["[c] files", "[l] log", "[d] diff", "[F] fetch"]);
+}
+
+#[test]
+fn changed_files_go_to_the_quickfix_list() {
+    let mut app = conflicted_project();
+    app.dispatch(Action::GitChangedFiles);
+    assert_eq!(app.engine.session.quickfix().len(), 1, "the conflicted file");
+    assert!(app.quickfix_open, "the pane opens for a non-empty list");
+    let out = render(&app, 130, 44);
+    assert!(out.contains("conflict: f.txt"), "quickfix row expected:\n{out}");
+}
+
+#[test]
+fn git_actions_outside_a_repo_report_rather_than_run() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    assert!(app.project.git.is_none(), "a bare temp dir is not a repo");
+    app.dispatch(Action::GitChangedFiles);
+    assert!(app.message.contains("not a git repository"), "got {:?}", app.message);
+    app.dispatch(Action::GitLog);
+    assert!(app.message.contains("not a git repository"), "got {:?}", app.message);
+}
+
 #[test]
 fn plugin_manager_screen() {
     let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
@@ -2014,6 +2079,21 @@ fn a_narrow_terminal_drops_the_preview_rather_than_squeezing_it() {
     let narrow = render(&app, 62, 30);
     assert!(!narrow.contains("- let widget = 1;"), "preview should be dropped:\n{narrow}");
     assert!(narrow.contains("alpha.rs"), "results still shown:\n{narrow}");
+}
+
+#[test]
+fn visual_replace_runs_through_the_real_key_path() {
+    // `r` on a selection used to fall through the frontend to a Visual-mode
+    // handler that had no arm for it, so `ver4` did nothing at all. This drives
+    // the actual crossterm → engine route the editor uses, not `Session` alone.
+    let mut app = temp_project(&[("main.rs", "NAME=donToliver\n")]);
+    app.open_path(app.root.join("main.rs"), "main.rs".into());
+    for c in "fdver4".chars() {
+        key(&mut app, c);
+    }
+    assert_eq!(app.editor_lines()[0], "NAME=4444444444");
+    assert_eq!(app.editor_mode(), "n", "back to Normal once the replace lands");
+    assert!(render(&app, 60, 10).contains("NAME=4444444444"));
 }
 
 // --- inline AI suggestions --------------------------------------------------

@@ -380,9 +380,15 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
     let workspace = on_dashboard && app.section == DashboardSection::Workspace;
 
     // Workspace: `g` expands the git panel; `e`/`f` open the fuzzy browser.
+    // `c`/`l`/`d`/`F` are the git pane's own actions, all read-only — see the
+    // legend drawn at the foot of the panel.
     if workspace {
         if c == Some('g') { app.dispatch(Action::TogglePanel(PanelId::Git)); return; }
         if c == Some('e') || c == Some('f') { app.dispatch(Action::OpenFinder); return; }
+        if c == Some('c') { app.dispatch(Action::GitChangedFiles); return; }
+        if c == Some('l') { app.dispatch(Action::GitLog); return; }
+        if c == Some('d') { app.dispatch(Action::GitDiff); return; }
+        if c == Some('F') { app.dispatch(Action::GitFetch); return; }
     }
 
     // Settings: j/k scroll continuously through the EDITOR options and the

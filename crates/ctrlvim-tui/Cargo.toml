@@ -7,10 +7,14 @@ description = "Ratatui frontend for the ctrlvim engine (startup dashboard + edit
 
 [features]
 default = []
-# Forward candle's accelerator backends to the AI completion crate. Off by
-# default: CUDA needs a toolkit at build time and Metal only exists on macOS.
-ai-cuda = ["ctrlvim-ai/cuda"]
-ai-metal = ["ctrlvim-ai/metal"]
+# Build the local inference backend (candle + CodeGemma). Off by default: the
+# `[ai]` config section is off by default too, so a stock `cvi` never loads a
+# model — compiling one in cost every build minutes it did not need.
+ai = ["ctrlvim-ai/local-model"]
+# Forward candle's accelerator backends. Each implies `ai`. Off by default:
+# CUDA needs a toolkit at build time and Metal only exists on macOS.
+ai-cuda = ["ai", "ctrlvim-ai/cuda"]
+ai-metal = ["ai", "ctrlvim-ai/metal"]
 
 [dependencies]
 ctrlvim-core.workspace = true

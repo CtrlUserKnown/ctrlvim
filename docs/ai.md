@@ -7,9 +7,34 @@ no API key, no network at edit time, nothing leaving the machine.
 
 ## Turning it on and off
 
-It is **off by default**, because the first suggestion downloads **~5GB** of
-weights (see [Disk and memory](#disk-and-memory) — this is *not* the 1.6GB you
-may be expecting). Three ways to switch it:
+It is off at **two** levels, and both have to be switched for a suggestion to
+appear.
+
+### 1. Build it in
+
+The backend is not compiled unless you ask for it:
+
+```sh
+cargo build -p ctrlvim --release --features ai
+```
+
+candle and its dependency tree are minutes of compile time (and do not build at
+all on Apple silicon with a rustc older than the one that stabilized
+`stdarch_neon_f16`), which is too much to charge every build for a feature that
+is also off at runtime. A binary built without it still shows the settings row
+and still answers `:AI`; suggestions just report "built without the
+`local-model` feature" rather than silently never appearing. See
+[Where the pieces live](#where-the-pieces-live).
+
+If you want GPU support, `ai-cuda` / `ai-metal` below imply `ai` — you do not
+need both flags.
+
+### 2. Switch it on
+
+Even in a build that has the backend, it is **off by default**, because the
+first suggestion downloads **~5GB** of weights (see
+[Disk and memory](#disk-and-memory) — this is *not* the 1.6GB you may be
+expecting). Three ways to switch it:
 
 - **Settings tab** — Dashboard → `settings` (`2`), then the **Inline AI
   suggestions** row: `Enter`/`Space`/click, or `a` from anywhere on the tab.
@@ -236,7 +261,8 @@ owns the data, the host owns the I/O:
   has never heard of buffers or cursors.
 - **`ctrlvim-tui`** joins them: it debounces, submits, polls, and draws.
 
-`ctrlvim-ai` builds without candle at all (`--no-default-features`), which is
-useful when you want to type-check the workspace without a two-minute compile.
-In that configuration suggestions report "built without the `local-model`
-feature" rather than silently never appearing.
+`ctrlvim-ai` builds without candle at all — which is the **default**, so an
+ordinary `cargo build` never pays for it. `--features ai` on `ctrlvim` (or
+`--features local-model` on `ctrlvim-ai` directly) pulls it in. Without it,
+suggestions report "built without the `local-model` feature" rather than
+silently never appearing.

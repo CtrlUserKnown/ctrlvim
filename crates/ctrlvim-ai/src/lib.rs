@@ -233,6 +233,11 @@ fn latest(first: Job, rx: &Receiver<Job>) -> Job {
 /// of the code itself, and a bare filename is not valid in any of the languages
 /// this completes — a guess at CodeGemma's repo-level layout that turns out
 /// wrong costs more than the hint is worth.
+///
+/// Only the real worker calls this, so it is gated with it — otherwise the
+/// default (backend-less) build warns about it on every compile. Its tests run
+/// either way: what it does to a prompt is worth checking without a model.
+#[cfg(any(feature = "local-model", test))]
 fn prompt_parts(req: &Request, cfg: &AiConfig) -> (String, String) {
     let prefix = config::keep_tail(&req.prefix, cfg.max_prefix_chars);
     let suffix = config::keep_head(&req.suffix, cfg.max_suffix_chars);

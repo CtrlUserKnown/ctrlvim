@@ -24,7 +24,7 @@ use ctrlvim_ai::{Completer, Request as AiRequest, Status as AiStatus};
 use ctrlvim_core::syntax::{self, Filetype};
 use ctrlvim_core::{
     grep_text, AiCmd, BufferCmd, ContextWindow, Ctrlvim, Event, EventLoop, ExEffect, HlSpan, Jobs,
-    Key, LineBuffer, MapMode, Matcher, OutputParser, PinCmd, QfItem, QuickfixCmd, Selection,
+    Key, LineBuffer, MapMode, Matcher, OutputParser, PinCmd, QfItem, QfKind, QuickfixCmd, Selection,
     Suggestion, TagAddress, TagCmd, TimerService,
 };
 
@@ -212,6 +212,13 @@ pub enum Action {
     CloseBuffer(usize),
     GotoSection(DashboardSection),
     TogglePanel(PanelId),
+    /// `[c]` — put every file git reports as changed into the quickfix list.
+    GitChangedFiles,
+    /// `[l]` / `[d]` / `[F]` — read-only git commands, shown in the `:!`
+    /// output overlay. Nothing here rewrites the working tree.
+    GitLog,
+    GitDiff,
+    GitFetch,
     OpenFile(usize),
     OpenPlugins,
     OpenDashboard,
@@ -549,6 +556,10 @@ impl App {
             Action::CloseBuffer(i) => self.close_buffer(i),
             Action::GotoSection(sec) => self.section = sec,
             Action::TogglePanel(p) => self.toggle_panel(p),
+            Action::GitChangedFiles => self.git_changed_files(),
+            Action::GitLog => self.git_command("log --oneline --graph --decorate -40"),
+            Action::GitDiff => self.git_command("diff HEAD"),
+            Action::GitFetch => self.git_command("fetch --all --prune"),
             Action::OpenFile(i) => self.open_file(i),
             Action::OpenPlugins => self.open_plugins(),
             Action::OpenDashboard => self.open_dashboard(),
@@ -905,6 +916,48 @@ impl App {
         match p {
             PanelId::Git => self.expand_git = !self.expand_git,
         }
+    }
+
+    /// Run a read-only `git` subcommand into the `:!` output overlay.
+    ///
+    /// These go through the same job machinery `:!` uses, so they are async,
+    /// scrollable, and report their exit code — and because the overlay is
+    /// where `:!git …` output already lands, the dashboard keys and the
+    /// command line agree about what running git looks like.
+    fn git_command(&mut self, args: &str) {
+        if self.project.git.is_none() {
+            self.message = "not a git repository".into();
+            return;
+        }
+        self.host_run_shell(format!("git {args}"));
+    }
+
+    /// `[c]` — the changed files as a quickfix list.
+    ///
+    /// The paths come from the porcelain output already parsed at startup, so
+    /// this costs no git call; only the *contents* are stale, and opening an
+    /// entry reads the file fresh.
+    fn git_changed_files(&mut self) {
+        let Some(g) = &self.project.git else {
+            self.message = "not a git repository".into();
+            return;
+        };
+        let items: Vec<QfItem> = g
+            .changed
+            .iter()
+            .map(|c| QfItem {
+                path: self.root.join(&c.path),
+                line: 0,
+                col: 0,
+                text: format!("{}: {}", c.label, c.path),
+                kind: match c.label {
+                    "conflict" => QfKind::Error,
+                    "untracked" => QfKind::Note,
+                    _ => QfKind::Info,
+                },
+            })
+            .collect();
+        self.finish_quickfix(items, "git changed files".to_string());
     }
 
     pub fn move_file_selection(&mut self, dir: i32) {
@@ -1844,6 +1897,12 @@ impl App {
         self.shell_scroll = 0;
         self.shell_open = true;
         self.message = format!("{}: exit {code}", job.command);
+
+        // Any shell command may have moved the repo underneath us — `[F] fetch`
+        // certainly did, and so does a `:!git commit`. Re-reading here is what
+        // keeps the panel from showing pre-command state until restart; it is a
+        // handful of git invocations, and only on a command the user ran.
+        self.project.git = crate::data::reload_git(&self.root);
 
         if let Some((name, index, id)) = self.installing_tool.take() {
             if id != job.id {

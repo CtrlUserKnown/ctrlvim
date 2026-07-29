@@ -6,10 +6,15 @@ license.workspace = true
 description = "Local code-completion inference for ctrlvim: CodeGemma-2B fill-in-the-middle on candle"
 
 [features]
-# The real backend. On by default; turn it off (`--no-default-features`) to
-# build the crate's prompt/plumbing layer without pulling in candle, which is
-# what the workspace's own CI does when it only wants to type-check quickly.
-default = ["local-model"]
+# The real backend, **off by default**. Inline suggestions are opt-in at
+# runtime (`[ai] enabled = true`), so a default-on backend meant every build
+# compiled candle and its whole dependency tree for a feature most users never
+# switch on — minutes of build time, and on aarch64-apple-darwin an outright
+# failure, since candle-core 0.11's NEON f16 path needs an unstable rustc
+# feature (`stdarch_neon_f16`). Without this feature the crate still builds its
+# prompt/plumbing layer and reports "no model" truthfully; turn it on with
+# `cargo build -p ctrlvim --features ai`.
+default = []
 local-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:serde_json", "dep:rayon"]
 # Accelerator backends, forwarded to candle. Neither is on by default: CUDA
 # needs a toolkit present at build time and Metal only exists on macOS.

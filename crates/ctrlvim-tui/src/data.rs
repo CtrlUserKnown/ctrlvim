@@ -15,7 +15,8 @@ use std::process::Command;
 use std::time::{Instant, SystemTime};
 
 use crate::model::{
-    icon_for, FileEntry, FileIcon, GitStatus, LspServer, Plugin, PluginStatus, SessionEntry, Stats,
+    icon_for, FileEntry, FileIcon, GitChange, GitStatus, LspServer, Plugin, PluginStatus,
+    SessionEntry, Stats,
 };
 
 /// A gathered snapshot of the project.
@@ -284,6 +285,60 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 // --- git -------------------------------------------------------------------
 
+/// The path field of a porcelain-v2 record, given how many space-separated
+/// fields precede it.
+///
+/// `splitn` rather than `split_whitespace().nth()`: porcelain v2 prints paths
+/// literally, so a file with a space in its name would otherwise be truncated
+/// at the space — and the path is always the *last* field, so taking the
+/// remainder is exactly right.
+fn porcelain_path(rest: &str, fields_before: usize) -> Option<String> {
+    let mut parts = rest.splitn(fields_before + 1, ' ');
+    let path = parts.nth(fields_before)?;
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn push_change(out: &mut Vec<GitChange>, path: Option<String>, label: &'static str) {
+    if let Some(path) = path {
+        out.push(GitChange { path, label });
+    }
+}
+
+/// Count the lines of a command's output, or 0 if it can't run.
+fn count_lines(root: &Path, args: &[&str]) -> u32 {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().count() as u32)
+        .unwrap_or(0)
+}
+
+/// Parse `git diff --shortstat`'s " N files changed, I insertions(+), D deletions(-)".
+/// Either half is absent when it is zero, so both are looked up by their word.
+fn parse_shortstat(text: &str) -> (u32, u32) {
+    let num_before = |word: &str| -> u32 {
+        let idx = match text.find(word) {
+            Some(i) => i,
+            None => return 0,
+        };
+        text[..idx]
+            .split_whitespace()
+            .next_back()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    (num_before("insertion"), num_before("deletion"))
+}
+
+/// Re-read the git panel's data, for after a command that may have changed it.
+pub fn reload_git(root: &Path) -> Option<GitStatus> {
+    load_git(root)
+}
+
 fn load_git(root: &Path) -> Option<GitStatus> {
     let out = Command::new("git")
         .args(["-C"])
@@ -298,12 +353,22 @@ fn load_git(root: &Path) -> Option<GitStatus> {
 
     let mut branch = "(detached)".to_string();
     let mut remote = String::new();
+    let mut oid = "—".to_string();
     let (mut ahead, mut behind) = (0u32, 0u32);
-    let (mut staged, mut modified, mut untracked) = (0u32, 0u32, 0u32);
+    let (mut staged, mut modified, mut untracked, mut conflicted) = (0u32, 0u32, 0u32, 0u32);
+    let mut changed: Vec<GitChange> = Vec::new();
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("# branch.head ") {
             branch = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.oid ") {
+            // Literally "(initial)" before the first commit, which is already
+            // the right thing to show.
+            let raw = rest.trim();
+            oid = match raw.starts_with('(') {
+                true => "—".to_string(),
+                false => raw.chars().take(7).collect(),
+            };
         } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
             remote = rest.trim().to_string();
         } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
@@ -315,32 +380,93 @@ fn load_git(root: &Path) -> Option<GitStatus> {
                     behind = n.parse().unwrap_or(0);
                 }
             }
-        } else if let Some(rest) = line.strip_prefix("1 ").or_else(|| line.strip_prefix("2 ")) {
+        } else if let Some(rest) = line.strip_prefix("1 ") {
             // "<XY> ..." — X = staged status, Y = worktree status.
             let xy: Vec<char> = rest.chars().take(2).collect();
-            if xy.first().is_some_and(|&c| c != '.') {
+            let is_staged = xy.first().is_some_and(|&c| c != '.');
+            if is_staged {
                 staged += 1;
             }
             if xy.get(1).is_some_and(|&c| c != '.') {
                 modified += 1;
             }
-        } else if line.starts_with("? ") {
+            push_change(&mut changed, porcelain_path(rest, 7), if is_staged { "staged" } else { "modified" });
+        } else if let Some(rest) = line.strip_prefix("2 ") {
+            // Renamed / copied: one extra field (the similarity score) before
+            // the path, and the path itself is "new\told".
+            let xy: Vec<char> = rest.chars().take(2).collect();
+            let is_staged = xy.first().is_some_and(|&c| c != '.');
+            if is_staged {
+                staged += 1;
+            }
+            if xy.get(1).is_some_and(|&c| c != '.') {
+                modified += 1;
+            }
+            let path = porcelain_path(rest, 8).map(|p| p.split('\t').next().unwrap_or(&p).to_string());
+            push_change(&mut changed, path, "renamed");
+        } else if let Some(rest) = line.strip_prefix("u ") {
+            // Unmerged. Git gives these their own record type rather than an
+            // `XY` pair, so the branch above never sees them — counting them
+            // there would also be wrong, since a conflict is not an edit you
+            // can stage away.
+            conflicted += 1;
+            push_change(&mut changed, porcelain_path(rest, 9), "conflict");
+        } else if let Some(rest) = line.strip_prefix("? ") {
             untracked += 1;
+            push_change(&mut changed, Some(rest.to_string()), "untracked");
         }
     }
+    // Conflicts first, then staged, then the rest: the quickfix list `[c]`
+    // builds from this is walked top-down, so it should open with what most
+    // needs attention.
+    changed.sort_by_key(|c| match c.label {
+        "conflict" => 0,
+        "staged" => 1,
+        "modified" => 2,
+        "renamed" => 3,
+        _ => 4,
+    });
 
-    let last_commit = Command::new("git")
+    // Relative time, author and subject in one call — three `git log`
+    // invocations to fill three adjacent rows would be silly.
+    let log = Command::new("git")
         .args(["-C"])
         .arg(root)
-        .args(["log", "-1", "--format=%cr"])
+        .args(["log", "-1", "--format=%cr%n%an%n%s"])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "—".to_string());
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let mut log_lines = log.lines();
+    let field = |v: Option<&str>| match v.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => "—".to_string(),
+    };
+    let last_commit = field(log_lines.next());
+    let last_author = field(log_lines.next());
+    let last_subject = field(log_lines.next());
 
-    Some(GitStatus { branch, ahead, behind, modified, staged, remote, last_commit, untracked })
+    let stashes = count_lines(root, &["stash", "list"]);
+    // Against HEAD, so staged and unstaged work both count — the panel's
+    // `+N −M` is "how far this tree is from the last commit", which is the
+    // question the number next to `modified` is actually answering.
+    let shortstat = Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["diff", "--shortstat", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let (insertions, deletions) = parse_shortstat(&shortstat);
+
+    Some(GitStatus {
+        branch, oid, ahead, behind, modified, staged, remote,
+        last_commit, last_author, last_subject,
+        untracked, conflicted, stashes, insertions, deletions, changed,
+    })
 }
 
 // --- lsp / plugins / sessions ---------------------------------------------
@@ -608,6 +734,99 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Run `git` in `dir`, failing loudly — a silently-skipped setup step
+    /// would make the assertions below pass for the wrong reason.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git").arg("-C").arg(dir).args(args).output().expect("git runs");
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn shortstat_survives_a_missing_half() {
+        assert_eq!(parse_shortstat(" 11 files changed, 248 insertions(+), 34 deletions(-)"), (248, 34));
+        // git omits whichever side is zero.
+        assert_eq!(parse_shortstat(" 1 file changed, 3 insertions(+)"), (3, 0));
+        assert_eq!(parse_shortstat(" 1 file changed, 9 deletions(-)"), (0, 9));
+        // Singular forms, and nothing at all.
+        assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+), 1 deletion(-)"), (1, 1));
+        assert_eq!(parse_shortstat(""), (0, 0));
+    }
+
+    #[test]
+    fn a_porcelain_path_may_contain_spaces() {
+        // The path is the last field, so it must be taken as the remainder —
+        // splitting on whitespace would cut "my notes.md" in half.
+        let rest = "1 .M N... 100644 100644 100644 aaa bbb my notes.md";
+        let rest = rest.strip_prefix("1 ").unwrap();
+        assert_eq!(porcelain_path(rest, 7).as_deref(), Some("my notes.md"));
+    }
+
+    #[test]
+    fn changed_files_are_listed_conflicts_first() {
+        let dir = temp_state();
+        git(&dir, &["init", "-q", "-b", "main", "."]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("tracked.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "base"]);
+
+        std::fs::write(dir.join("tracked.txt"), "edited\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "fresh\n").unwrap();
+
+        let g = load_git(&dir).expect("a git repo");
+        let paths: Vec<&str> = g.changed.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"tracked.txt"), "got {paths:?}");
+        assert!(paths.contains(&"new.txt"), "untracked files are listed too: {paths:?}");
+        // Untracked sorts last, so the edited file comes first.
+        assert_eq!(g.changed.first().map(|c| c.label), Some("modified"));
+        assert_eq!(g.changed.last().map(|c| c.label), Some("untracked"));
+        assert!(g.insertions > 0 || g.deletions > 0, "the diff stat is populated");
+        assert_ne!(g.oid, "—", "a repo with a commit has a HEAD oid");
+    }
+
+    #[test]
+    fn a_conflicted_tree_is_not_reported_as_clean() {
+        let dir = temp_state();
+        git(&dir, &["init", "-q", "-b", "main", "."]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "base"]);
+
+        git(&dir, &["checkout", "-q", "-b", "other"]);
+        std::fs::write(dir.join("f.txt"), "theirs\n").unwrap();
+        git(&dir, &["commit", "-qam", "theirs"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("f.txt"), "ours\n").unwrap();
+        git(&dir, &["commit", "-qam", "ours"]);
+        // This one is *expected* to fail — it is the conflict under test.
+        let _ = Command::new("git").arg("-C").arg(&dir).args(["merge", "other"]).output();
+
+        let g = load_git(&dir).expect("a git repo");
+        assert_eq!(g.conflicted, 1, "the unmerged file must be counted");
+        // The regression: `u` records are neither staged nor modified, so
+        // before this was counted the panel showed 0/0 mid-conflict and read
+        // as a clean tree.
+        assert_eq!((g.staged, g.modified), (0, 0), "git reports `u` as neither");
+    }
+
+    #[test]
+    fn a_clean_tree_reports_no_conflicts() {
+        let dir = temp_state();
+        git(&dir, &["init", "-q", "-b", "main", "."]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "base"]);
+
+        let g = load_git(&dir).expect("a git repo");
+        assert_eq!((g.conflicted, g.staged, g.modified, g.untracked), (0, 0, 0, 0));
+        assert_eq!(g.branch, "main");
     }
 
     #[test]

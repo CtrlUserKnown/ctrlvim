@@ -112,7 +112,7 @@ fn columns_layout(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
 
     // Right: SESSIONS over STATS.
     let sessions = &app.project.sessions;
-    let git_h = if app.expand_git { 9 } else { 6 };
+    let git_h = git_panel_height(app);
     let right = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -238,6 +238,30 @@ fn recent_files_rows(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, fu
 
 // --- git panel -------------------------------------------------------------
 
+/// Total height the GIT STATUS panel wants, borders included.
+///
+/// Computed rather than fixed because the rows are conditional now — a clean
+/// repo with no stashes is four lines shorter than a conflicted one mid-merge,
+/// and a fixed height would either clip that or leave a hole in the common case.
+fn git_panel_height(app: &App) -> u16 {
+    const BORDERS: u16 = 2;
+    const LEGEND: u16 = 2; // divider + key row
+    let Some(g) = &app.project.git else {
+        return 1 + BORDERS; // just the "not a git repository" line
+    };
+    let mut rows = 4; // branch, ahead/behind, modified, staged
+    if g.conflicted > 0 {
+        rows += 1;
+    }
+    if g.stashes > 0 {
+        rows += 1;
+    }
+    if app.expand_git {
+        rows += 4; // remote, untracked, last commit, subject
+    }
+    rows + LEGEND + BORDERS
+}
+
 fn git_rows(f: &mut Frame, app: &App, area: Rect) {
     let Some(g) = &app.project.git else {
         f.render_widget(
@@ -252,23 +276,106 @@ fn git_rows(f: &mut Frame, app: &App, area: Rect) {
         spans.extend(val);
         Line::from(spans)
     };
+    // `modified` carries the diff size next to it: a count of files says how
+    // scattered the work is, the line delta says how big it is, and the two
+    // answer different questions.
+    let mut modified_val = vec![Span::styled(g.modified.to_string(), Style::default().fg(theme::orange()))];
+    if g.insertions > 0 || g.deletions > 0 {
+        modified_val.push(Span::styled(
+            format!("  +{}", g.insertions),
+            Style::default().fg(theme::green()),
+        ));
+        modified_val.push(Span::styled(
+            format!(" −{}", g.deletions),
+            Style::default().fg(theme::red()),
+        ));
+    }
     let mut lines = vec![
-        kv("branch", vec![Span::styled(format!(" {}", g.branch), Style::default().fg(theme::purple()))]),
+        kv("branch", vec![
+            Span::styled(format!(" {}", g.branch), Style::default().fg(theme::purple())),
+            Span::styled(format!("  {}", g.oid), Style::default().fg(theme::fg_dim())),
+        ]),
         kv("ahead / behind", vec![
             Span::styled(format!("↑{}", g.ahead), Style::default().fg(theme::green())),
             Span::raw(" "),
             Span::styled(format!("↓{}", g.behind), Style::default().fg(theme::red())),
         ]),
-        kv("modified", vec![Span::styled(g.modified.to_string(), Style::default().fg(theme::orange()))]),
+        kv("modified", modified_val),
         kv("staged", vec![Span::styled(g.staged.to_string(), Style::default().fg(theme::cyan()))]),
     ];
+    // Stashes are easy to forget about, so they only earn a row when there is
+    // something in there to forget.
+    if g.stashes > 0 {
+        lines.push(kv("stashes", vec![Span::styled(
+            g.stashes.to_string(),
+            Style::default().fg(theme::orange()),
+        )]));
+    }
+    // Conflicts get a row only when there are some — an always-present "0"
+    // would cost a line of a six-line panel to say nothing. When they exist
+    // they matter more than anything else here, so the row goes first.
+    if g.conflicted > 0 {
+        lines.insert(
+            0,
+            kv("conflicts", vec![Span::styled(
+                format!("{} unresolved", g.conflicted),
+                Style::default().fg(theme::red()).add_modifier(Modifier::BOLD),
+            )]),
+        );
+    }
     if app.expand_git {
         let remote = if g.remote.is_empty() { "—".to_string() } else { g.remote.clone() };
         lines.push(kv("remote", vec![Span::styled(remote, Style::default().fg(theme::fg_muted()))]));
-        lines.push(kv("last commit", vec![Span::styled(g.last_commit.clone(), Style::default().fg(theme::fg_muted()))]));
         lines.push(kv("untracked", vec![Span::styled(g.untracked.to_string(), Style::default().fg(theme::red()))]));
+        lines.push(kv("last commit", vec![
+            Span::styled(g.last_commit.clone(), Style::default().fg(theme::fg_muted())),
+            Span::styled(format!(" · {}", g.last_author), Style::default().fg(theme::fg_dim())),
+        ]));
+        // The subject is the one line here likely to overrun the panel, so it
+        // gets its own row, indented under the timestamp it belongs to.
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(16)),
+            Span::styled(
+                truncate(&g.last_subject, area.width.saturating_sub(17) as usize),
+                Style::default().fg(theme::fg_muted()),
+            ),
+        ]));
     }
-    f.render_widget(Paragraph::new(lines).style(Style::default().bg(theme::bg_dark())), area);
+
+    // The action legend, pinned to the bottom of the panel so the rows above
+    // can grow (conflicts, stashes) without pushing it out of view.
+    let legend_h = 2u16;
+    let rows_h = area.height.saturating_sub(legend_h);
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::bg_dark())),
+        Rect { height: rows_h, ..area },
+    );
+    if area.height <= legend_h {
+        return;
+    }
+    let y = area.y + rows_h;
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(theme::border_dim()),
+        )))
+        .style(Style::default().bg(theme::bg_dark())),
+        Rect { y, height: 1, ..area },
+    );
+    let legend = Line::from(vec![
+        hint_badge('c'),
+        Span::styled(" files ", Style::default().fg(theme::fg_dim())),
+        hint_badge('l'),
+        Span::styled(" log ", Style::default().fg(theme::fg_dim())),
+        hint_badge('d'),
+        Span::styled(" diff ", Style::default().fg(theme::fg_dim())),
+        hint_badge('F'),
+        Span::styled(" fetch", Style::default().fg(theme::fg_dim())),
+    ]);
+    f.render_widget(
+        Paragraph::new(legend).style(Style::default().bg(theme::bg_dark())),
+        Rect { y: y + 1, height: 1, ..area },
+    );
 }
 
 // --- settings (LSP) --------------------------------------------------------

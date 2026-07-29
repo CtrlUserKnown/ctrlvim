@@ -214,7 +214,8 @@ command = "set number"
 #
 # Off by default: the first suggestion downloads ~1.6GB of weights (a 4-bit
 # quantized GGUF — the same file Ollama's `codegemma:2b` tag ships).
-# Full guide: docs/ai.md
+# It also has to be *built* in — `cargo build -p ctrlvim --features ai` — or
+# this section has nothing to switch on. Full guide: docs/ai.md
 #
 # On a CPU this is slow: prefill of the prompt dominates, so `context_before`
 # is the most expensive setting here. Build with --features ai-cuda / ai-metal

@@ -60,7 +60,7 @@
       <div class="l"></div>
       <div class="l">  <span class="key">:</span>         open the command palette</div>
       <div class="l">  <span class="key">j</span> <span class="dim">/</span> <span class="key">k</span>     move the cursor down / up</div>
-      <div class="l">  <span class="key">gt</span> <span class="dim">/</span> <span class="key">gT</span>   next / previous buffer <span class="dim">(or press 1–5)</span></div>
+      <div class="l">  <span class="key">gt</span> <span class="dim">/</span> <span class="key">gT</span>   next / previous buffer <span class="dim">(or press 1–7)</span></div>
       <div class="l">  <span class="key">/</span>         search this buffer, <span class="key">n</span> <span class="dim">/</span> <span class="key">N</span> to cycle hits</div>
       <div class="l">  <span class="key">?</span>         the full keymap</div>
       <div class="l"></div>
@@ -263,7 +263,7 @@
       <div class="l"><span class="h2">BUFFERS</span></div>
       <div class="l">  <span class="key">gt</span> <span class="dim">/</span> <span class="key">gT</span>          next / previous buffer</div>
       <div class="l">  <span class="key">:bn</span> <span class="dim">/</span> <span class="key">:bp</span>         next / previous buffer</div>
-      <div class="l">  <span class="key">1</span> <span class="dim">…</span> <span class="key">5</span>             jump straight to a buffer</div>
+      <div class="l">  <span class="key">1</span> <span class="dim">…</span> <span class="key">7</span>             jump straight to a buffer</div>
       <div class="l">  <span class="key">:e</span> <span class="dim">&lt;name&gt;</span>         edit a buffer by name</div>
       <div class="l"></div>
       <div class="l"><span class="h2">COMMAND LINE</span></div>
@@ -290,6 +290,209 @@
       <div class="l"></div>
       <div class="l"><span class="c">These are the site's keys. The editor itself speaks the real thing:</span></div>
       <div class="l"><span class="c">operators, text objects, registers, marks, macros, splits.</span></div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 6: ai.md ══════════════════════════════════════════ -->
+    <section class="buf" data-name="ai.md" data-ft="markdown" data-icon="" id="buf-ai">
+      <div class="l"><span class="h1"># Inline AI suggestions</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="quote">&gt; Ghost text ahead of the cursor, from a model on your own machine.</span></div>
+      <div class="l"></div>
+      <div class="l">CodeGemma-2B on candle, in-process. No API key, no network at edit</div>
+      <div class="l">time, nothing leaving the machine. It is fill-in-the-middle, so the</div>
+      <div class="l">model sees the code on <span class="fg">both</span> sides of the cursor:</div>
+      <div class="l"></div>
+      <div class="l">  <span class="dim">&lt;|fim_prefix|&gt;</span>code before<span class="dim">&lt;|fim_suffix|&gt;</span>code after<span class="dim">&lt;|fim_middle|&gt;</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Two switches, and both start off</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="fg">1. Build it in.</span> The backend is not compiled unless you ask:</div>
+      <div class="l"></div>
+      <div class="l">  <span class="dim">$</span> cargo build -p ctrlvim --release <span class="s">--features ai</span></div>
+      <div class="l"></div>
+      <div class="l">candle is minutes of compile time, so a stock build does not pay for</div>
+      <div class="l">it. Without the feature the commands still answer — suggestions just</div>
+      <div class="l">report that the backend is absent, rather than silently never coming.</div>
+      <div class="l"></div>
+      <div class="l"><span class="fg">2. Switch it on.</span> Still off even in a build that has it, because</div>
+      <div class="l">the first suggestion downloads weights. Three ways:</div>
+      <div class="l"></div>
+      <div class="l">  <span class="key">Settings tab</span>    Dashboard → settings → Inline AI suggestions.</div>
+      <div class="l">                  <span class="dim">The persistent one: writes back to config.toml.</span></div>
+      <div class="l">  <span class="key">:AI on</span>          this session only</div>
+      <div class="l">  <span class="key">config.toml</span>     <span class="t">[ai]</span> enabled <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Keys</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c">Ghost text only claims keys while it is on screen. With nothing</span></div>
+      <div class="l"><span class="c">suggested, Tab inserts a tab and ^E does what it always did.</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="key">⇥</span>       accept the whole suggestion</div>
+      <div class="l">  <span class="key">^L</span>      accept one word, keep the rest</div>
+      <div class="l">  <span class="key">^J</span>      accept one line, keep the rest</div>
+      <div class="l">  <span class="key">^E</span>      dismiss it, stay in Insert</div>
+      <div class="l">  <span class="key">Esc</span>     leave Insert; the suggestion goes with it</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Commands</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="key">:AI</span>          toggle <span class="dim">(:AI on / :AI off to be explicit)</span></div>
+      <div class="l">  <span class="key">:AISuggest</span>   complete at the cursor now, skip the idle delay</div>
+      <div class="l">  <span class="key">:AIStatus</span>    where the model is — or why it failed</div>
+      <div class="l">  <span class="key">:AILoad</span>      load the weights now, not on first use</div>
+      <div class="l"></div>
+      <div class="l">The status line carries a marker while suggestions are armed:</div>
+      <div class="l">  <span class="green">AI</span> ready <span class="dim">·</span> <span class="green">AI ↓</span> loading <span class="dim">·</span> <span class="green">AI …</span> thinking <span class="dim">·</span> <span class="green">AI !</span> failed</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Be realistic about speed</span></div>
+      <div class="l"></div>
+      <div class="l">Measured on a 4-core laptop, quantized, ~20 lines of context:</div>
+      <div class="l"></div>
+      <div class="box">
+        <div class="l"><span class="dim">╭──────────────────────────────────────────────────────╮</span></div>
+        <div class="l"><span class="dim">│</span> Prompt prefill <span class="dim">(~200 tokens)</span>                  <span class="n">~35 s</span>  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> Each generated token                        <span class="n">~0.45 s</span>  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">│</span> Model load <span class="dim">(cached weights)</span>           <span class="n">a few seconds</span>  <span class="dim">│</span></div>
+        <div class="l"><span class="dim">╰──────────────────────────────────────────────────────╯</span></div>
+      </div>
+      <div class="l"></div>
+      <div class="l"><span class="fg">Prefill dominates</span>, and it scales with the context you send — which</div>
+      <div class="l">is why <span class="cy">context_before</span> defaults to 20 lines rather than something</div>
+      <div class="l">generous. Doubling it roughly doubles time-to-first-suggestion.</div>
+      <div class="l"></div>
+      <div class="l">In order of effect, if that is too slow:</div>
+      <div class="l"></div>
+      <div class="l">  <span class="n">1</span>  build with GPU support <span class="dim">—</span> <span class="s">--features ai-cuda</span> <span class="dim">/</span> <span class="s">ai-metal</span></div>
+      <div class="l">  <span class="n">2</span>  build in release at all <span class="dim">(debug cannot finish one)</span></div>
+      <div class="l">  <span class="n">3</span>  shrink the context <span class="dim">(</span><span class="cy">context_before</span> <span class="op">=</span> <span class="n">10</span><span class="dim">)</span></div>
+      <div class="l">  <span class="n">4</span>  lower <span class="cy">max_tokens</span> <span class="dim">— you rarely accept more than a line</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Why it doesn't drag the editor down</span></div>
+      <div class="l"></div>
+      <div class="l">Inference is confined to <span class="cy">cores - 1</span> threads. candle parallelizes</div>
+      <div class="l">across every core it finds, and a 2B model keeps them all busy for</div>
+      <div class="l">seconds — which made the <span class="fg">whole editor</span> feel slow, not just the</div>
+      <div class="l">suggestions. One core left for the UI buys that back.</div>
+      <div class="l"></div>
+      <div class="l"><span class="c">The rest is unchanged: a completion is asked for only once typing</span></div>
+      <div class="l"><span class="c">pauses, only one is ever in flight, and a newer request abandons the</span></div>
+      <div class="l"><span class="c">older one mid-token.</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Disk and memory</span></div>
+      <div class="l"></div>
+      <div class="l">A 4-bit quantized GGUF by default — the same <span class="n">1.63 GB</span> file Ollama's</div>
+      <div class="l"><span class="cy">codegemma:2b</span> tag ships. Full-precision safetensors are <span class="n">5.01 GB</span> and</div>
+      <div class="l">load only with <span class="cy">gguf</span> <span class="op">=</span> <span class="s">""</span>.</div>
+      <div class="l"></div>
+      <div class="l">Resident memory is ~<span class="n">2.8 GB</span>: the weights plus a <span class="n">1.05 GB</span> f16</div>
+      <div class="l">embedding table — Gemma's vocabulary is 256,000 tokens, so that table</div>
+      <div class="l">is large however hard the weights are quantized.</div>
+      <div class="l"></div>
+      <div class="l"><span class="c">Gemma-2, Gemma-3 and Llama GGUFs will not load: this is a Gemma-1</span></div>
+      <div class="l"><span class="c">decoder, written because candle-transformers ships no Gemma-1.</span></div>
+      <div class="l"></div>
+      <div class="l">  <a href="https://github.com/CtrlUserKnown/ctrlvim/blob/main/docs/ai.md">docs/ai.md</a> <span class="dim">— the full guide: every knob, the license gate,</span></div>
+      <div class="l">  <span class="dim">alternate repos, and how the three crates split the work</span></div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 7: config.toml ════════════════════════════════════ -->
+    <section class="buf" data-name="config.toml" data-ft="toml" data-icon="" id="buf-config">
+      <div class="l"><span class="c"># ctrlvim is configured in TOML, not in a config script.</span></div>
+      <div class="l"><span class="c">#</span></div>
+      <div class="l"><span class="c"># TOML expresses the *wiring* — options, mappings, event bindings,</span></div>
+      <div class="l"><span class="c"># plugins. Anything needing actual logic lives in a plugin, which this</span></div>
+      <div class="l"><span class="c"># file then refers to by name. The bridge is the Ex command: a keymap's</span></div>
+      <div class="l"><span class="c"># rhs and an autocmd's command are ordinary `:` commands, so a plugin</span></div>
+      <div class="l"><span class="c"># contributes behaviour by registering :Format and the config names it.</span></div>
+      <div class="l"><span class="c">#</span></div>
+      <div class="l"><span class="c"># Lives at ~/.config/ctrlvim/config.toml</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># The editor shell itself.</span></div>
+      <div class="l"><span class="t">[ui]</span></div>
+      <div class="l">drawer <span class="op">=</span> <span class="k">false</span>          <span class="c"># file drawer (^B) open on startup</span></div>
+      <div class="l">mouse  <span class="op">=</span> <span class="k">true</span>           <span class="c"># off gives the wheel back to the terminal</span></div>
+      <div class="l">icons  <span class="op">=</span> <span class="s">"auto"</span>         <span class="c"># auto | nerd | text</span></div>
+      <div class="l">theme  <span class="op">=</span> <span class="s">"Tokyo Night"</span>  <span class="c"># or Terminal, Catppuccin, Noir-cat,</span></div>
+      <div class="l">                       <span class="c"># Rosé Pine, Gruvbox, Habamax</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># Anything `:set` understands. Untyped on purpose: every option the</span></div>
+      <div class="l"><span class="c"># engine gains works here immediately. `true` sets it, `false` becomes</span></div>
+      <div class="l"><span class="c"># the no- form, numbers and strings become name=value.</span></div>
+      <div class="l"><span class="t">[options]</span></div>
+      <div class="l">number <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l">relativenumber <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l">ignorecase <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l">smartcase <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l">expandtab <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l">tabstop <span class="op">=</span> <span class="n">4</span></div>
+      <div class="l">shiftwidth <span class="op">=</span> <span class="n">4</span></div>
+      <div class="l">scrolloff <span class="op">=</span> <span class="n">5</span></div>
+      <div class="l">foldmethod <span class="op">=</span> <span class="s">"indent"</span></div>
+      <div class="l">timeoutlen <span class="op">=</span> <span class="n">500</span>       <span class="c"># how long a half-typed chord waits, and</span></div>
+      <div class="l">                       <span class="c"># when the which-key popup appears</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="t">[keymaps]</span></div>
+      <div class="l">defaults <span class="op">=</span> <span class="k">true</span>         <span class="c"># false starts from an empty table</span></div>
+      <div class="l">leader <span class="op">=</span> <span class="s">" "</span>            <span class="c"># applies at definition time, as in Vim</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># One table per mapping. `mode` is "n" (default), "i" or "v"; both</span></div>
+      <div class="l"><span class="c"># sides use &lt;...&gt; notation. `desc` is what ? and which-key show — the</span></div>
+      <div class="l"><span class="c"># difference between a keymap you can discover and one you can't.</span></div>
+      <div class="l"><span class="c"># An lhs that doesn't parse is reported, never silently dropped.</span></div>
+      <div class="l"><span class="t">[[keymap]]</span></div>
+      <div class="l">lhs  <span class="op">=</span> <span class="s">"&lt;leader&gt;g"</span></div>
+      <div class="l">rhs  <span class="op">=</span> <span class="s">":Find&lt;CR&gt;"</span></div>
+      <div class="l">desc <span class="op">=</span> <span class="s">"Search the project"</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="t">[[keymap]]</span></div>
+      <div class="l">mode <span class="op">=</span> <span class="s">"i"</span></div>
+      <div class="l">lhs  <span class="op">=</span> <span class="s">"jj"</span></div>
+      <div class="l">rhs  <span class="op">=</span> <span class="s">"&lt;Esc&gt;"</span></div>
+      <div class="l">desc <span class="op">=</span> <span class="s">"Leave Insert mode"</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># [[unmap]] removes a built-in chord entirely, so the key falls back</span></div>
+      <div class="l"><span class="c"># to its Vim meaning. Rebinding the same lhs already replaces it.</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># Define a `:` command as an alias for another. This is the escape</span></div>
+      <div class="l"><span class="c"># hatch that keeps the config declarative — a [[command]] plus a</span></div>
+      <div class="l"><span class="c"># [[keymap]] pointing at it is a complete binding, no plugin involved.</span></div>
+      <div class="l"><span class="c">#</span></div>
+      <div class="l"><span class="c"># In a filename position, % expands with Vim's modifiers: %:p full</span></div>
+      <div class="l"><span class="c"># path, %:h dir, %:t name, %:r no extension. They chain (%:t:r).</span></div>
+      <div class="l"><span class="c"># Elsewhere % is left alone, so :s/50%/half/ still works.</span></div>
+      <div class="l"><span class="t">[[command]]</span></div>
+      <div class="l">name      <span class="op">=</span> <span class="s">"RunPython"</span></div>
+      <div class="l">expansion <span class="op">=</span> <span class="s">"!python3 %:p"</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># Run an Ex command when an event fires. `pattern` matches the</span></div>
+      <div class="l"><span class="c"># buffer's name: "*", "*.rs", "test_*", or an exact name.</span></div>
+      <div class="l"><span class="c"># Events: VimEnter, BufEnter, BufLeave, BufWritePre, BufWritePost.</span></div>
+      <div class="l"><span class="t">[[autocmd]]</span></div>
+      <div class="l">event   <span class="op">=</span> <span class="s">"BufWritePre"</span></div>
+      <div class="l">pattern <span class="op">=</span> <span class="s">"*.rs"</span></div>
+      <div class="l">command <span class="op">=</span> <span class="s">"set expandtab"</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># A directory holding an init.lua or init.vim. Load order is the order</span></div>
+      <div class="l"><span class="c"># declared here — what loads, and when, is explicit rather than</span></div>
+      <div class="l"><span class="c"># emergent, which is why there is no runtimepath search.</span></div>
+      <div class="l"><span class="t">[[plugin]]</span></div>
+      <div class="l">name  <span class="op">=</span> <span class="s">"example"</span></div>
+      <div class="l">path  <span class="op">=</span> <span class="s">"~/.config/ctrlvim/pack/example"</span></div>
+      <div class="l">event <span class="op">=</span> <span class="s">"BufWritePre"</span>   <span class="c"># omit to load at startup</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="c"># Inline AI suggestions — see the ai.md buffer. Needs --features ai at</span></div>
+      <div class="l"><span class="c"># build time, or this section has nothing to switch on.</span></div>
+      <div class="l"><span class="t">[ai]</span></div>
+      <div class="l">enabled        <span class="op">=</span> <span class="k">true</span></div>
+      <div class="l">device         <span class="op">=</span> <span class="s">"auto"</span>   <span class="c"># auto | cpu | cuda | cuda:1 | metal</span></div>
+      <div class="l">debounce_ms    <span class="op">=</span> <span class="n">350</span>      <span class="c"># idle time before a completion is asked for</span></div>
+      <div class="l">context_before <span class="op">=</span> <span class="n">20</span>       <span class="c"># lines before the cursor — the prefill cost</span></div>
+      <div class="l">context_after  <span class="op">=</span> <span class="n">6</span></div>
+      <div class="l">max_lines      <span class="op">=</span> <span class="n">8</span>        <span class="c"># ghost-text rows to show (1 = strictly inline)</span></div>
+      <div class="l"></div>
+      <div class="l">  <a href="https://github.com/CtrlUserKnown/ctrlvim/blob/main/docs/config.example.toml">docs/config.example.toml</a> <span class="dim">— the annotated original,</span></div>
+      <div class="l">  <span class="dim">with every key and the commented-out ones this omits</span></div>
       <div class="l"></div>
     </section>
 

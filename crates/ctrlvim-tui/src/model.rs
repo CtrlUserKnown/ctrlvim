@@ -76,17 +76,46 @@ pub struct LspServer {
     pub installable: bool,
 }
 
+/// One path git reports as not matching HEAD, with how it differs.
+///
+/// Kept alongside the counts so `[c]` can fill the quickfix list without
+/// shelling out again — the porcelain output the counts came from already
+/// named every file.
+#[derive(Clone)]
+pub struct GitChange {
+    /// Repo-relative, exactly as git printed it.
+    pub path: String,
+    /// `conflict` / `staged` / `modified` / `untracked`, for the quickfix text.
+    pub label: &'static str,
+}
+
 /// Real git status for the project root, or `None` when it isn't a repo.
 #[derive(Clone)]
 pub struct GitStatus {
     pub branch: String,
+    /// Abbreviated HEAD commit, or `—` before the first commit.
+    pub oid: String,
     pub ahead: u32,
     pub behind: u32,
     pub modified: u32,
     pub staged: u32,
     pub remote: String,
+    /// Relative time of the last commit (`%cr`).
     pub last_commit: String,
+    pub last_author: String,
+    pub last_subject: String,
     pub untracked: u32,
+    /// Files with unresolved merge conflicts (porcelain-v2 `u` entries).
+    ///
+    /// These are counted separately because git reports them as neither staged
+    /// nor modified: a conflicted tree would otherwise show `0 / 0` and read as
+    /// clean at exactly the moment it is least clean.
+    pub conflicted: u32,
+    pub stashes: u32,
+    /// Lines added / removed against HEAD, for the `+N −M` summary.
+    pub insertions: u32,
+    pub deletions: u32,
+    pub changed: Vec<GitChange>,
 }
 
 /// Startup / project stats.

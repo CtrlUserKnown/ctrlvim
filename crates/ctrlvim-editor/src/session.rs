@@ -1315,6 +1315,18 @@ impl Session {
             _ => unreachable!(),
         };
 
+        // `r{c}` on a selection — the replacement char, consumed literally so a
+        // mapping or a count can't claim it. Like `f{c}`, this comes before
+        // everything else. A non-character (`<Esc>`) aborts and leaves the
+        // selection standing, which is what Vim does.
+        if self.pending.await_replace {
+            self.pending.await_replace = false;
+            if let Key::Char(ch) = key {
+                self.visual_operator(Operator::Replace(ch), anchor, kind);
+            }
+            return;
+        }
+
         // `g`-prefixed motions (`gg`) — the second key of the pair.
         if self.pending.g_prefix {
             self.pending.g_prefix = false;
@@ -1364,6 +1376,9 @@ impl Session {
             Key::Char('u') => self.visual_operator(Operator::Lower, anchor, kind),
             Key::Char('U') => self.visual_operator(Operator::Upper, anchor, kind),
             Key::Char('~') => self.visual_operator(Operator::ToggleCase, anchor, kind),
+            // `r{c}` overwrites the whole selection with one character. The
+            // char itself is awaited above rather than handled here.
+            Key::Char('r') => self.pending.await_replace = true,
             other => {
                 // Movement extends the selection (honoring any pending count).
                 if let Some(m) = self.resolve_motion(other) {
@@ -3539,6 +3554,55 @@ mod tests {
         let mut s = Session::with_text("a\nb\nc");
         s.feed_str("GVggd");
         assert_eq!(s.lines(), vec![""]);
+    }
+
+    #[test]
+    fn visual_replace_overwrites_the_whole_selection() {
+        // The reported case: `ver4` selects to the end of the word and stamps
+        // every character of it with `4`.
+        let mut s = Session::with_text("NAME=donToliver");
+        s.feed_str("$"); // to the end, then back to the start of the value
+        s.feed_str("0fdver4");
+        assert_eq!(s.lines(), vec!["NAME=4444444444"]);
+        assert_eq!(s.mode_name(), "n", "visual `r` returns to Normal mode");
+        assert_eq!(s.cursor(), Position::new(0, 5), "cursor lands at the start");
+    }
+
+    #[test]
+    fn visual_replace_spans_lines_without_joining_them() {
+        let mut s = Session::with_text("abc\ndef\nghi");
+        s.feed_str("lvjlr-");
+        assert_eq!(s.lines(), vec!["a--", "---", "ghi"]);
+    }
+
+    #[test]
+    fn visual_line_replace_takes_whole_lines() {
+        let mut s = Session::with_text("abc\ndef");
+        s.feed_str("Vr#");
+        assert_eq!(s.lines(), vec!["###", "def"]);
+    }
+
+    #[test]
+    fn visual_replace_is_undone_in_one_step() {
+        let mut s = Session::with_text("hello");
+        s.feed_str("vllrx");
+        assert_eq!(s.lines(), vec!["xxxlo"]);
+        s.feed_str("u");
+        assert_eq!(s.lines(), vec!["hello"]);
+    }
+
+    #[test]
+    fn escaping_out_of_visual_replace_changes_nothing() {
+        let mut s = Session::with_text("hello");
+        s.feed_str("vll<Esc>");
+        assert_eq!(s.lines(), vec!["hello"]);
+        // …and the aborted `r` leaves the *selection* standing rather than
+        // swallowing the next key: `x` is then the ordinary visual delete.
+        let mut s = Session::with_text("hello");
+        s.feed_str("vllr<Esc>");
+        assert_eq!(s.mode_name(), "v", "still selecting");
+        s.feed_str("x");
+        assert_eq!(s.lines(), vec!["lo"], "`x` deleted the selection, not one char");
     }
 
     #[test]
