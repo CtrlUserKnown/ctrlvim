@@ -13,7 +13,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use ctrlvim_core::Key;
+use ctrlvim_core::{Key, Mods, SpecialKey};
 
 use crate::app::{Action, App, DashboardSection, PanelId};
 use crate::replace::Field;
@@ -91,26 +91,16 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
             KeyCode::Right if ctrl => return app.cycle_buffer(1),
             _ => {}
         }
-        if ctrl && c == Some('b') {
-            return app.dispatch(Action::ToggleSidebar);
-        }
         // `:` opens the unified command palette (the command line's new UI)
-        // rather than dropping the engine into its own Cmdline mode.
+        // rather than dropping the engine into its own Cmdline mode. This one
+        // stays here: it's mode entry, not a mapping.
         if c == Some(':') {
             return app.dispatch(Action::OpenPalette);
         }
-        // Toggle live markdown rendering (no-op on non-markdown buffers).
-        if ctrl && c == Some('g') {
-            return app.dispatch(Action::ToggleMarkdown);
-        }
-        // Arrow keys act as hjkl motions (the engine's Key has no arrows).
-        match key.code {
-            KeyCode::Left => return app.feed_engine(Key::Char('h')),
-            KeyCode::Down => return app.feed_engine(Key::Char('j')),
-            KeyCode::Up => return app.feed_engine(Key::Char('k')),
-            KeyCode::Right => return app.feed_engine(Key::Char('l')),
-            _ => {}
-        }
+        // `Ctrl-B` (drawer), `Ctrl-G` (markdown) and the arrow motions used to
+        // be hardcoded here too. They are default mappings now
+        // (`session::DEFAULT_KEYMAPS`), so they reach the engine like any other
+        // key — which is what makes them listable in `?` and rebindable.
     }
 
     if let Some(k) = to_engine_key(&key) {
@@ -120,15 +110,57 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
 
 /// Translate a crossterm key into the engine's [`Key`], or `None` for keys the
 /// engine has no representation for.
+/// Translate a crossterm event into the engine's [`Key`].
+///
+/// Shift on a character is carried as the character's case, which is what the
+/// terminal already reports for printable keys — so `<C-S-j>` arrives as
+/// `Ctrl('J')` and `<C-j>` as `Ctrl('j')`. Most terminals can only tell those
+/// apart when the keyboard-enhancement protocol is active (see
+/// `main::enable_key_disambiguation`); without it both report as `<C-j>` and
+/// the shifted mapping simply never fires.
 fn to_engine_key(key: &KeyEvent) -> Option<Key> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let mods = Mods { ctrl, alt, shift };
+
+    let special = |k: SpecialKey| Some(Key::Special { key: k, mods });
     match key.code {
-        KeyCode::Char(c) if ctrl => Some(Key::Ctrl(c.to_ascii_lowercase())),
-        KeyCode::Char(c) => Some(Key::Char(c)),
+        KeyCode::Char(c) => {
+            // A shifted printable already arrives uppercased; fold it in
+            // explicitly too, for terminals that report the base char instead.
+            let c = if shift { c.to_ascii_uppercase() } else { c };
+            match (ctrl, alt) {
+                // Ctrl and Alt together has no portable encoding, and the
+                // engine has no key for it — drop it rather than misreport it
+                // as one or the other.
+                (true, true) => None,
+                (true, false) => Some(Key::Ctrl(c)),
+                (false, true) => Some(Key::Alt(c)),
+                (false, false) => Some(Key::Char(c)),
+            }
+        }
         KeyCode::Enter => Some(Key::Enter),
         KeyCode::Backspace => Some(Key::Backspace),
         KeyCode::Tab => Some(Key::Tab),
         KeyCode::Esc => Some(Key::Esc),
+        KeyCode::BackTab => Some(Key::Special {
+            key: SpecialKey::BackTab,
+            // BackTab *is* the shifted Tab; keeping the flag as well would
+            // make `<S-Tab>` unmatchable, since parsing normalizes it away.
+            mods: Mods { shift: false, ..mods },
+        }),
+        KeyCode::Up => special(SpecialKey::Up),
+        KeyCode::Down => special(SpecialKey::Down),
+        KeyCode::Left => special(SpecialKey::Left),
+        KeyCode::Right => special(SpecialKey::Right),
+        KeyCode::Home => special(SpecialKey::Home),
+        KeyCode::End => special(SpecialKey::End),
+        KeyCode::PageUp => special(SpecialKey::PageUp),
+        KeyCode::PageDown => special(SpecialKey::PageDown),
+        KeyCode::Delete => special(SpecialKey::Delete),
+        KeyCode::Insert => special(SpecialKey::Insert),
+        KeyCode::F(n) if (1..=12).contains(&n) => special(SpecialKey::F(n)),
         _ => None,
     }
 }
@@ -267,30 +299,15 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // `<leader>{1-9}` jumps to that tab (the editor does this via the engine
-    // keymap; the shell needs its own two-key handling).
-    if app.leader_pending {
-        app.leader_pending = false;
-        if let Some(d) = c.and_then(|c| c.to_digit(10)) {
-            if (1..=9).contains(&d) {
-                app.set_active(d as usize - 1);
-                return;
-            }
-        }
-        if c == Some('d') {
-            app.dispatch(Action::OpenDashboard);
+    // Mappings, from the same table the editor uses. This used to be a
+    // hand-rolled leader machine that knew only `<leader>1-9`, `<leader>d` and
+    // `<leader>S`, so a user's `[[keymap]]` entries did nothing on the
+    // dashboard. A chord that isn't a mapping falls through to the shell's own
+    // navigation keys below.
+    if let Some(k) = to_engine_key(&key) {
+        if app.shell_keymap(k) {
             return;
         }
-        // `<leader>S` — the same chord the engine keymap binds in the editor.
-        if matches!(key.code, KeyCode::Char('S')) {
-            app.dispatch(Action::OpenReplace);
-            return;
-        }
-        // Not a recognized leader chord — fall through and handle normally.
-    }
-    if c == Some(' ') {
-        app.leader_pending = true;
-        return;
     }
 
     // '?' toggles help from anywhere in the shell.
@@ -377,6 +394,7 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
             (_, Some('d')) => { app.dispatch(Action::ToggleStartupDrawer); return; }
             (_, Some('m')) => { app.dispatch(Action::ToggleMouse); return; }
             (_, Some('i')) => { app.dispatch(Action::CycleIconMode); return; }
+            (_, Some('a')) => { app.dispatch(Action::ToggleAi); return; }
             (KeyCode::Down, _) | (_, Some('j')) => { app.move_settings(1); return; }
             (KeyCode::Up, _) | (_, Some('k')) => { app.move_settings(-1); return; }
             (KeyCode::Enter, _) | (KeyCode::Char(' '), _) => {

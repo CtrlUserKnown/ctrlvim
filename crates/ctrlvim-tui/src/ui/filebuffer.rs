@@ -8,12 +8,12 @@
 //! the markup. One source line is always one screen row, so the cursor/scroll
 //! math is identical whether rendering is on or off.
 
-use ctrlvim_core::{char_width, width_upto, HlSpan, Selection, VisualKind};
+use ctrlvim_core::{char_width, width_upto, HlSpan, Selection, Suggestion, VisualKind};
 use ctrlvim_markdown::{analyze, MdLine};
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -48,6 +48,9 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
 
     // Cursor color tracks the mode: green in insert, blue otherwise.
     let cursor_color = if app.editor_mode() == "i" { theme::green() } else { theme::blue() };
+
+    // The inline AI suggestion, if the model has one for this cursor.
+    let ghost = app.suggestion();
 
     // Decorate the whole buffer once when live markdown rendering is on. Fence
     // state spans lines, so this needs the full source, not just the viewport.
@@ -85,8 +88,18 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
             );
             continue;
         }
-        match &md {
-            Some(mdlines) => md_spans(&mdlines[i], i == cur_line, content_w, &mut spans),
+        match md.as_ref().map(|mdlines| mdlines.get(i)) {
+            Some(Some(mdline)) => md_spans(mdline, i == cur_line, content_w, &mut spans),
+            // Markdown is on, but this row has no decoration. That happens on
+            // the buffer's phantom trailing line: a `Buffer`'s rope always ends
+            // in `\n` (its documented `'eol'` invariant), so `lines()` reports a
+            // final empty line that `analyze` deliberately does not — see its
+            // `split_lines`. The two counts therefore differ by one as soon as
+            // the buffer ends in a blank line, which any edit at the end
+            // produces. An empty line has nothing to decorate, so rendering it
+            // plain is not a fallback but the right answer; going through
+            // `get` also means a renderer can never panic on the mismatch.
+            Some(None) => syntax_spans(raw, &[], &mut spans),
             None => syntax_spans(
                 raw,
                 hl.get(i - first_line).map(Vec::as_slice).unwrap_or(&[]),
@@ -139,12 +152,35 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
             }
         }
 
+        // Inline AI suggestion ("ghost text"): the model's proposal, drawn dim.
+        // It is *not* in the buffer, so it's painted over the finished row
+        // rather than spliced into the spans above — which keeps the cursor,
+        // selection, and search math untouched.
+        if let Some(sug) = ghost {
+            let right = area.x + area.width;
+            if i == sug.anchor.line {
+                let x = text_x + width_upto(raw, sug.anchor.col) as u16;
+                // The rest of the real line is redrawn *after* the ghost, so a
+                // suggestion offered mid-line pushes the existing text right
+                // instead of covering it.
+                ghost_head(f, sug.head(), &raw[byte_at(raw, sug.anchor.col)..], x, y, right);
+            }
+            if let Some(line) = tail_row_for(sug, i) {
+                ghost_row(f, line, text_x, y, right);
+            }
+        }
+
         // Block cursor on the active line. The cursor line renders raw (markup
         // visible), so source columns line up with the screen 1:1.
         if i == cur_line {
             let cx = text_x + width_upto(&raw, cur_col) as u16;
             if cx < area.x + area.width {
-                let ch = raw.chars().nth(cur_col).unwrap_or(' ');
+                // With ghost text under the cursor the block shows the model's
+                // first character, not the buffer's: that cell now belongs to
+                // the suggestion.
+                let ch = ghost_char_at(ghost, cur_line, cur_col)
+                    .or_else(|| raw.chars().nth(cur_col))
+                    .unwrap_or(' ');
                 // A wide glyph needs a two-cell cursor, or the block sits on
                 // half a character and the other half keeps the normal colors.
                 let w = char_width(ch) as u16;
@@ -159,6 +195,97 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
+}
+
+// --- inline AI suggestions --------------------------------------------------
+//
+// Ghost text is proposed, not present: it lives in the engine's suggestion
+// state, never in the buffer, and disappears on the next keystroke unless it is
+// accepted. Rendering therefore paints *over* a finished row instead of taking
+// part in the span building above, so nothing about how a line is highlighted,
+// selected, or searched changes when a suggestion happens to be showing.
+
+/// How ghost text is drawn: dim and italic, so it never reads as real code.
+fn ghost_style() -> Style {
+    Style::default()
+        .fg(theme::fg_muted())
+        .bg(theme::bg())
+        .add_modifier(Modifier::ITALIC)
+}
+
+/// Draw the first line of a suggestion at the cursor, followed by whatever the
+/// real line had after the cursor.
+///
+/// Redrawing `rest` is what makes a mid-line suggestion readable: without it
+/// the ghost would sit *on top of* the text after the cursor rather than
+/// appearing to push it aside, which is how the same feature behaves in a
+/// proportional editor.
+fn ghost_head(f: &mut Frame, ghost: &str, rest: &str, x: u16, y: u16, right: u16) {
+    if ghost.is_empty() || x >= right {
+        return;
+    }
+    let spans = vec![
+        Span::styled(ghost.to_string(), ghost_style()),
+        Span::styled(rest.to_string(), Style::default().fg(theme::fg()).bg(theme::bg())),
+    ];
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect { x, y, width: right - x, height: 1 },
+    );
+}
+
+/// Draw one continuation row of a multi-line suggestion.
+///
+/// These rows sit where the buffer's *next* lines are drawn, and cover them:
+/// one source line is one screen row here (the invariant the fold and scroll
+/// maths depend on), so there is nowhere to push the real text down to. The
+/// row is cleared to the code background first, so it reads as an overlay
+/// panel rather than as buffer content that mysteriously changed — and it is
+/// gone as soon as the suggestion is accepted or dismissed. Set
+/// `[ai] max_lines = 1` for strictly inline suggestions.
+fn ghost_row(f: &mut Frame, text: &str, x: u16, y: u16, right: u16) {
+    if x >= right {
+        return;
+    }
+    let area = Rect { x, y, width: right - x, height: 1 };
+    f.render_widget(Block::default().style(Style::default().bg(theme::code_bg())), area);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            text.to_string(),
+            ghost_style().bg(theme::code_bg()),
+        )),
+        area,
+    );
+}
+
+/// The continuation line a suggestion puts on buffer row `line`, if any.
+/// Line 0 of the suggestion belongs to the anchor's own row, so row `n` below
+/// the anchor shows suggestion line `n + 1`.
+fn tail_row_for(sug: &Suggestion, line: usize) -> Option<&str> {
+    let below = line.checked_sub(sug.anchor.line + 1)?;
+    sug.text.split('\n').nth(below + 1)
+}
+
+/// Byte offset of column `col` in `s`, clamped into the string and back to the
+/// nearest character boundary — engine columns are byte offsets, and slicing a
+/// line mid-character would panic.
+fn byte_at(s: &str, col: usize) -> usize {
+    let mut col = col.min(s.len());
+    while col > 0 && !s.is_char_boundary(col) {
+        col -= 1;
+    }
+    col
+}
+
+/// The first character of a suggestion anchored exactly at `(line, col)` — the
+/// glyph the block cursor should show, since that cell now belongs to the
+/// ghost text rather than to the buffer.
+fn ghost_char_at(ghost: Option<&Suggestion>, line: usize, col: usize) -> Option<char> {
+    let sug = ghost?;
+    if sug.anchor.line != line || sug.anchor.col != col {
+        return None;
+    }
+    sug.head().chars().next()
 }
 
 /// The half-open source-column range `[lo, hi)` selected on line `i`, or `None`

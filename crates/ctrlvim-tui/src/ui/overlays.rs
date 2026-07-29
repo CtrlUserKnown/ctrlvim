@@ -9,6 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use ctrlvim_core::MapMode;
+
 use crate::app::{Action, App};
 use crate::theme;
 
@@ -248,32 +250,53 @@ pub fn save_prompt(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     );
 }
 
+/// Every mapping in the live table, as `(keys, what it does)` rows.
+///
+/// This is deliberately *derived* rather than written down. The help modal used
+/// to render a hardcoded 20-item array that could not see user mappings and
+/// went stale whenever a default changed — the fn didn't even take `app`. Now
+/// a mapping added in `config.toml`, by `:map`, or by a plugin appears here the
+/// moment it is defined, and one removed by `[[unmap]]` disappears.
+fn binding_rows(app: &App) -> Vec<(String, String)> {
+    let keymap = &app.engine.session.keymap;
+    let mut rows = Vec::new();
+    for mode in MapMode::ALL {
+        for m in keymap.list(mode) {
+            let keys = match mode {
+                // Normal mode is the default; only annotate the others, so the
+                // common case stays uncluttered.
+                MapMode::Normal => m.lhs_notation(),
+                other => format!("{} {}", other.letter(), m.lhs_notation()),
+            };
+            // `label()` is the mapping's `desc`, falling back to its rhs — so a
+            // row is never blank, even for a mapping nobody described.
+            rows.push((keys, m.label()));
+        }
+    }
+    rows.sort();
+    rows
+}
+
 /// Centered keybinding help modal (`?`).
-pub fn help(f: &mut Frame, _app: &App, area: Rect, zones: &mut Zones) {
+pub fn help(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     zones.push(area, Action::CloseHelp);
 
-    let bindings: [(&str, &str); 16] = [
-        ("␣e / ␣ff", "fuzzy file browser"),
-        ("␣S / :Find", "find & replace in project"),
-        ("n / :new", "new file"),
-        ("␣w / ␣q", "write / write+quit"),
-        (":w :q :wq", "ex write / quit"),
-        (":", "command palette"),
-        ("^⇥ / ^⇧⇥", "next / prev tab"),
-        ("␣1 – ␣9", "jump to tab N"),
-        ("w / s / a", "workspace / settings / about"),
-        ("p", "open plugin manager"),
-        ("g", "expand git"),
-        ("j / k", "move selection"),
-        ("⇥ / ⇧⇥", "cycle tabs"),
-        ("i / Esc", "insert / normal mode"),
-        (":source :lua", "run a script"),
-        ("?", "toggle this help"),
-    ];
+    let bindings = binding_rows(app);
 
-    let w = 60u16.min(area.width.saturating_sub(4));
-    let rows = bindings.len().div_ceil(2) as u16;
-    let h = rows + 4;
+    // Size to the content rather than to a fixed 60 columns. The list is the
+    // real mapping table now, so both columns vary with what the user has
+    // bound — a fixed width silently truncated the longer descriptions.
+    let key_w = bindings.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(8).max(8);
+    let desc_w = bindings.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(20);
+    let cell_w = (key_w + 2 + desc_w) as u16;
+
+    let avail = area.width.saturating_sub(4);
+    // Two columns when they fit, otherwise one — better a tall list than a
+    // clipped one.
+    let cols: u16 = if cell_w * 2 + 2 <= avail { 2 } else { 1 };
+    let w = (cell_w * cols + 2).min(avail);
+    let rows = (bindings.len() as u16).div_ceil(cols);
+    let h = rows + 2;
     let panel = centered(area, w, h.min(area.height.saturating_sub(2)));
     f.render_widget(Clear, panel);
     let block = Block::default()
@@ -289,22 +312,84 @@ pub fn help(f: &mut Frame, _app: &App, area: Rect, zones: &mut Zones) {
     f.render_widget(Paragraph::new(Span::styled("×", Style::default().fg(theme::fg_dim()))), close_rect);
     zones.push(close_rect, Action::CloseHelp);
 
-    let col_w = inner.width / 2;
+    let col_w = inner.width / cols;
     for (i, (keys, desc)) in bindings.iter().enumerate() {
-        let col = (i % 2) as u16;
-        let rownum = (i / 2) as u16;
+        let col = i as u16 % cols;
+        let rownum = i as u16 / cols;
         let cx = inner.x + col * col_w;
         let cy = inner.y + rownum;
         if cy >= inner.y + inner.height {
             break;
         }
         let line = Line::from(vec![
-            Span::styled(format!("{keys:<11}"), Style::default().fg(theme::cyan())),
-            Span::styled(*desc, Style::default().fg(theme::fg_dim())),
+            Span::styled(format!("{keys:<width$}", width = key_w), Style::default().fg(theme::cyan())),
+            Span::raw("  "),
+            Span::styled(desc.clone(), Style::default().fg(theme::fg_dim())),
         ]);
         f.render_widget(
             Paragraph::new(line).style(Style::default().bg(theme::bg_dark())),
             Rect { x: cx, y: cy, width: col_w, height: 1 },
+        );
+    }
+}
+
+/// Bottom-anchored which-key popup: what can still follow the chord in progress.
+///
+/// Shown once `'timeoutlen'` elapses on a half-typed mapping, so it never
+/// flickers up on a chord you type at speed. Contents come from
+/// `Keymap::continuations` — the live table — which is why a mapping added in
+/// config appears here with no code change, and why a row can never describe a
+/// key that doesn't do that any more.
+pub fn which_key(f: &mut Frame, app: &App, area: Rect) {
+    if app.which_key.is_empty() {
+        return;
+    }
+
+    // Widest key column, so the descriptions line up.
+    let key_w = app.which_key.iter().map(|c| c.rest.chars().count()).max().unwrap_or(1).max(3);
+    let col_w = (key_w + 3 + 28) as u16;
+    let cols = (area.width / col_w).clamp(1, 4) as usize;
+    let rows = app.which_key.len().div_ceil(cols) as u16;
+
+    let h = (rows + 2).min(area.height.saturating_sub(2));
+    let w = area.width.saturating_sub(2);
+    let panel = Rect { x: area.x + 1, y: area.y + area.height.saturating_sub(h + 1), width: w, height: h };
+    f.render_widget(Clear, panel);
+
+    let title = format!(" {} ", app.engine.pending_display());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::border()))
+        .style(Style::default().bg(theme::bg_dark()))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default().fg(theme::purple()).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let cell_w = inner.width / cols as u16;
+    for (i, c) in app.which_key.iter().enumerate() {
+        let col = (i % cols) as u16;
+        let row = (i / cols) as u16;
+        if row >= inner.height {
+            break;
+        }
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{:<width$}", c.rest, width = key_w),
+                Style::default().fg(theme::cyan()).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" → ", Style::default().fg(theme::fg_dim())),
+            Span::styled(c.label.clone(), Style::default().fg(theme::fg())),
+        ]);
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(theme::bg_dark())),
+            Rect { x: inner.x + col * cell_w, y: inner.y + row, width: cell_w, height: 1 },
         );
     }
 }

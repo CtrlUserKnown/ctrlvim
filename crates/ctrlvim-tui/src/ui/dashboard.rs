@@ -336,7 +336,7 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         return;
     }
     // EDITOR options panel: live-toggleable settings backed by config.toml.
-    let opt_h = 6u16.min(area.height);
+    let opt_h = 7u16.min(area.height);
     let opt_rect = Rect { height: opt_h, ..area };
     let cfg_hint = Line::from(Span::styled("┤ ~/.config/ctrlvim/config.toml ├", Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
     let opt_inner = super::titled_panel_with_right(f, opt_rect, "EDITOR", theme::cyan(), Some(cfg_hint));
@@ -352,6 +352,13 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     if opt_inner.height >= 3 {
         let r = Rect { x: opt_inner.x, y: opt_inner.y + 2, width: opt_inner.width, height: 1 };
         choice_row(f, r, "File icons (Nerd Font)", &app.config.icons.label(), sel == 2, zones, Action::CycleIconMode);
+    }
+    if opt_inner.height >= 4 {
+        let r = Rect { x: opt_inner.x, y: opt_inner.y + 3, width: opt_inner.width, height: 1 };
+        // The *live* state, not `config.ai.enabled`: `:AI on` changes one and
+        // not the other, and a checkbox that disagrees with the editor is worse
+        // than no checkbox. Toggling here writes the config as well.
+        option_row(f, r, "Inline AI suggestions (CodeGemma)", app.ai_enabled(), sel == 3, zones, Action::ToggleAi);
     }
 
     // Header row for the LSP table.

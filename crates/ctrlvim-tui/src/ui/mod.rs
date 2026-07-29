@@ -97,6 +97,10 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     if app.shell_open {
         overlays::shell_output(f, app, area, &mut zones);
     }
+    // Last of all: the which-key popup is transient and must sit on top of
+    // whatever is already showing. It registers no zones — it's a hint, not a
+    // menu, and clicking through it should hit what's underneath.
+    overlays::which_key(f, app, area);
 
     zones
 }

@@ -28,8 +28,15 @@ pub use registry::{call, ApiFunction};
 pub struct ApiContext {
     pub session: Session,
     pub autocmds: AutocmdStore,
-    /// Keymaps registered from Lua (`vim.keymap.set`): (mode, lhs) -> LuaRef id.
-    pub keymaps: HashMap<(String, String), i64>,
+    /// Callback keymaps registered from Lua (`vim.keymap.set` with a function
+    /// right-hand side): (mode, lhs) -> (LuaRef id, `desc`).
+    ///
+    /// A *string* right-hand side doesn't land here — it goes straight into
+    /// [`session`](Self::session)'s mapping table, where it works like any
+    /// other mapping. Callbacks still need the typeahead layer to learn how to
+    /// invoke a `LuaRef`, so for now they are trigger-only; keeping the `desc`
+    /// means the description survives until it can be listed.
+    pub keymaps: HashMap<(String, String), (i64, Option<String>)>,
     /// Commands registered from Lua (`vim.api.ctrlvim_create_user_command`):
     /// name -> (callback, description, source). `source` is whatever script
     /// was executing at registration time (see [`current_source`]), so the

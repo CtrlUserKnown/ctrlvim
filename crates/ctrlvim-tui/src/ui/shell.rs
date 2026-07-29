@@ -151,6 +151,16 @@ pub fn status_line(f: &mut Frame, app: &App, area: Rect) {
     }
     hints.push(("^⇥ tabs", theme::fg_dim()));
     hints.push(("? help", theme::fg_dim()));
+    // Inline AI suggestions: shown only once they've been switched on, and
+    // colored by state — a model that failed to load says so here rather than
+    // silently never suggesting anything.
+    if let Some(badge) = app.ai_badge() {
+        let color = match app.ai_status() {
+            Some(s) if s.is_failed() => theme::red(),
+            _ => theme::purple(),
+        };
+        hints.push((badge, color));
+    }
     // The language tag reports the buffer's real filetype — the one the
     // tree-sitter highlighter is using — and is blank when there isn't one.
     if let Some(ft) = app.editor_filetype() {

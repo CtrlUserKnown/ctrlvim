@@ -5,8 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Ratatui frontend for the ctrlvim engine (startup dashboard + editor shell)"
 
+[features]
+default = []
+# Forward candle's accelerator backends to the AI completion crate. Off by
+# default: CUDA needs a toolkit at build time and Metal only exists on macOS.
+ai-cuda = ["ctrlvim-ai/cuda"]
+ai-metal = ["ctrlvim-ai/metal"]
+
 [dependencies]
 ctrlvim-core.workspace = true
+ctrlvim-ai.workspace = true
 ctrlvim-markdown.workspace = true
 ctrlvim-tools.workspace = true
 ratatui.workspace = true

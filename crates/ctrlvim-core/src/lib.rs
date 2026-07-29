@@ -13,13 +13,20 @@ pub use ctrlvim_api::ApiContext;
 pub use ctrlvim_treesitter::{HlKind, HlSpan};
 pub use ctrlvim_async::{Event, EventLoop, Jobs, LineBuffer, TimerService};
 pub use ctrlvim_editor::{
-    ex_commands, is_ex_command, BufferCmd, Editor, ExCommand, ExEffect, Fold, Folds, Frame, Key,
-    Mode, QfItem, QfKind, QuickfixCmd, QuickfixList, Selection, Session, TagCmd, VisualKind,
+    ex_commands, is_ex_command, AiCmd, BufferCmd, Editor, ExCommand, ExEffect, Fold, Folds, Frame,
+    Key, Mode, Mods, PinCmd, QfItem, QfKind, QuickfixCmd, QuickfixList, Selection, Session, SpecialKey,
+    TagCmd, VisualKind,
 };
-pub use ctrlvim_editor::keymap::MapMode;
+pub use ctrlvim_editor::suggest::{
+    Accept as SuggestAccept, ContextWindow, InlineSuggest, SuggestRequest, Suggestion,
+};
+pub use ctrlvim_editor::keymap::{
+    notation as keys_notation, Continuation, Keymap, KeymapMatch, MapMode, Mapping,
+};
 pub use ctrlvim_editor::fold::fold_text;
 pub use ctrlvim_editor::tags::{resolve_address as resolve_tag_address, TagAddress, TagTable};
 pub use ctrlvim_editor::quickfix::{grep_text, Matcher, OutputParser};
+pub use ctrlvim_editor::pinned::PinList;
 pub use ctrlvim_editor::replace::{ReplaceHit, ReplacePlan};
 pub use ctrlvim_lua::Host;
 pub use ctrlvim_types::{BufferId, Object, Position, WindowId};

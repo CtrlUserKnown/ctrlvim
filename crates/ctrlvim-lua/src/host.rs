@@ -80,7 +80,7 @@ impl Host {
             .borrow()
             .keymaps
             .get(&(mode.to_string(), lhs.to_string()))
-            .copied();
+            .map(|(id, _)| *id);
         match luaref {
             Some(id) => {
                 if let Some(func) = self.store.get(&self.lua, id)? {
@@ -144,16 +144,50 @@ impl Host {
         Ok(())
     }
 
-    /// Install `vim.keymap.set(mode, lhs, callback)` — stores the callback as a
-    /// `LuaRef` in the shared keymap table (same mechanism as autocmds).
+    /// Install `vim.keymap.set(mode, lhs, rhs, opts)`, matching Neovim's
+    /// signature: `rhs` is a string of keys to replay *or* a Lua callback, and
+    /// `opts.desc` describes the mapping.
+    ///
+    /// A string right-hand side becomes a real mapping in the session's table,
+    /// so a plugin's `vim.keymap.set('n', '<leader>x', ':Foo<CR>')` behaves
+    /// exactly like the same line in config. A callback is stored as a
+    /// `LuaRef` and is still trigger-only — dispatching one needs the typeahead
+    /// layer to learn how to call back into Lua mid-keystroke.
+    ///
+    /// `desc` is kept in both cases. It is the only source of the text the
+    /// keybinding help shows, so dropping it here would mean a plugin's
+    /// mappings could never be described.
     fn install_keymap(&self, vim: &Table) -> mlua::Result<()> {
         let keymap = self.lua.create_table()?;
         let ctx = self.ctx.clone();
         let store = self.store.clone();
         let set = self.lua.create_function(
-            move |lua, (mode, lhs, cb): (String, String, Function)| {
-                let id = store.store(lua, cb)?;
-                ctx.borrow_mut().keymaps.insert((mode, lhs), id);
+            move |lua, (mode, lhs, rhs, opts): (String, String, Value, Option<Table>)| {
+                let desc = match &opts {
+                    Some(o) => o.get::<_, Option<String>>("desc")?,
+                    None => None,
+                };
+                match rhs {
+                    Value::Function(cb) => {
+                        let id = store.store(lua, cb)?;
+                        ctx.borrow_mut().keymaps.insert((mode, lhs), (id, desc));
+                    }
+                    Value::String(s) => {
+                        let rhs = s.to_str()?.to_string();
+                        let mode = ctrlvim_editor::keymap::MapMode::parse(&mode);
+                        ctx.borrow_mut()
+                            .session
+                            .keymap
+                            .set_with_desc(mode, &lhs, &rhs, desc)
+                            .map_err(mlua::Error::runtime)?;
+                    }
+                    other => {
+                        return Err(mlua::Error::runtime(format!(
+                            "vim.keymap.set: rhs must be a string or a function, got {}",
+                            other.type_name()
+                        )))
+                    }
+                }
                 Ok(())
             },
         )?;
@@ -868,6 +902,36 @@ mod tests {
         assert_eq!(host.eval_string("tostring(_G.pressed)").unwrap(), "0");
         assert!(host.trigger_keymap("n", "<leader>x").unwrap());
         assert_eq!(host.eval_string("tostring(_G.pressed)").unwrap(), "1");
+    }
+
+    #[test]
+    fn vim_keymap_set_with_a_string_rhs_defines_a_real_mapping() {
+        // The shape almost every Neovim config uses. A callback still needs the
+        // typeahead layer to dispatch it, but a string rhs is just a mapping.
+        let host = host_with("x");
+        host.exec("vim.keymap.set('n', '<leader>g', ':Find<CR>', { desc = 'grep' })").unwrap();
+        let ctx = host.ctx.borrow();
+        let maps = ctx.session.keymap.list(ctrlvim_editor::keymap::MapMode::Normal);
+        let m = maps.iter().find(|m| m.lhs_notation() == "<Space>g").expect("mapping stored");
+        assert_eq!(m.rhs_notation(), ":Find<CR>");
+        assert_eq!(m.desc.as_deref(), Some("grep"));
+    }
+
+    #[test]
+    fn vim_keymap_set_keeps_a_callbacks_desc() {
+        let host = host_with("x");
+        host.exec("vim.keymap.set('n', '<leader>y', function() end, { desc = 'do a thing' })")
+            .unwrap();
+        let ctx = host.ctx.borrow();
+        let (_, desc) = &ctx.keymaps[&("n".to_string(), "<leader>y".to_string())];
+        assert_eq!(desc.as_deref(), Some("do a thing"));
+    }
+
+    #[test]
+    fn vim_keymap_set_rejects_a_rhs_that_is_neither_string_nor_function() {
+        let host = host_with("x");
+        let e = host.exec("vim.keymap.set('n', 'x', 42)").unwrap_err().to_string();
+        assert!(e.contains("must be a string or a function"), "{e}");
     }
 
     #[test]

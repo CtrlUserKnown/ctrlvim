@@ -45,32 +45,136 @@ tabstop = 4
 shiftwidth = 4
 scrolloff = 5
 foldmethod = "indent"
+# How long a half-typed mapping waits for its next key, in milliseconds. This
+# is what lets `<leader>q` and `<leader>qq` coexist, and how long the
+# which-key popup takes to appear.
+timeoutlen = 500
+
+
+# ---------------------------------------------------------------------------
+# [keymaps] — settings about the mapping table itself.
+# ---------------------------------------------------------------------------
+[keymaps]
+# Install the built-in mappings. Set false to start from an empty table and
+# define every chord yourself. (To drop just a few, use [[unmap]] below.)
+defaults = true
+# What `<leader>` expands to. Applies at definition time, as in Vim — so it
+# must be set before the [[keymap]] entries that use it.
+leader = " "
 
 
 # ---------------------------------------------------------------------------
 # [[keymap]] — one table per mapping.
 #
-# `mode` is "n" (default), "i", or "v". Both sides use `<...>` key notation.
+# `mode` is "n" (default), "i", or "v". Both sides use `<...>` key notation:
+# `<leader>`, `<Space>`, `<Esc>`, `<CR>`, `<Tab>`, `<S-Tab>`, `<C-x>`, `<A-x>`
+# (same as `<M-x>`), `<C-S-x>`, `<Up>`, `<C-Left>`, `<F5>`, `<Del>`, `<Home>`.
+#
+# `desc` is what `?` and the which-key popup show. It's optional — an
+# undescribed mapping is listed by its right-hand side instead — but it's the
+# difference between a keymap you can discover and one you have to read this
+# file to understand.
+#
+# A mapping whose `lhs` doesn't parse is reported on the status line rather
+# than silently ignored, so a typo can't leave you with a dead key.
+#
+# `<leader>q` fires only after `timeoutlen` (500ms) because `<leader>qq` also
+# exists and would otherwise be untypable. That's `'timeoutlen'`, set under
+# [options].
 # ---------------------------------------------------------------------------
-[[keymap]]
-mode = "n"
-lhs = "<Space>f"
-rhs = ":Files<CR>"
 
 [[keymap]]
-mode = "n"
-lhs = "<Space>g"
+lhs = "<leader>g"
 rhs = ":Find<CR>"
+desc = "Search the project"
 
 [[keymap]]
 mode = "i"
-lhs = "jk"
+lhs = "jj"
 rhs = "<Esc>"
+desc = "Leave Insert mode"
 
 [[keymap]]
 mode = "v"
 lhs = "<"
 rhs = "<gv"
+desc = "Outdent, keeping the selection"
+
+# --- Motion remaps, if you like them -----------------------------------------
+# These shadow real Vim motions (H/L are screen top/bottom, [[/]] are section
+# motions, `;` repeats f/t), so they are NOT defaults. Uncomment to opt in.
+#
+# [[keymap]]
+# lhs = "H"
+# rhs = "0"
+# desc = "Start of line"
+#
+# [[keymap]]
+# lhs = "L"
+# rhs = "$"
+# desc = "End of line"
+#
+# [[keymap]]
+# lhs = "[["
+# rhs = "gg"
+# desc = "Top of file"
+#
+# [[keymap]]
+# lhs = "]]"
+# rhs = "G"
+# desc = "Bottom of file"
+#
+# [[keymap]]
+# lhs = "<M-[>"
+# rhs = "{"
+# desc = "Previous paragraph"
+#
+# [[keymap]]
+# lhs = ";"
+# rhs = ":!"
+# desc = "Start a shell command"
+
+
+# ---------------------------------------------------------------------------
+# [[unmap]] — remove a built-in mapping.
+#
+# Binding the same `lhs` in [[keymap]] already replaces a built-in; this is for
+# chords you want simply gone, so the key falls through to its Vim meaning.
+# ---------------------------------------------------------------------------
+# [[unmap]]
+# mode = "n"
+# lhs = "<leader>d"
+
+
+# ---------------------------------------------------------------------------
+# [[command]] — define a `:` command as an alias for another one.
+#
+# This is the escape hatch that keeps the config declarative: `expansion` is an
+# ordinary Ex command line, so a command plus a [[keymap]] pointing at it is a
+# complete binding with no plugin involved.
+#
+# In a filename position — `:!`, `:e`, `:w`, `:make`, `:grep`, `:source` — the
+# argument expands `%` (this file) with Vim's modifiers: `%:p` full path,
+# `%:h` directory, `%:t` file name, `%:r` without extension, `%:e` extension.
+# They chain (`%:t:r`). `\%` is a literal percent, and `<cword>` is the word
+# under the cursor. Elsewhere `%` is left alone, so `:s/50%/half/` still works.
+# ---------------------------------------------------------------------------
+# [[command]]
+# name = "RunPython"
+# expansion = "!python3 %:p"
+#
+# [[command]]
+# name = "RunJava"
+# expansion = "!cd %:p:h && javac %:p && java %:t:r"
+#
+# [[command]]
+# name = "OpenInBrowser"
+# expansion = "!xdg-open %:p"
+#
+# [[keymap]]
+# lhs = "<leader>rp"
+# rhs = ":RunPython<CR>"
+# desc = "Run this Python file"
 
 
 # ---------------------------------------------------------------------------
@@ -103,3 +207,43 @@ command = "set number"
 # path = "~/.config/ctrlvim/pack/example"
 # event = "BufWritePre"   # omit to load at startup
 # enabled = true
+
+
+# ---------------------------------------------------------------------------
+# [ai] — inline AI code suggestions (CodeGemma-2B, running locally on candle).
+#
+# Off by default: the first suggestion downloads ~1.6GB of weights (a 4-bit
+# quantized GGUF — the same file Ollama's `codegemma:2b` tag ships).
+# Full guide: docs/ai.md
+#
+# On a CPU this is slow: prefill of the prompt dominates, so `context_before`
+# is the most expensive setting here. Build with --features ai-cuda / ai-metal
+# if you have a GPU.
+#
+# In Insert mode, while ghost text is showing: <Tab> accepts it, <C-l> takes a
+# word, <C-j> takes a line, <C-e> dismisses it. `:AI` toggles the feature and
+# `:AIStatus` says where the model is.
+# ---------------------------------------------------------------------------
+# [ai]
+# enabled          = true
+# device           = "auto"   # auto | cpu | cuda | cuda:1 | metal
+# debounce_ms      = 350      # idle time before a completion is requested
+# max_tokens       = 64       # generation ceiling
+# max_millis       = 8000     # wall-clock ceiling for one completion
+# temperature      = 0.0      # 0 = greedy, which is what code completion wants
+# context_before   = 20       # lines before the cursor (the prefill cost)
+# context_after    = 6        # lines after
+# threads          = 3        # default: one fewer than the machine has
+# max_lines        = 8        # most lines of ghost text to show (1 = inline only)
+
+# [ai.model]
+# 4-bit quantized weights. Set to "" to load full-precision safetensors.
+# gguf      = "bartowski/codegemma-2b-GGUF:codegemma-2b-Q4_K_M.gguf"
+# Supplies tokenizer.json (and the weights when `gguf` is empty). Ungated.
+# repo      = "unsloth/codegemma-2b"
+# precision = "bf16"          # bf16 | f16 | f32; ignored when `gguf` is set
+# path      = "~/models/codegemma-2b"   # skip the download entirely
+
+
+
+# end of code

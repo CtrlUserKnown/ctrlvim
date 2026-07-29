@@ -505,6 +505,56 @@ pub fn save_theme(name: &str) {
     }
 }
 
+/// Where a project's pinned files are remembered, keyed by project root.
+///
+/// Pins are per-project by nature — "the four files I'm working in" means
+/// nothing across repositories — so the file name is derived from the root
+/// rather than there being one global list. Kept in the state dir next to
+/// `sessions.tsv`, since it's recoverable cache, not configuration.
+pub fn pins_path(root: &Path) -> Option<PathBuf> {
+    state_dir().map(|s| pins_path_in(&s, root))
+}
+
+/// The pins file for `root` under an explicit state directory. Split out from
+/// [`pins_path`] so the read/write pair can be tested against a temp dir
+/// instead of the developer's real `~/.local/state`.
+fn pins_path_in(state: &Path, root: &Path) -> PathBuf {
+    let key: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    state.join("ctrlvim").join("pins").join(format!("{key}.txt"))
+}
+
+/// Read a project's pinned files. Missing or unreadable is an empty list —
+/// losing pins is not worth refusing to start over.
+pub fn load_pins(root: &Path) -> Vec<PathBuf> {
+    let Some(state) = state_dir() else { return Vec::new() };
+    load_pins_in(&state, root)
+}
+
+fn load_pins_in(state: &Path, root: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(pins_path_in(state, root)) else { return Vec::new() };
+    text.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect()
+}
+
+/// Write a project's pinned files (best-effort).
+pub fn save_pins(root: &Path, files: &[PathBuf]) {
+    if let Some(state) = state_dir() {
+        save_pins_in(&state, root, files);
+    }
+}
+
+fn save_pins_in(state: &Path, root: &Path, files: &[PathBuf]) {
+    let path = pins_path_in(state, root);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body: String = files.iter().map(|f| format!("{}\n", f.to_string_lossy())).collect();
+    let _ = std::fs::write(path, body);
+}
+
 fn state_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -541,4 +591,59 @@ fn group_thousands(n: usize) -> String {
         out.push(*b as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique temp directory, so the tests never touch the real state dir.
+    fn temp_state() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ctrlvim-pins-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pins_round_trip_through_the_state_dir() {
+        let state = temp_state();
+        let root = Path::new("/home/dev/project");
+        assert!(load_pins_in(&state, root).is_empty(), "nothing saved yet");
+
+        let files = vec![PathBuf::from("src/main.rs"), PathBuf::from("src/lib.rs")];
+        save_pins_in(&state, root, &files);
+        assert_eq!(load_pins_in(&state, root), files, "order is preserved");
+
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn pins_are_kept_per_project() {
+        // "the files I'm working in" means nothing across repositories, so two
+        // roots must not share a list.
+        let state = temp_state();
+        save_pins_in(&state, Path::new("/a"), &[PathBuf::from("a.rs")]);
+        save_pins_in(&state, Path::new("/b"), &[PathBuf::from("b.rs")]);
+        assert_eq!(load_pins_in(&state, Path::new("/a")), [PathBuf::from("a.rs")]);
+        assert_eq!(load_pins_in(&state, Path::new("/b")), [PathBuf::from("b.rs")]);
+
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn saving_an_empty_list_clears_the_file() {
+        let state = temp_state();
+        let root = Path::new("/p");
+        save_pins_in(&state, root, &[PathBuf::from("a.rs")]);
+        save_pins_in(&state, root, &[]);
+        assert!(load_pins_in(&state, root).is_empty(), ":PinClear must actually persist");
+
+        std::fs::remove_dir_all(&state).ok();
+    }
 }

@@ -14,6 +14,7 @@ use crate::mode::{Mode, Selection, VisualKind};
 use crate::motion::{self, MotionKind, MotionResult};
 use crate::operator::{apply_operator, Operator, OperatorSpan};
 use crate::range::{self, Addr, Address, RangeSpec};
+use crate::suggest::{self, Accept, InlineSuggest, SuggestRequest};
 use crate::textobject;
 use ctrlvim_text::{Gravity, MotionType, YankReg, NS_LEGACY_MARKS};
 use ctrlvim_types::Position;
@@ -142,17 +143,23 @@ impl Pending {
 pub struct Session {
     pub editor: Editor,
     pub mode: Mode,
-    /// Normal-mode key mappings (`<leader>` chords etc.), consulted by [`feed`].
+    /// Key mappings (`<leader>` chords etc.), consulted by [`feed`].
     pub keymap: Keymap,
     pending: Pending,
     /// Keys buffered while a mapping's left-hand side is still being matched
-    /// (the start of the M3 typeahead buffer).
+    /// (the typeahead buffer).
     map_pending: Vec<Key>,
+    /// An expansion that matched exactly but is also the prefix of a longer
+    /// mapping (`<leader>q` while `<leader>qq` exists). Held until
+    /// [`Session::keymap_timeout`] fires or a further key resolves it.
+    map_ambiguous: Option<Vec<Key>>,
     /// Nonzero while replaying a mapping's right-hand side, so the expansion is
     /// non-recursive (noremap) and can't loop.
     no_remap: u32,
     /// Host effects requested by Ex commands, drained via [`take_effects`].
     effects: Vec<ExEffect>,
+    /// Files pinned for quick access (`:Pin`, `<M-1>`…). See [`crate::pinned`].
+    pub pins: crate::pinned::PinList,
     /// Text typed during the current Insert session, tracked so a single undo
     /// step covers the whole insertion (Neovim coalesces typing into one undo).
     insert_start: Option<Position>,
@@ -167,7 +174,7 @@ pub struct Session {
     /// Whether search matches are currently highlighted (cleared by `:noh`).
     pub search_highlight: bool,
     /// The last Visual selection `(start, end)`, resolving `'<` / `'>`.
-    last_visual: Option<(Position, Position)>,
+    last_visual: Option<(Position, Position, VisualKind)>,
     /// Dot-repeat: keys of the current normal-mode command, the last completed
     /// change to replay on `.`, and a guard while replaying it.
     recording: Vec<Key>,
@@ -183,6 +190,9 @@ pub struct Session {
     /// Nesting depth while replaying, so a macro that invokes itself hits a
     /// bound instead of hanging the editor.
     macro_depth: u32,
+    /// Inline AI suggestions ("ghost text"). The engine owns what is proposed
+    /// and when it goes stale; the host runs the model — see [`crate::suggest`].
+    pub suggest: InlineSuggest,
 }
 
 /// How deep `@` replays may nest before we refuse to go further. Vim relies on
@@ -203,6 +213,8 @@ impl Session {
             keymap: default_keymap(),
             pending: Pending::default(),
             map_pending: Vec::new(),
+            map_ambiguous: None,
+            pins: crate::pinned::PinList::new(),
             no_remap: 0,
             effects: Vec::new(),
             insert_start: None,
@@ -220,6 +232,7 @@ impl Session {
             macro_recording: None,
             last_macro: None,
             macro_depth: 0,
+            suggest: InlineSuggest::default(),
         }
     }
 
@@ -575,10 +588,18 @@ impl Session {
             return false;
         }
         self.map_pending.push(key);
+        // Any further key supersedes a held ambiguous match: the user kept
+        // typing, so they meant the longer mapping (or nothing).
+        self.map_ambiguous = None;
         match self.keymap.match_mode(mode, &self.map_pending) {
             KeymapMatch::Full(rhs) => {
                 self.map_pending.clear();
                 self.replay(rhs);
+            }
+            KeymapMatch::FullAmbiguous(rhs) => {
+                // Matches, but a longer mapping starts with these keys. Park
+                // the expansion; `keymap_timeout` fires it if nothing follows.
+                self.map_ambiguous = Some(rhs);
             }
             KeymapMatch::Prefix => {} // wait for the next key
             KeymapMatch::None => {
@@ -588,6 +609,52 @@ impl Session {
             }
         }
         true
+    }
+
+    /// True while the mapping layer is waiting on more keys — either for a
+    /// longer mapping or to resolve an ambiguity. The host uses this to know
+    /// it should be running a `'timeoutlen'` clock.
+    pub fn keymap_pending(&self) -> bool {
+        !self.map_pending.is_empty()
+    }
+
+    /// `'timeoutlen'` — how long the host should wait for the rest of a mapped
+    /// sequence before calling [`Session::keymap_timeout`].
+    pub fn timeoutlen(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.editor.global_options.timeoutlen.max(0) as u64)
+    }
+
+    /// The mappings reachable from the keys typed so far — what the which-key
+    /// popup lists. Empty when nothing is pending.
+    pub fn keymap_continuations(&self) -> Vec<crate::keymap::Continuation> {
+        if self.map_pending.is_empty() {
+            return Vec::new();
+        }
+        let mode = match &self.mode {
+            Mode::Normal => MapMode::Normal,
+            Mode::Insert => MapMode::Insert,
+            Mode::Visual { .. } => MapMode::Visual,
+            Mode::Cmdline { .. } => return Vec::new(),
+        };
+        self.keymap.continuations(mode, &self.map_pending)
+    }
+
+    /// Resolve whatever the mapping layer is holding, because `'timeoutlen'`
+    /// elapsed with no further key.
+    ///
+    /// An ambiguous exact match (`<leader>q` with `<leader>qq` also mapped)
+    /// fires; a bare prefix that never completed (`<leader>` alone) is replayed
+    /// literally, so the keys aren't swallowed. Without this a prefix waited
+    /// forever and the editor looked hung.
+    pub fn keymap_timeout(&mut self) {
+        if self.map_pending.is_empty() {
+            return;
+        }
+        let buffered = std::mem::take(&mut self.map_pending);
+        match self.map_ambiguous.take() {
+            Some(rhs) => self.replay(rhs),
+            None => self.replay(buffered),
+        }
     }
 
     /// Re-feed a key sequence non-recursively (mapping right-hand sides and
@@ -672,6 +739,8 @@ impl Session {
             Key::Char('~') => self.pending.begin_operator(Operator::ToggleCase),
             Key::Char('-') => self.undo_time(),
             Key::Char('+') => self.redo_time(),
+            // `gv` reselects the last Visual selection.
+            Key::Char('v') => self.reselect_visual(),
             _ => self.pending.clear(),
         }
     }
@@ -874,8 +943,8 @@ impl Session {
     fn mark_position(&self, c: char) -> Option<Position> {
         // `'<`/`'>` come from the last visual selection rather than the store.
         match c {
-            '<' => return self.last_visual.map(|(s, _)| s),
-            '>' => return self.last_visual.map(|(_, e)| e),
+            '<' => return self.last_visual.map(|(s, _, _)| s),
+            '>' => return self.last_visual.map(|(_, e, _)| e),
             _ => {}
         }
         self.editor
@@ -1139,6 +1208,10 @@ impl Session {
     fn start_insert_session(&mut self) {
         self.insert_start = Some(self.editor.cursor());
         self.mode = Mode::Insert;
+        // Arm inline suggestions for the new cursor position, so entering
+        // Insert on an empty line already offers something without needing a
+        // keystroke first.
+        self.suggest.invalidate();
     }
 
     // --- Insert mode ---
@@ -1148,6 +1221,20 @@ impl Session {
         // exactly as in Normal mode.
         if self.no_remap == 0 && self.consult_keymap(key) {
             return;
+        }
+        // Inline AI suggestions claim a few keys, but only while ghost text is
+        // actually showing — with none on screen `<Tab>` still inserts a tab
+        // and `<C-e>` is still the no-op it has always been. Handled before the
+        // edit below so accepting can read the suggestion before typing
+        // invalidates it.
+        if self.suggest.current().is_some() {
+            match key {
+                Key::Tab => return self.accept_suggestion(Accept::All),
+                Key::Ctrl('l') => return self.accept_suggestion(Accept::Word),
+                Key::Ctrl('j') => return self.accept_suggestion(Accept::Line),
+                Key::Ctrl('e') => return self.suggest.dismiss(),
+                _ => {}
+            }
         }
         match key {
             Key::Esc => {
@@ -1190,8 +1277,29 @@ impl Session {
                     self.editor.cur_window_mut().cursor = Position::new(cur.line - 1, prev_len);
                 }
             }
-            Key::Ctrl(_) => { /* completion etc. not yet implemented */ }
+            // Ctrl chords (completion etc.) aren't implemented yet; Alt and
+            // the non-character keys only ever reach Insert mode as the lhs of
+            // a mapping, and an unmapped one must not insert anything.
+            Key::Ctrl(_) | Key::Alt(_) | Key::Special { .. } => {}
         }
+        // Any key that reached this far either changed the text or moved the
+        // cursor, so whatever the model was about to propose no longer fits.
+        // `<Esc>` left Insert mode on the way through, and there is nothing to
+        // suggest outside it — so that case disarms instead of re-asking.
+        if matches!(self.mode, Mode::Insert) {
+            self.suggest.invalidate();
+        } else {
+            self.suggest.disarm();
+        }
+    }
+
+    /// Insert part of the visible suggestion at the cursor, as if the user had
+    /// typed it. What remains (if anything) stays on screen, re-anchored.
+    fn accept_suggestion(&mut self, what: Accept) {
+        let Some(text) = suggest::accept(&mut self.suggest, what) else { return };
+        let cur = self.editor.cursor();
+        let (l, col) = self.editor.cur_buffer_mut().text.insert(cur.line, cur.col, &text);
+        self.editor.cur_window_mut().cursor = Position::new(l, col);
     }
 
     // --- Visual mode ---
@@ -1218,16 +1326,23 @@ impl Session {
             return;
         }
 
+        // Visual-mode mappings (`:vnoremap`, `[[keymap]] mode = "v"`). This
+        // sits after the `g`-prefix block so a half-typed `g` isn't swallowed,
+        // and skips a pending count so `3<A-j>` still counts.
+        if self.no_remap == 0 && self.pending.count.is_none() && self.consult_keymap(key) {
+            return;
+        }
+
         match key {
             Key::Esc => {
-                self.record_visual(anchor);
+                self.record_visual(anchor, kind);
                 self.mode = Mode::Normal;
                 self.pending.clear();
             }
             // `:` on a selection opens the command line pre-seeded with the
             // visual range, so `:'<,'>` line commands work.
             Key::Char(':') => {
-                self.record_visual(anchor);
+                self.record_visual(anchor, kind);
                 self.mode = Mode::Cmdline { prefix: ':', buffer: "'<,'>".to_string() };
                 self.pending.clear();
             }
@@ -1270,15 +1385,40 @@ impl Session {
         self.editor.set_cursor(target);
     }
 
-    /// Record the just-ended Visual selection so `'<` / `'>` addresses resolve.
-    fn record_visual(&mut self, anchor: Position) {
+    /// Record the just-ended Visual selection so `'<` / `'>` addresses resolve
+    /// and `gv` can bring it back. The kind is kept too, or `gv` after a
+    /// linewise selection would come back characterwise.
+    fn record_visual(&mut self, anchor: Position, kind: VisualKind) {
         let cursor = self.editor.cursor();
         let (start, end) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
-        self.last_visual = Some((start, end));
+        self.last_visual = Some((start, end, kind));
+    }
+
+    /// `gv` — reselect the last Visual selection. Mappings that leave Visual
+    /// mode to run an Ex command (`:m '<-2<CR>gv`) need this to put the
+    /// selection back, so the chord can be repeated.
+    fn reselect_visual(&mut self) {
+        let Some((start, end, kind)) = self.last_visual else {
+            self.pending.clear();
+            return;
+        };
+        // Clamp to the buffer: the recorded selection may name lines that a
+        // command in between (`:m`, `:d`) has since removed.
+        let text = &self.editor.cur_buffer().text;
+        let last = text.line_count().saturating_sub(1);
+        let clamp = |p: Position| {
+            let line = p.line.min(last);
+            let len = text.line(line).unwrap_or_default().len();
+            Position::new(line, p.col.min(len))
+        };
+        let (start, end) = (clamp(start), clamp(end));
+        self.editor.set_cursor(end);
+        self.mode = Mode::Visual { anchor: start, kind };
+        self.pending.clear();
     }
 
     fn visual_operator(&mut self, op: Operator, anchor: Position, kind: VisualKind) {
-        self.record_visual(anchor);
+        self.record_visual(anchor, kind);
         let cursor = self.editor.cursor();
         let motion_kind = match kind {
             VisualKind::Line => MotionKind::Linewise,
@@ -1325,6 +1465,67 @@ impl Session {
         }
     }
 
+    /// Expand `%` (the current file) and `<cword>` in an Ex command's argument.
+    ///
+    /// Only for commands where a *file name* is expected, exactly as Vim does:
+    /// expanding everywhere would corrupt patterns, since `%` is a perfectly
+    /// ordinary character in `:s/50%/half/`.
+    ///
+    /// This is what makes the runner commands expressible without new Rust —
+    /// `:command RunPython !python3 %:p` is the whole feature.
+    fn expand_ex_arg(&self, name: &str, arg: &str) -> String {
+        const FILENAME_COMMANDS: &[&str] = &[
+            "!", "e", "edit", "new", "w", "write", "sav", "save", "saveas", "up", "update",
+            "source", "so", "luafile", "make", "grep", "gr", "vimgrep", "vim", "vimg", "tag", "ta",
+            "Find", "Replace", "Repl",
+        ];
+        if arg.is_empty() || !FILENAME_COMMANDS.contains(&name) {
+            return arg.to_string();
+        }
+        self.expand_filename_macros(arg)
+    }
+
+    /// The expansion itself, split out so it can be tested directly.
+    ///
+    /// `\%` is a literal `%`, as in Vim. An unnamed buffer expands to the empty
+    /// string rather than to some placeholder — a command built on it will
+    /// fail, which is more useful than silently running against the wrong file.
+    fn expand_filename_macros(&self, arg: &str) -> String {
+        let name = self.editor.cur_buffer().name.clone().unwrap_or_default();
+        let mut out = String::with_capacity(arg.len());
+        let chars: Vec<char> = arg.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' if chars.get(i + 1) == Some(&'%') => {
+                    out.push('%');
+                    i += 2;
+                }
+                '%' => {
+                    i += 1;
+                    let mut value = name.clone();
+                    // Chained modifiers: `%:p:h`, `%:t:r`.
+                    while chars.get(i) == Some(&':') {
+                        let Some(&m) = chars.get(i + 1) else { break };
+                        let Some(next) = apply_filename_modifier(&value, m) else { break };
+                        value = next;
+                        i += 2;
+                    }
+                    out.push_str(&value);
+                }
+                '<' if chars[i..].starts_with(&['<', 'c', 'w', 'o', 'r', 'd', '>']) => {
+                    out.push_str(&self.word_at_cursor().unwrap_or_default());
+                    i += 7;
+                }
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
     /// Execute a `:` command line. A leading line range is parsed first; then
     /// range-aware commands (`:s`, `:g`, `:d`, `:m`, …) run in-core, and the
     /// rest fall through to [`parse_ex`] (cursor moves in-core, host effects
@@ -1345,6 +1546,7 @@ impl Session {
         }
 
         let (name, arg) = split_ex(&rest);
+        let arg = self.expand_ex_arg(&name, &arg);
 
         // `:!{cmd}` runs a raw command line through the configured shell.
         // Filtering a range through a command (`:%!sort`) isn't supported yet.
@@ -1381,6 +1583,10 @@ impl Session {
             return;
         }
 
+        if self.run_pin_command(&name, &arg) {
+            return;
+        }
+
         if self.run_window_command(&name, &arg) {
             return;
         }
@@ -1411,12 +1617,33 @@ impl Session {
                 }
             }
             ExParsed::Set { scope, items } => self.apply_set(scope, items),
-            ExParsed::Map { mode, lhs, rhs } => self.keymap.set(mode, &lhs, &rhs),
+            ExParsed::Map { mode, lhs, rhs, desc } => {
+                // A mapping with unrecognized key notation is reported rather
+                // than stored — it would otherwise sit in the table matching a
+                // sequence of literal `<`, `A`, `-`… that nobody will ever type.
+                if let Err(e) = self.keymap.set_with_desc(mode, &lhs, &rhs, desc) {
+                    self.effects.push(ExEffect::Message(e));
+                }
+            }
             ExParsed::Unmap { mode, lhs } => {
                 if !self.keymap.remove(mode, &lhs) {
                     self.effects
                         .push(ExEffect::Message(format!("E31: No such mapping: {lhs}")));
                 }
+            }
+            ExParsed::ListMaps { mode } => {
+                let maps = self.keymap.list(mode);
+                let msg = if maps.is_empty() {
+                    "No mapping found".to_string()
+                } else {
+                    maps.iter()
+                        .map(|m| {
+                            format!("{}  {}  {}", mode.letter(), m.lhs_notation(), m.rhs_notation())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.effects.push(ExEffect::Message(msg));
             }
             ExParsed::DefineCommand { name, repl } => {
                 self.user_commands.insert(name, repl);
@@ -1625,6 +1852,55 @@ impl Session {
         self.queue_effect(effect);
     }
 
+    // --- inline AI suggestions ---
+
+    /// The completion the host should run now, or `None` if nothing is wanted:
+    /// the feature is off, the buffer hasn't changed, a request is already out,
+    /// or the cursor isn't in Insert mode.
+    ///
+    /// Calling this *issues* the request — the returned [`SuggestRequest::seq`]
+    /// is the token [`fulfill_suggestion`] checks — so the host should call it
+    /// only when it is actually about to run the model (i.e. after its debounce
+    /// has elapsed).
+    ///
+    /// [`fulfill_suggestion`]: Self::fulfill_suggestion
+    pub fn suggest_request(&mut self) -> Option<SuggestRequest> {
+        if !matches!(self.mode, Mode::Insert) {
+            return None;
+        }
+        let lines = self.editor.cur_buffer().text.lines();
+        let cursor = self.editor.cursor();
+        let filename = self.editor.cur_buffer().name.clone();
+        suggest::build_request(&mut self.suggest, &lines, cursor, filename)
+    }
+
+    /// Deliver a completion. Returns whether it was shown — a reply for a
+    /// buffer state the user has already typed past is dropped.
+    pub fn fulfill_suggestion(&mut self, seq: u64, text: &str) -> bool {
+        // Anchor at the *current* cursor rather than the one recorded in the
+        // request: `fulfill` only accepts a reply whose seq is still current,
+        // which means nothing has moved, so the two agree — and taking it live
+        // keeps the ghost text glued to the cursor either way.
+        let anchor = self.editor.cursor();
+        self.suggest.fulfill(seq, anchor, text)
+    }
+
+    /// Report that a request produced nothing, freeing the in-flight slot.
+    pub fn fail_suggestion(&mut self, seq: u64) {
+        self.suggest.fail(seq);
+    }
+
+    /// Turn inline suggestions on or off (`:AIToggle`). Returns the new state.
+    pub fn set_suggestions_enabled(&mut self, on: bool) -> bool {
+        self.suggest.enabled = on;
+        if on {
+            self.suggest.arm();
+        } else {
+            self.suggest.disarm();
+        }
+        on
+    }
+
     // --- tags ---
 
     /// Install a parsed tags file (the host reads it; see [`ExEffect::Tag`]).
@@ -1759,6 +2035,70 @@ impl Session {
 
     /// Dispatch a tag command (`:tag`, `:tnext`, `:tags`, …). Returns whether
     /// it was one.
+    /// The `:Pin…` family. Returns whether `name` was one of them.
+    ///
+    /// The list holds file *names*, taken from the buffer, so pinning is only
+    /// meaningful on a saved file — pinning a scratch buffer would record a
+    /// name nothing could reopen.
+    fn run_pin_command(&mut self, name: &str, arg: &str) -> bool {
+        use crate::ex::PinCmd;
+        let arg = arg.trim();
+        let current = self.editor.cur_buffer().name.clone();
+        match name {
+            "Pin" | "PinAdd" => {
+                let msg = match current {
+                    Some(f) => {
+                        let slot = self.pins.add(&f);
+                        format!("pinned {f} as {slot}")
+                    }
+                    None => "E32: No file name".to_string(),
+                };
+                self.queue_effect(ExEffect::Pin(PinCmd::Message(msg)));
+            }
+            "PinRemove" | "Unpin" => {
+                let msg = match current {
+                    Some(f) if self.pins.remove(&f) => format!("unpinned {f}"),
+                    Some(f) => format!("{f} was not pinned"),
+                    None => "E32: No file name".to_string(),
+                };
+                self.queue_effect(ExEffect::Pin(PinCmd::Message(msg)));
+            }
+            "PinClear" => {
+                self.pins.clear();
+                self.queue_effect(ExEffect::Pin(PinCmd::Message("unpinned every file".into())));
+            }
+            "PinList" | "Pins" => {
+                let files =
+                    self.pins.files().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                self.queue_effect(ExEffect::Pin(PinCmd::Menu(files)));
+            }
+            "PinGo" | "PinNext" | "PinPrev" => {
+                let target = match name {
+                    "PinNext" => self.pins.next(),
+                    "PinPrev" => self.pins.prev(),
+                    _ => match arg.parse::<usize>() {
+                        Ok(n) => self.pins.go(n),
+                        Err(_) => {
+                            self.queue_effect(ExEffect::Message(
+                                "E488: :PinGo needs a slot number".into(),
+                            ));
+                            return true;
+                        }
+                    },
+                };
+                let effect = match target {
+                    Some(p) => ExEffect::Pin(PinCmd::Open(p.to_string_lossy().into_owned())),
+                    // Not an error: an empty pin list is the normal state
+                    // before you've pinned anything.
+                    None => ExEffect::Pin(PinCmd::Message("no pinned files".into())),
+                };
+                self.queue_effect(effect);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn run_tag_command(&mut self, name: &str, arg: &str) -> bool {
         let arg = arg.trim();
         match name {
@@ -2581,6 +2921,10 @@ impl Session {
                 SetItem::Scrolloff(n) => {
                     self.set_window_opt(scope, n.max(0), |g| &mut g.scrolloff, |w| &mut w.scrolloff);
                 }
+                // `'timeoutlen'` is global-only, like Vim: a per-window
+                // mapping timeout would mean the same chord behaved
+                // differently depending on which split had focus.
+                SetItem::Timeoutlen(n) => self.editor.global_options.timeoutlen = n.max(0),
                 SetItem::Foldcolumn(n) => {
                     self.set_window_opt(
                         scope,
@@ -2940,22 +3284,136 @@ impl Default for Session {
     }
 }
 
-/// The built-in normal-mode mappings. `<leader>` is Space; the chords expand to
-/// real command lines so the behavior is identical to a user defining them in
-/// config (`:nnoremap <Space>w :w<CR>`).
+/// The built-in mappings, as data.
+///
+/// Every entry goes through the same [`Keymap::set_with_desc`] a user's config
+/// or `:map` uses, so there is exactly one place a mapping's description can
+/// live and the keybinding help can never disagree with the table. The chords
+/// expand to real command lines, so a built-in behaves identically to the user
+/// writing `:nnoremap <Space>w :w<CR>` themselves — and can be replaced or
+/// removed from config.
+///
+/// Deliberately conservative: bindings that would shadow a standard Vim motion
+/// (`H`/`L`, `[[`/`]]`, `;`) ship commented-out in `docs/config.example.toml`
+/// instead, so muscle memory keeps working out of the box.
+pub const DEFAULT_KEYMAPS: &[(MapMode, &str, &str, &str)] = &[
+    // -- files, saving, panels --------------------------------------------
+    (MapMode::Normal, "<leader>e", ":Files<CR>", "fuzzy file browser"),
+    (MapMode::Normal, "<leader>ff", ":Files<CR>", "fuzzy file browser"),
+    (MapMode::Normal, "<leader>w", ":w<CR>", "write the buffer"),
+    (MapMode::Normal, "<leader>q", ":wq<CR>", "write and quit"),
+    (MapMode::Normal, "<leader>qq", ":q!<CR>", "quit without saving"),
+    (MapMode::Normal, "<leader>d", ":dash<CR>", "go to the dashboard"),
+    (MapMode::Normal, "<leader>S", ":Find<CR>", "find & replace in project"),
+    // -- frontend panels, via `ExEffect::HostAction` -------------------------
+    // These were hardcoded in the frontend's key handler, which meant they
+    // couldn't be listed, rebound, or removed. As mappings they are ordinary.
+    (MapMode::Normal, "<leader>p", ":palette<CR>", "command palette"),
+    (MapMode::Normal, "<C-b>", ":sidebar<CR>", "toggle the file drawer"),
+    (MapMode::Normal, "<C-g>", ":markdown<CR>", "toggle markdown rendering"),
+    (MapMode::Normal, "<leader>?", ":help<CR>", "show this keybinding help"),
+    // -- pinned files -------------------------------------------------------
+    // `<leader>a` is deliberately also the prefix of `<leader>ar`/`<leader>ac`:
+    // it fires after `'timeoutlen'`, which is what the ambiguity handling in
+    // `consult_keymap` exists for.
+    (MapMode::Normal, "<leader>a", ":Pin<CR>", "pin this file"),
+    (MapMode::Normal, "<leader>ar", ":PinRemove<CR>", "unpin this file"),
+    (MapMode::Normal, "<leader>ac", ":PinClear<CR>", "unpin every file"),
+    (MapMode::Normal, "<leader>h", ":PinList<CR>", "list pinned files"),
+    (MapMode::Normal, "<A-n>", ":PinNext<CR>", "next pinned file"),
+    (MapMode::Normal, "<A-p>", ":PinPrev<CR>", "previous pinned file"),
+    // -- insert-mode escape -------------------------------------------------
+    (MapMode::Insert, "jk", "<Esc>", "leave Insert mode"),
+    // -- move the current line / selection ----------------------------------
+    (MapMode::Normal, "<A-j>", ":m .+1<CR>", "move line down"),
+    (MapMode::Normal, "<A-k>", ":m .-2<CR>", "move line up"),
+    (MapMode::Visual, "<A-j>", ":m '>+1<CR>gv", "move selection down"),
+    (MapMode::Visual, "<A-k>", ":m '<-2<CR>gv", "move selection up"),
+    // -- duplicate the current line / selection -----------------------------
+    // Needs the keyboard-enhancement protocol to be distinguishable from
+    // `<C-j>`/`<C-k>`; on a terminal without it these simply never fire.
+    (MapMode::Normal, "<C-S-j>", ":t .<CR>", "duplicate line below"),
+    (MapMode::Normal, "<C-S-k>", ":t .-1<CR>", "duplicate line above"),
+    (MapMode::Visual, "<C-S-j>", ":t '><CR>gv", "duplicate selection below"),
+    (MapMode::Visual, "<C-S-k>", ":t '<-1<CR>gv", "duplicate selection above"),
+    // -- arrows are motions -------------------------------------------------
+    // These live here rather than in the frontend so they show up in `:map`
+    // and can be rebound like anything else.
+    (MapMode::Normal, "<Left>", "h", "left"),
+    (MapMode::Normal, "<Down>", "j", "down"),
+    (MapMode::Normal, "<Up>", "k", "up"),
+    (MapMode::Normal, "<Right>", "l", "right"),
+    (MapMode::Visual, "<Left>", "h", "left"),
+    (MapMode::Visual, "<Down>", "j", "down"),
+    (MapMode::Visual, "<Up>", "k", "up"),
+    (MapMode::Visual, "<Right>", "l", "right"),
+];
+
+/// Build the built-in mapping table from [`DEFAULT_KEYMAPS`].
 fn default_keymap() -> Keymap {
-    let mut km = Keymap::default();
-    km.set_normal("<Space>e", ":Files<CR>");
-    km.set_normal("<Space>ff", ":Files<CR>");
-    km.set_normal("<Space>w", ":w<CR>");
-    km.set_normal("<Space>q", ":wq<CR>");
-    km.set_normal("<Space>d", ":dash<CR>");
-    km.set_normal("<Space>S", ":Find<CR>");
-    // `<leader>1`..`<leader>9` jump to that tab/buffer (`:b N`).
+    let mut km = Keymap::new();
+    for &(mode, lhs, rhs, desc) in DEFAULT_KEYMAPS {
+        km.set_with_desc(mode, lhs, rhs, Some(desc.to_string()))
+            .unwrap_or_else(|e| panic!("built-in mapping {lhs:?} is malformed: {e}"));
+    }
+    // `<leader>1`..`<leader>9` jump to that tab/buffer (`:b N`), and
+    // `<A-1>`..`<A-5>` to that *pinned* file — the two are different lists on
+    // purpose (see `crate::pinned`).
     for n in 1..=9 {
-        km.set_normal(&format!("<Space>{n}"), &format!(":b {n}<CR>"));
+        km.set_with_desc(
+            MapMode::Normal,
+            &format!("<leader>{n}"),
+            &format!(":b {n}<CR>"),
+            Some(format!("go to tab {n}")),
+        )
+        .expect("built-in tab mapping is malformed");
+    }
+    for n in 1..=5 {
+        km.set_with_desc(
+            MapMode::Normal,
+            &format!("<A-{n}>"),
+            &format!(":PinGo {n}<CR>"),
+            Some(format!("go to pinned file {n}")),
+        )
+        .expect("built-in pin mapping is malformed");
     }
     km
+}
+
+/// Apply one Vim filename modifier to a path. `None` for an unknown letter, so
+/// the caller can stop chaining and leave the rest of the text alone.
+///
+/// `:p` deliberately doesn't touch the filesystem — it joins against the
+/// process's working directory, which is what the editor was launched in.
+fn apply_filename_modifier(path: &str, m: char) -> Option<String> {
+    let p = std::path::Path::new(path);
+    Some(match m {
+        // Full path.
+        'p' => {
+            if p.is_absolute() {
+                path.to_string()
+            } else {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(p).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.to_string())
+            }
+        }
+        // Head: the directory, with no trailing slash. Empty when there is none.
+        'h' => p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default(),
+        // Tail: the file name.
+        't' => p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+        // Root: everything but the extension, keeping any directory part.
+        'r' => match (p.parent(), p.file_stem()) {
+            (Some(d), Some(stem)) if !d.as_os_str().is_empty() => {
+                d.join(stem).to_string_lossy().into_owned()
+            }
+            (_, Some(stem)) => stem.to_string_lossy().into_owned(),
+            _ => path.to_string(),
+        },
+        // Extension, without the dot.
+        'e' => p.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default(),
+        _ => return None,
+    })
 }
 
 /// Find the byte index of the char boundary immediately before `col`.
@@ -4328,6 +4786,262 @@ mod tests {
     }
 
     #[test]
+    fn an_ambiguous_chord_waits_for_the_timeout() {
+        use crate::ex::ExEffect;
+        // `<leader>q` is `:wq` and `<leader>qq` is `:q!`. The short one must
+        // not fire on sight, or the long one could never be typed.
+        let mut s = Session::with_text("hello");
+        s.feed_str(" q");
+        assert!(s.take_effects().is_empty(), "held, not fired");
+        assert!(s.keymap_pending());
+
+        s.keymap_timeout();
+        assert!(matches!(s.take_effects().as_slice(), [ExEffect::WriteQuit { .. }]));
+        assert!(!s.keymap_pending());
+    }
+
+    #[test]
+    fn the_longer_chord_fires_without_waiting() {
+        use crate::ex::ExEffect;
+        let mut s = Session::with_text("hello");
+        s.feed_str(" qq");
+        assert!(
+            matches!(s.take_effects().as_slice(), [ExEffect::Quit { force: true }]),
+            "unambiguous once fully typed, so no timeout is involved"
+        );
+        assert!(!s.keymap_pending());
+    }
+
+    #[test]
+    fn an_unfinished_chord_replays_literally_on_timeout() {
+        // `<leader>` alone is a prefix of several mappings. Before there was a
+        // timeout this waited forever and the editor looked hung.
+        let mut s = Session::with_text("abc");
+        s.feed_str(" ");
+        assert!(s.keymap_pending());
+        s.keymap_timeout();
+        assert!(!s.keymap_pending());
+        // Space is `l` in Normal mode, so the buffered key wasn't swallowed.
+        assert_eq!(s.cursor(), Position::new(0, 1));
+    }
+
+    #[test]
+    fn a_visual_mode_mapping_fires() {
+        // Visual mappings were stored but never matched — `feed_visual` never
+        // consulted the table, so `[[keymap]] mode = "v"` was dead config.
+        let mut s = Session::with_text("one\ntwo");
+        s.keymap.set(MapMode::Visual, "X", "d").unwrap();
+        s.feed_str("vX");
+        assert_eq!(s.lines(), vec!["ne", "two"]);
+    }
+
+    #[test]
+    fn alt_and_shifted_ctrl_chords_move_and_duplicate_lines() {
+        // The charvim bindings that the widened key model exists for.
+        let mut s = Session::with_text("a\nb\nc");
+        s.feed(Key::Alt('j')); // `:m .+1` — swap the first two lines
+        assert_eq!(s.lines(), vec!["b", "a", "c"]);
+        s.feed(Key::Ctrl('J')); // `<C-S-j>` = `:t .` — duplicate below
+        assert_eq!(s.lines(), vec!["b", "a", "a", "c"]);
+        // The unshifted `<C-j>` is a different key and must not duplicate.
+        s.feed(Key::Ctrl('j'));
+        assert_eq!(s.lines(), vec!["b", "a", "a", "c"]);
+    }
+
+    #[test]
+    fn gv_reselects_the_last_selection() {
+        let mut s = Session::with_text("one\ntwo\nthree");
+        s.feed_str("vj"); // select from (0,0) down to (1,0)
+        s.feed(Key::Esc); // leaving Visual mode records the selection
+        assert!(matches!(s.mode, Mode::Normal));
+        s.feed_str("gv");
+        assert!(matches!(s.mode, Mode::Visual { .. }), "back in Visual mode");
+        s.feed_str("d");
+        // The same characterwise-inclusive range the original selection covered.
+        assert_eq!(s.lines(), vec!["wo", "three"]);
+    }
+
+    #[test]
+    fn filename_macros_expand_against_the_current_buffer() {
+        let mut s = Session::with_text("x");
+        s.editor.cur_buffer_mut().name = Some("src/main.rs".into());
+        let e = |arg: &str| s.expand_filename_macros(arg);
+
+        assert_eq!(e("%"), "src/main.rs");
+        assert_eq!(e("%:h"), "src");
+        assert_eq!(e("%:t"), "main.rs");
+        assert_eq!(e("%:e"), "rs");
+        assert_eq!(e("%:r"), "src/main");
+        assert_eq!(e("%:t:r"), "main", "chained modifiers");
+        assert_eq!(e("javac % && java %:t:r"), "javac src/main.rs && java main");
+        // `%:p` is absolute, and still ends in the file.
+        let abs = e("%:p");
+        assert!(abs.starts_with('/') && abs.ends_with("src/main.rs"), "{abs}");
+    }
+
+    #[test]
+    fn a_backslash_escapes_a_literal_percent() {
+        let mut s = Session::with_text("x");
+        s.editor.cur_buffer_mut().name = Some("a.rs".into());
+        assert_eq!(s.expand_filename_macros(r"echo 50\% done"), "echo 50% done");
+    }
+
+    #[test]
+    fn cword_expands_to_the_word_under_the_cursor() {
+        let mut s = Session::with_text("alpha beta");
+        s.feed_str("w"); // onto `beta`
+        assert_eq!(s.expand_filename_macros("grep <cword>"), "grep beta");
+    }
+
+    #[test]
+    fn an_unnamed_buffer_expands_to_nothing() {
+        // Better a command that visibly fails than one that silently runs
+        // against whatever file happened to be there.
+        let s = Session::with_text("x");
+        assert_eq!(s.expand_filename_macros("python3 %"), "python3 ");
+    }
+
+    #[test]
+    fn percent_only_expands_where_a_filename_belongs() {
+        let mut s = Session::with_text("x");
+        s.editor.cur_buffer_mut().name = Some("a.rs".into());
+        // `:!` and `:e` take filenames...
+        assert_eq!(s.expand_ex_arg("!", "python3 %"), "python3 a.rs");
+        assert_eq!(s.expand_ex_arg("e", "%:h/other.rs"), "/other.rs");
+        // ...but `%` is an ordinary character in a substitution pattern, and
+        // expanding it there would corrupt the command.
+        assert_eq!(s.expand_ex_arg("s", "/50%/half/"), "/50%/half/");
+        assert_eq!(s.expand_ex_arg("normal", "A100%"), "A100%");
+    }
+
+    #[test]
+    fn a_bang_command_expands_the_current_file() {
+        use crate::ex::ExEffect;
+        let mut s = Session::with_text("print(1)");
+        s.editor.cur_buffer_mut().name = Some("hello.py".into());
+        s.execute_ex("!python3 %");
+        assert!(s.take_effects().contains(&ExEffect::Shell("python3 hello.py".into())));
+    }
+
+    #[test]
+    fn a_user_command_carries_the_expansion_through() {
+        // The whole point of the feature: runners are user commands, not Rust.
+        use crate::ex::ExEffect;
+        let mut s = Session::with_text("class A {}");
+        s.editor.cur_buffer_mut().name = Some("src/App.java".into());
+        s.execute_ex("command RunJava !cd %:h && javac %:t && java %:t:r");
+        s.take_effects();
+        s.execute_ex("RunJava");
+        assert!(s
+            .take_effects()
+            .contains(&ExEffect::Shell("cd src && javac App.java && java App".into())));
+    }
+
+    #[test]
+    fn pin_commands_add_list_and_jump() {
+        use crate::ex::PinCmd;
+        let mut s = Session::with_text("x");
+        s.editor.cur_buffer_mut().name = Some("a.rs".into());
+        s.execute_ex("Pin");
+        assert_eq!(s.pins.files(), [std::path::PathBuf::from("a.rs")]);
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Message(m))] if m.contains("pinned a.rs as 1")
+        ));
+
+        s.editor.cur_buffer_mut().name = Some("b.rs".into());
+        s.execute_ex("Pin");
+        s.take_effects();
+
+        s.execute_ex("PinGo 1");
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Open(p))] if p == "a.rs"
+        ));
+
+        s.execute_ex("PinList");
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Menu(files))] if files == &["a.rs".to_string(), "b.rs".to_string()]
+        ));
+    }
+
+    #[test]
+    fn pinning_an_unnamed_buffer_is_refused() {
+        // The list holds names, so pinning a scratch buffer would record
+        // something nothing could reopen.
+        use crate::ex::PinCmd;
+        let mut s = Session::with_text("x");
+        s.execute_ex("Pin");
+        assert!(s.pins.is_empty());
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Message(m))] if m.contains("No file name")
+        ));
+    }
+
+    #[test]
+    fn jumping_with_nothing_pinned_says_so_rather_than_erroring() {
+        use crate::ex::PinCmd;
+        let mut s = Session::with_text("x");
+        s.execute_ex("PinNext");
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Message(m))] if m == "no pinned files"
+        ));
+    }
+
+    #[test]
+    fn the_pin_chords_exercise_mapping_ambiguity_end_to_end() {
+        // `<leader>a` is a prefix of `<leader>ar` and `<leader>ac`. This is the
+        // real-world case the ambiguity/timeout handling exists for.
+        use crate::ex::PinCmd;
+        let mut s = Session::with_text("x");
+        s.editor.cur_buffer_mut().name = Some("a.rs".into());
+
+        s.feed_str(" a");
+        assert!(s.take_effects().is_empty(), "held: `<leader>ar` is still reachable");
+        s.keymap_timeout();
+        assert_eq!(s.pins.len(), 1, "`<leader>a` pinned it once the timeout passed");
+        s.take_effects();
+
+        // ...and typing the longer chord runs the longer mapping instead.
+        s.feed_str(" ar");
+        assert!(s.pins.is_empty(), "`<leader>ar` unpinned it, with no timeout involved");
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Message(m))] if m.contains("unpinned a.rs")
+        ));
+    }
+
+    #[test]
+    fn alt_number_jumps_to_a_pinned_file() {
+        use crate::ex::PinCmd;
+        let mut s = Session::with_text("x");
+        s.pins.add("first.rs");
+        s.pins.add("second.rs");
+        s.feed(Key::Alt('2'));
+        assert!(matches!(
+            s.take_effects().as_slice(),
+            [ExEffect::Pin(PinCmd::Open(p))] if p == "second.rs"
+        ));
+    }
+
+    #[test]
+    fn continuations_report_what_can_follow_the_pending_chord() {
+        let mut s = Session::with_text("x");
+        assert!(s.keymap_continuations().is_empty(), "nothing pending");
+        s.feed_str(" ");
+        let c = s.keymap_continuations();
+        assert!(c.iter().any(|c| c.rest == "w" && c.label == "write the buffer"));
+        assert!(c.iter().any(|c| c.rest == "S"), "the Find chord is offered too");
+        assert!(
+            c.iter().all(|c| !c.label.is_empty()),
+            "every row is labelled, so the popup never renders a blank line"
+        );
+    }
+
+    #[test]
     fn change_word_enters_insert() {
         let mut s = Session::with_text("foo bar");
         s.feed_str("cwbaz<Esc>");
@@ -4382,5 +5096,106 @@ mod tests {
         assert_eq!(rects.len(), 2);
         // Two side-by-side windows split the width.
         assert_eq!(rects[0].3 + rects[1].3, 80);
+    }
+
+    // --- inline AI suggestions ---------------------------------------------
+
+    /// Put a session in Insert mode with ghost text showing, through the same
+    /// request/reply path the host uses — there is no back door for installing
+    /// a suggestion, and tests shouldn't invent one.
+    fn with_ghost(text: &str, keys: &str, ghost: &str) -> Session {
+        let mut s = Session::with_text(text);
+        s.set_suggestions_enabled(true);
+        s.feed_str(keys);
+        let req = s.suggest_request().expect("insert mode wants a completion");
+        assert!(s.fulfill_suggestion(req.seq, ghost), "the reply should be shown");
+        s
+    }
+
+    #[test]
+    fn tab_accepts_the_whole_suggestion() {
+        let mut s = with_ghost("fn main() {\n}", "jI", "    println!()");
+        s.feed_str("<Tab>");
+        assert_eq!(s.editor.cur_buffer().text.line(1).unwrap(), "    println!()}");
+        assert!(s.suggest.current().is_none(), "nothing left to accept");
+        assert_eq!(s.cursor(), Position::new(1, 14), "cursor follows the insertion");
+    }
+
+    #[test]
+    fn tab_still_inserts_a_tab_when_nothing_is_suggested() {
+        // The feature must not cost anyone their `<Tab>` key.
+        let mut s = Session::with_text("x");
+        s.set_suggestions_enabled(true);
+        s.feed_str("i<Tab>");
+        assert!(s.editor.cur_buffer().text.line(0).unwrap().starts_with('\t'));
+    }
+
+    #[test]
+    fn ctrl_l_accepts_one_word_and_keeps_the_rest() {
+        let mut s = with_ghost("", "i", "hello world");
+        s.feed_str("<C-l>");
+        assert_eq!(s.editor.cur_buffer().text.line(0).unwrap(), "hello");
+        assert_eq!(s.suggest.current().expect("the rest is still offered").text, " world");
+    }
+
+    #[test]
+    fn typing_invalidates_the_suggestion() {
+        // Ghost text describing a buffer state two keystrokes old is worse than
+        // no ghost text at all.
+        let mut s = with_ghost("", "i", "hello");
+        s.feed_str("x");
+        assert!(s.suggest.current().is_none());
+        assert_eq!(s.editor.cur_buffer().text.line(0).unwrap(), "x");
+    }
+
+    #[test]
+    fn ctrl_e_dismisses_without_leaving_insert_mode() {
+        let mut s = with_ghost("", "i", "hello");
+        s.feed_str("<C-e>");
+        assert!(s.suggest.current().is_none());
+        assert_eq!(s.mode, Mode::Insert);
+        // And it stays dismissed: re-offering what was just rejected is the
+        // most irritating thing this feature can do.
+        assert!(s.suggest_request().is_none());
+    }
+
+    #[test]
+    fn leaving_insert_mode_drops_the_suggestion_and_asks_for_nothing() {
+        let mut s = with_ghost("", "i", "hello");
+        s.feed_str("<Esc>");
+        assert!(s.suggest.current().is_none());
+        assert_eq!(s.mode, Mode::Normal);
+        assert!(s.suggest_request().is_none(), "normal mode has nothing to complete");
+    }
+
+    #[test]
+    fn a_reply_the_user_typed_past_is_dropped() {
+        let mut s = Session::with_text("");
+        s.set_suggestions_enabled(true);
+        s.feed_str("i");
+        let req = s.suggest_request().expect("wants a completion");
+        s.feed_str("abc"); // …while the model was thinking
+        assert!(!s.fulfill_suggestion(req.seq, "stale"));
+        assert!(s.suggest.current().is_none());
+    }
+
+    #[test]
+    fn nothing_is_requested_until_the_feature_is_switched_on() {
+        let mut s = Session::with_text("x");
+        s.feed_str("i");
+        assert!(s.suggest_request().is_none());
+        s.set_suggestions_enabled(true);
+        assert!(s.suggest_request().is_some());
+    }
+
+    #[test]
+    fn the_request_carries_the_text_either_side_of_the_cursor() {
+        let mut s = Session::with_text("fn main() {\n\n}");
+        s.set_suggestions_enabled(true);
+        s.feed_str("jI");
+        let req = s.suggest_request().expect("wants a completion");
+        assert_eq!(req.prefix, "fn main() {\n");
+        assert_eq!(req.suffix, "\n}");
+        assert_eq!(req.anchor, Position::new(1, 0));
     }
 }

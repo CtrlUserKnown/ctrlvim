@@ -13,10 +13,11 @@
 use std::io::{self, Stdout};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -173,13 +174,22 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
         })?;
 
         // Block for the next event (with a poll so resize repaints promptly).
-        // The timeout is also where background job output is picked up, so a
-        // long `:make` streams into the quickfix list without blocking keys.
-        if !event::poll(Duration::from_millis(250))? {
+        // The timeout is also where background job output and finished AI
+        // completions are picked up, so a long `:make` streams into the
+        // quickfix list — and ghost text appears — without blocking keys. How
+        // long to wait is the app's call: inline suggestions need a tighter
+        // loop than a build does (see `App::poll_interval`).
+        // ...and where a half-typed mapping's `'timeoutlen'` runs out, which
+        // is what lets `<leader>q` and `<leader>qq` coexist.
+        if !event::poll(app.poll_interval())? {
             app.poll_jobs();
+            app.poll_ai();
+            app.tick_keymap_timeout();
             continue;
         }
         app.poll_jobs();
+        app.poll_ai();
+        app.tick_keymap_timeout();
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 input::handle_key(&mut app, key);
@@ -208,11 +218,34 @@ fn setup_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    enable_key_disambiguation(&mut stdout);
     Terminal::new(CrosstermBackend::new(stdout))
+}
+
+/// Ask for the kitty keyboard protocol, which is what makes `<C-S-j>`
+/// distinguishable from `<C-j>` (and `<C-Up>` from `<Up>`).
+///
+/// A legacy terminal encodes both of those the same way, so without this the
+/// shifted mappings simply never fire — there is nothing in the byte stream to
+/// match on. Support is not universal, so this is best-effort: the request is
+/// ignored by terminals that don't implement it, and a failure to write it is
+/// not worth refusing to start over.
+fn enable_key_disambiguation(out: &mut impl io::Write) {
+    let _ = execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+}
+
+/// Undo [`enable_key_disambiguation`]. Leaving the flags pushed would hand the
+/// user's shell a terminal that reports keys in a mode it doesn't expect.
+fn disable_key_disambiguation(out: &mut impl io::Write) {
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
 }
 
 fn restore_terminal(terminal: &mut Term) -> io::Result<()> {
     disable_raw_mode()?;
+    disable_key_disambiguation(terminal.backend_mut());
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
@@ -224,6 +257,7 @@ fn install_panic_hook() {
     panic::set_hook(Box::new(move |info| {
         let mut stdout = io::stdout();
         let _ = disable_raw_mode();
+        disable_key_disambiguation(&mut stdout);
         let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
         original(info);
     }));

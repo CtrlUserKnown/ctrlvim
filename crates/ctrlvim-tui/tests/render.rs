@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use ctrlvim::app::{Action, App, DashboardSection, PanelId};
+use ctrlvim_core::MapMode;
 use ctrlvim::{icons, input, ui};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
@@ -295,7 +296,99 @@ fn help_overlay() {
     let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
     app.dispatch(Action::ToggleHelp);
     let out = render(&app, 130, 44);
+    // Descriptions come from the live mapping table, not a hardcoded list.
     contains_all(&out, &["Keybindings", "command palette", "fuzzy file browser"]);
+}
+
+#[test]
+fn help_overlay_lists_mappings_from_the_live_table() {
+    // The modal used to render a hardcoded array and could not see user
+    // mappings at all — its render fn didn't even take `app`.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.engine
+        .session
+        .keymap
+        .set_with_desc(MapMode::Normal, "<leader>z", ":w<CR>", Some("zap it".into()))
+        .unwrap();
+    app.dispatch(Action::ToggleHelp);
+    contains_all(&render(&app, 130, 44), &["<Space>z", "zap it"]);
+}
+
+#[test]
+fn help_overlay_drops_a_mapping_that_was_unmapped() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.dispatch(Action::ToggleHelp);
+    assert!(render(&app, 130, 44).contains("find & replace in project"));
+
+    assert!(app.engine.session.keymap.remove(MapMode::Normal, "<leader>S"));
+    assert!(
+        !render(&app, 130, 44).contains("find & replace in project"),
+        "a removed mapping must stop being advertised"
+    );
+}
+
+#[test]
+fn a_mapping_with_no_desc_falls_back_to_its_rhs() {
+    // A described mapping is better, but an undescribed one must still be
+    // listed — a blank row would be worse than a slightly technical one.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.engine.session.keymap.set_normal("<leader>z", ":wq<CR>").unwrap();
+    app.dispatch(Action::ToggleHelp);
+    contains_all(&render(&app, 130, 44), &["<Space>z", ":wq<CR>"]);
+}
+
+#[test]
+fn a_config_mapping_works_on_the_dashboard_too() {
+    // The dashboard used to run a hand-rolled leader machine that knew only
+    // `<leader>1-9`, `<leader>d` and `<leader>S`, so a user's `[[keymap]]`
+    // entries were silently editor-only.
+    let mut app = temp_project(&[("a.rs", "a\n")]);
+    app.engine
+        .session
+        .keymap
+        .set_normal("<leader>z", ":Files<CR>")
+        .unwrap();
+    assert_eq!(app.active, 0, "on the dashboard, not a file buffer");
+    assert!(app.finder.is_none());
+
+    typ(&mut app, " z");
+    assert!(app.finder.is_some(), "the user's own chord ran the file browser");
+}
+
+#[test]
+fn an_unmapped_shell_key_still_reaches_the_dashboard_keys() {
+    // Routing shell keys through the mapping table must not swallow the
+    // dashboard's own navigation.
+    let mut app = temp_project(&[("a.rs", "a\n")]);
+    key(&mut app, 'p');
+    assert!(
+        matches!(app.buffers[app.active].kind, ctrlvim::app::BufferKind::Plugins),
+        "`p` still opens the plugin manager"
+    );
+}
+
+#[test]
+fn which_key_popup_lists_what_can_follow_a_pending_chord() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.open_file(0);
+    assert!(!render(&app, 130, 44).contains("write the buffer"), "nothing pending yet");
+
+    key(&mut app, ' '); // half-type the leader chord
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["write the buffer", "find & replace in project"]);
+}
+
+#[test]
+fn which_key_popup_clears_once_the_chord_resolves() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.open_file(0);
+    key(&mut app, ' ');
+    assert!(render(&app, 130, 44).contains("write the buffer"));
+    key(&mut app, 'd'); // `<leader>d` — completes the chord
+    assert!(
+        !render(&app, 130, 44).contains("write the buffer"),
+        "the popup must not outlive the chord it was describing"
+    );
 }
 
 #[test]
@@ -1335,8 +1428,12 @@ fn settings_navigation_spans_options_and_lsp() {
     app.move_settings(1);
     assert_eq!(app.settings_index, 2); // file-icons option
     app.move_settings(1);
-    assert_eq!(app.settings_index, 3, "j continues into the LSP list");
-    // Toggling the focused LSP flips its enabled state (no disk write).
+    assert_eq!(app.settings_index, 3); // inline AI suggestions
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 4, "j continues into the LSP list");
+    // Toggling the focused LSP flips its enabled state (no disk write). The
+    // option rows above deliberately aren't toggled here: they persist to the
+    // *real* `~/.config/ctrlvim/config.toml`, which a test must never touch.
     let before = app.lsp_enabled[0];
     app.settings_toggle();
     assert_eq!(app.lsp_enabled[0], !before);
@@ -1917,4 +2014,296 @@ fn a_narrow_terminal_drops_the_preview_rather_than_squeezing_it() {
     let narrow = render(&app, 62, 30);
     assert!(!narrow.contains("- let widget = 1;"), "preview should be dropped:\n{narrow}");
     assert!(narrow.contains("alpha.rs"), "results still shown:\n{narrow}");
+}
+
+// --- inline AI suggestions --------------------------------------------------
+//
+// The model itself is never loaded here: a suggestion is delivered through the
+// engine's ordinary request/reply path, which is exactly what the completion
+// worker does when it finishes. That keeps these tests about the *editor* —
+// ghost text, accepting, dismissing, the status badge — rather than about
+// candle.
+
+/// A file buffer in Insert mode with ghost text showing.
+fn app_with_ghost(source: &str, keys: &str, ghost: &str) -> App {
+    let mut app = temp_project(&[("main.rs", source)]);
+    app.open_path(app.root.join("main.rs"), "main.rs".into());
+    app.engine.session.set_suggestions_enabled(true);
+    for c in keys.chars() {
+        key(&mut app, c);
+    }
+    let req = app
+        .engine
+        .session
+        .suggest_request()
+        .expect("insert mode wants a completion");
+    assert!(
+        app.engine.session.fulfill_suggestion(req.seq, ghost),
+        "the reply should have been shown"
+    );
+    app
+}
+
+#[test]
+fn ghost_text_is_drawn_at_the_cursor_but_is_not_in_the_buffer() {
+    let mut app = app_with_ghost("fn main() {\n\n}\n", "ji", "    println!(\"hi\");");
+    let out = render(&app, 100, 20);
+    assert!(out.contains("println!(\"hi\");"), "ghost text expected:\n{out}");
+    // Proposed, not present: the buffer is untouched until it is accepted.
+    assert_eq!(app.editor_lines()[1], "");
+
+    // Dismissing takes it back off the screen.
+    ctrl(&mut app, 'e');
+    let after = render(&app, 100, 20);
+    assert!(!after.contains("println!"), "dismissed ghost should be gone:\n{after}");
+}
+
+#[test]
+fn ghost_text_is_dimmer_than_real_code() {
+    // The whole point is that it reads as a proposal at a glance.
+    let app = app_with_ghost("fn main() {\n\n}\n", "ji", "todo");
+    let buf = render_cells(&app, 100, 20);
+    assert_ne!(fg_of(&buf, "todo", 0), fg_of(&buf, "fn main", 0));
+}
+
+#[test]
+fn a_suggestion_offered_mid_line_pushes_the_existing_text_right() {
+    // The regression this guards: ghost text painted over the rest of the line
+    // used to hide the `)` the cursor was sitting in front of.
+    let app = app_with_ghost("let x = f();\n", "i", "value");
+    let out = render(&app, 100, 20);
+    assert!(out.contains("valuelet x = f();"), "line tail expected after ghost:\n{out}");
+}
+
+#[test]
+fn tab_accepts_ghost_text_into_the_buffer() {
+    let mut app = app_with_ghost("fn main() {\n\n}\n", "ji", "    body();");
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(app.editor_lines()[1], "    body();");
+    assert!(app.suggestion().is_none());
+    // …and it survives into what would be written out.
+    assert!(render(&app, 100, 20).contains("body();"));
+}
+
+#[test]
+fn a_multiline_suggestion_shows_its_continuation_rows() {
+    let app = app_with_ghost("fn main() {\n\n}\n", "ji", "    if x {\n        y();\n    }");
+    let out = render(&app, 100, 20);
+    contains_all(&out, &["if x {", "y();"]);
+}
+
+#[test]
+fn the_status_line_shows_nothing_until_suggestions_are_switched_on() {
+    let app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    assert!(app.ai_badge().is_none());
+    assert!(!render(&app, 130, 44).contains("AI"));
+}
+
+#[test]
+fn the_ai_command_toggles_suggestions_and_says_so() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.open_path(app.root.join("main.rs"), "main.rs".into());
+
+    app.run_ex_command("AI on");
+    assert!(app.engine.session.suggest.enabled);
+    assert!(app.message.contains("on"), "got {:?}", app.message);
+    // Enabling starts the worker but must not load anything on its own — a
+    // multi-gigabyte download is not a side effect of typing `:AI on`.
+    assert_eq!(app.ai_status(), Some(ctrlvim_ai::Status::Cold));
+    assert_eq!(app.ai_badge(), Some("AI"));
+
+    app.run_ex_command("AI off");
+    assert!(!app.engine.session.suggest.enabled);
+    assert!(app.ai_status().is_none(), "the worker is dropped with the feature");
+
+    // A bare `:AI` flips whatever the current state is.
+    app.run_ex_command("AI");
+    assert!(app.engine.session.suggest.enabled);
+}
+
+#[test]
+fn ai_status_reports_the_model_state_without_loading_it() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.run_ex_command("AIStatus");
+    assert!(app.message.contains("off"), "got {:?}", app.message);
+    app.run_ex_command("AI on");
+    app.run_ex_command("AIStatus");
+    assert!(app.message.contains("not loaded"), "got {:?}", app.message);
+}
+
+#[test]
+fn the_poll_interval_tightens_only_while_suggestions_are_armed() {
+    // A 250ms loop would deliver every completion a quarter second late, on top
+    // of a model that is already the slow part.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    let idle = app.poll_interval();
+    app.run_ex_command("AI on");
+    assert!(app.poll_interval() < idle, "armed loop should poll faster");
+    app.run_ex_command("AI off");
+    assert_eq!(app.poll_interval(), idle);
+}
+
+#[test]
+fn the_settings_tab_has_a_row_for_inline_ai_suggestions() {
+    // Deliberately only *rendered*, never toggled: `toggle_ai` persists to the
+    // real `~/.config/ctrlvim/config.toml`. That half is covered by
+    // `config::tests::toggling_ai_persists_without_flattening_the_rest`, which
+    // writes to a temp path.
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["EDITOR", "Inline AI suggestions", "off"]);
+    assert!(!app.ai_enabled(), "off until switched on");
+}
+
+#[test]
+fn the_settings_row_follows_the_live_state_not_just_the_config_file() {
+    // `:AI on` and the checkbox must never disagree about whether suggestions
+    // are running.
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    app.run_ex_command("AI on");
+    assert!(app.ai_enabled());
+    let out = render(&app, 130, 44);
+    let row = out
+        .lines()
+        .find(|l| l.contains("Inline AI suggestions"))
+        .expect("the AI row renders");
+    assert!(row.contains("on"), "row should read as on: {row:?}");
+}
+
+
+#[test]
+fn rendering_a_markdown_buffer_that_ends_in_a_blank_line_does_not_panic() {
+    // The crash this guards: a `Buffer`'s rope always ends in `\n`, so
+    // `editor_lines()` reports a final empty line, while `ctrlvim_markdown`
+    // deliberately drops that phantom line. The decorated vector was therefore
+    // one short of the buffer, and drawing the last row indexed past its end —
+    // `index out of bounds: the len is N but the index is N`.
+    //
+    // A freshly-opened file doesn't show it (`open_path` splits with `.lines()`,
+    // which strips the trailing newline); *any edit that leaves a blank last
+    // line* does, and markdown files render live by default, so this was one
+    // `o` away on every `.md` buffer in the project.
+    let src: String = (1..=30).map(|i| format!("# line {i}\n")).collect();
+    let mut app = temp_project(&[("doc.md", &src)]);
+    app.open_path(app.root.join("doc.md"), "doc.md".into());
+    assert!(app.md_render_active(), "markdown buffers render live by default");
+    assert_eq!(app.editor_lines().len(), 30);
+
+    typ(&mut app, "Go"); // jump to the last line, open a blank one below it
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.editor_lines().len(), 31, "the buffer now ends in a blank line");
+
+    // Tall enough that the blank last line is on screen — that is the row that
+    // used to panic.
+    let out = render(&app, 100, 40);
+    assert!(out.contains("line 30"), "the document still renders:\n{out}");
+
+    // …and with rendering off, which takes the other arm of the same match.
+    ctrl(&mut app, 'g');
+    assert!(!app.md_render_active());
+    render(&app, 100, 40);
+}
+
+#[test]
+fn a_gated_model_explains_itself_in_a_panel_not_a_clipped_status_line() {
+    // The bug this guards: the gated-repo error is the single most likely
+    // failure of this feature, and the whole point of it is the instructions.
+    // As one long line it got cut off at the terminal edge, leaving the user
+    // with "AI: google/codegemma-2b is gated" and nowhere to go.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    let error = ctrlvim_ai::gated_repo_help("google/codegemma-2b");
+    app.show_ai_error(&error);
+
+    // Status line gets a self-contained summary…
+    assert!(app.message.starts_with("AI: "), "got {:?}", app.message);
+    assert!(!app.message.contains('\n'), "one line only: {:?}", app.message);
+
+    // …and the panel gets everything that matters.
+    assert!(app.shell_open, "the panel opens");
+    let out = render(&app, 100, 30);
+    contains_all(
+        &out,
+        &[
+            "huggingface.co/google/codegemma-2b", // where to accept the license
+            "HF_TOKEN",                           // how to authenticate
+            "AILoad",                             // how to retry
+            "unsloth/codegemma-2b",               // the ungated way out
+            "docs/ai.md",
+        ],
+    );
+
+    // Dismissible like any other output panel.
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.shell_open);
+}
+
+#[test]
+fn a_one_line_ai_error_stays_on_the_status_line() {
+    // Not every failure deserves a modal; only ones with something to teach.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.show_ai_error("tokenizer: unexpected end of input");
+    assert!(app.message.contains("tokenizer"));
+    assert!(!app.shell_open, "a short error needs no panel");
+}
+
+/// Write a throwaway config file and return its path.
+fn temp_config(body: &str) -> std::path::PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = std::env::temp_dir()
+        .join(format!("ctrlvim-reload-{}-{}.toml", std::process::id(), n));
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn ai_load_rereads_the_config_so_a_fixed_repo_actually_takes_effect() {
+    // `gated_repo_help` tells the user to edit `[ai.model] repo` and then run
+    // `:AILoad`. That advice is only true if the reload re-reads the file —
+    // otherwise the retry uses the repo the editor booted with and fails
+    // identically, which looks like a broken command.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.run_ex_command("AI on");
+    // Whatever the shipped default happens to be — which repo that is belongs
+    // to `the_default_model_is_quantized_and_ungated`, not here.
+    let booted = app.config.ai.model.repo.clone();
+    assert!(app.ai_status().is_some(), "a worker exists for the booted config");
+
+    let path = temp_config("[ai]\nenabled = true\n\n[ai.model]\nrepo = \"some-mirror/codegemma-2b\"\n");
+    assert!(app.reload_ai_config_from(&path), "the section changed");
+    assert!(
+        app.ai_status().is_none(),
+        "the worker built from the old repo was dropped, so the next load uses the new one"
+    );
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn reloading_an_unchanged_config_keeps_the_loaded_worker() {
+    // Re-reading must not throw away several gigabytes of resident weights
+    // just because someone ran `:AILoad` twice.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.run_ex_command("AI on");
+    // A file whose `[ai]` resolves to exactly what the app already holds.
+    // (`:AI on` is session state; it deliberately doesn't touch `config.ai`.)
+    let path = temp_config("# no [ai] section, so every knob is the default\n");
+    assert!(!app.reload_ai_config_from(&path), "nothing differs from what's loaded");
+    assert!(app.ai_status().is_some(), "the worker survives");
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn reloading_picks_up_every_ai_knob_not_just_the_repo() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.run_ex_command("AI on");
+    let path = temp_config(
+        "[ai]\nenabled = true\ndevice = \"cpu\"\nmax_tokens = 16\ncontext_before = 5\n",
+    );
+    assert!(app.reload_ai_config_from(&path));
+    assert_eq!(app.config.ai.device, ctrlvim_ai::DevicePref::Cpu);
+    assert_eq!(app.config.ai.max_tokens, 16);
+    // The context window lives in the engine, so it has to be pushed across.
+    assert_eq!(app.engine.session.suggest.context.before, 5);
+    let _ = fs::remove_file(&path);
 }

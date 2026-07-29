@@ -62,6 +62,10 @@ pub struct GlobalOptions {
     // Where `:split`/`:vsplit` put the new window.
     pub splitbelow: bool,
     pub splitright: bool,
+    /// Milliseconds to wait for the rest of a mapped key sequence before
+    /// giving up on it — Vim's `'timeoutlen'`. This is what lets `<leader>q`
+    /// and `<leader>qq` coexist: the shorter one fires only once this elapses.
+    pub timeoutlen: i64,
 }
 
 impl Default for GlobalOptions {
@@ -86,6 +90,10 @@ impl Default for GlobalOptions {
             hlsearch: true,
             splitbelow: false,
             splitright: false,
+            // Neovim's default is 1000ms, which feels sluggish on a chord that
+            // is *only* waiting to be disambiguated. 500 is what most configs
+            // (charvim included) set it to anyway.
+            timeoutlen: 500,
         }
     }
 }

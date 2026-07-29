@@ -1,0 +1,30 @@
+[package]
+name = "ctrlvim-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local code-completion inference for ctrlvim: CodeGemma-2B fill-in-the-middle on candle"
+
+[features]
+# The real backend. On by default; turn it off (`--no-default-features`) to
+# build the crate's prompt/plumbing layer without pulling in candle, which is
+# what the workspace's own CI does when it only wants to type-check quickly.
+default = ["local-model"]
+local-model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "dep:serde_json", "dep:rayon"]
+# Accelerator backends, forwarded to candle. Neither is on by default: CUDA
+# needs a toolkit present at build time and Metal only exists on macOS.
+cuda = ["local-model", "candle-core?/cuda", "candle-nn?/cuda", "candle-transformers?/cuda"]
+metal = ["local-model", "candle-core?/metal", "candle-nn?/metal", "candle-transformers?/metal"]
+
+[dependencies]
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
+serde_json = { version = "1", optional = true }
+# Not used directly for parallelism — used to *contain* candle's. See
+# `Completer`'s worker: inference otherwise saturates every core through the
+# global rayon pool and starves the editor's own thread.
+rayon = { version = "1.7", optional = true }
+serde.workspace = true

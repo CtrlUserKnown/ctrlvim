@@ -20,14 +20,15 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use ctrlvim_ai::{Completer, Request as AiRequest, Status as AiStatus};
 use ctrlvim_core::syntax::{self, Filetype};
 use ctrlvim_core::{
-    grep_text, BufferCmd, Ctrlvim, Event, EventLoop, ExEffect, HlSpan, Jobs, Key, LineBuffer,
-    Matcher, OutputParser, QfItem, QuickfixCmd, Selection, TagAddress, TagCmd, TimerService,
+    grep_text, AiCmd, BufferCmd, ContextWindow, Ctrlvim, Event, EventLoop, ExEffect, HlSpan, Jobs,
+    Key, LineBuffer, MapMode, Matcher, OutputParser, PinCmd, QfItem, QuickfixCmd, Selection,
+    Suggestion, TagAddress, TagCmd, TimerService,
 };
 
 use crate::config::{expand_tilde, Config, PluginEntry};
-use ctrlvim_core::MapMode;
 use crate::data::{list_dir, FinderEntry};
 use crate::data::Project;
 use crate::replace::{by_file, Field, ReplacePanel, MAX_HITS};
@@ -219,6 +220,8 @@ pub enum Action {
     InstallTool(usize),
     ToggleMouse,
     CycleIconMode,
+    /// Flip inline AI suggestions from the Settings tab, persisting the choice.
+    ToggleAi,
     /// Select (and jump to) a quickfix entry by list index.
     QuickfixSelect(usize),
     SetSettingsIndex(usize),
@@ -291,10 +294,6 @@ pub struct App {
     /// buffer (`Some` while the prompt is open).
     pub save_prompt: Option<String>,
 
-    /// True after `<leader>` (Space) is pressed in the shell, so the next digit
-    /// jumps to that tab (the editor handles its own leader via the engine).
-    pub leader_pending: bool,
-
     /// A transient one-line message shown on the status line (e.g. `:w` acks,
     /// set from engine [`ExEffect::Message`]).
     pub message: String,
@@ -333,6 +332,17 @@ pub struct App {
     installing_tool: Option<(String, usize, u64)>,
     /// Whether the `:!{cmd}` output overlay is showing.
     pub shell_open: bool,
+    /// When the currently half-typed mapping last took a key, or `None` when
+    /// none is pending. Drives `'timeoutlen'` (see `tick_keymap_timeout`).
+    keymap_pending_since: Option<std::time::Instant>,
+    /// Keys buffered while a mapping is half-typed *in the shell*. The engine
+    /// owns the equivalent buffer for the editor; the shell needs its own
+    /// because its keys never reach the engine (see `shell_keymap`).
+    shell_map_pending: Vec<Key>,
+    /// What can still follow the keys typed so far — the which-key popup's
+    /// contents, read straight from the engine's mapping table so it can never
+    /// disagree with what the keys actually do.
+    pub which_key: Vec<ctrlvim_core::Continuation>,
     /// Overlay title: the command line plus its exit code once it's back.
     pub shell_title: String,
     /// Output lines of the last `:!{cmd}`, shown in the overlay.
@@ -348,6 +358,15 @@ pub struct App {
     view_top: usize,
     /// Editor viewport height, recorded by the renderer for scroll clamping.
     viewport_rows: std::cell::Cell<usize>,
+
+    /// The inline-suggestion worker (CodeGemma on candle), created the first
+    /// time suggestions are switched on — so an editor that never asks for AI
+    /// never spawns the thread, let alone downloads a model.
+    ai: Option<Completer>,
+    /// When the editor last changed while in Insert mode. A completion is
+    /// requested once this is `debounce_ms` old: asking on every keystroke
+    /// would cancel each request with the next one and never finish any.
+    ai_idle_since: Option<Instant>,
 
     pub should_quit: bool,
 }
@@ -431,7 +450,6 @@ impl App {
             palette_query: String::new(),
             palette_index: 0,
             save_prompt: None,
-            leader_pending: false,
             message: startup_message,
             expand_git: false,
             lsp_enabled,
@@ -448,12 +466,17 @@ impl App {
             shell_job: None,
             installing_tool: None,
             shell_open: false,
+            keymap_pending_since: None,
+            shell_map_pending: Vec::new(),
+            which_key: Vec::new(),
             shell_title: String::new(),
             shell_output: Vec::new(),
             shell_scroll: 0,
             tags_loaded_at: None,
             view_top: 0,
             viewport_rows: std::cell::Cell::new(24),
+            ai: None,
+            ai_idle_since: None,
             should_quit: false,
         }
     }
@@ -533,6 +556,7 @@ impl App {
             Action::InstallTool(i) => self.install_tool(i),
             Action::ToggleMouse => self.toggle_mouse(),
             Action::CycleIconMode => self.cycle_icon_mode(),
+            Action::ToggleAi => self.toggle_ai(),
             Action::QuickfixSelect(i) => self.quickfix_select(i),
             Action::SetSettingsIndex(i) => {
                 if i < self.settings_count() {
@@ -707,10 +731,35 @@ impl App {
     /// config gets exactly the semantics the `:` command line has — one code
     /// path, one source of truth for what an option or mapping means.
     pub fn apply_config(&mut self) {
+        // Pins are per-project state rather than config, but this is the one
+        // startup hook, and they must be back before the first `<A-1>`.
+        self.engine.session.pins.set(crate::data::load_pins(&self.root));
+
         // `[options]` → a single `:set` with every argument.
         if !self.config.set_args.is_empty() {
             let args = self.config.set_args.join(" ");
             self.run_ex_command(&format!("set {args}"));
+        }
+
+        // `[keymaps] defaults = false` starts from an empty table, for a config
+        // that would rather define every chord itself than shadow ours.
+        if !self.config.keymap_defaults {
+            self.engine.session.keymap = ctrlvim_core::Keymap::new();
+        }
+        // `mapleader` applies at definition time, as in Vim — so it has to be
+        // set before any `[[keymap]]` entry is parsed.
+        self.engine.session.keymap.set_leader(self.config.leader);
+
+        // `[[command]]` → user commands, defined *before* the keymaps so a
+        // mapping's rhs can name one that config itself contributed.
+        for c in self.config.commands.clone() {
+            self.run_ex_command(&format!("command {} {}", c.name, c.expansion));
+        }
+
+        // `[[unmap]]` → drop a built-in outright. Binding the same lhs already
+        // replaces one; this is for chords you want simply gone.
+        for u in self.config.unmaps.clone() {
+            self.engine.session.keymap.remove(MapMode::parse(&u.mode), &u.lhs);
         }
 
         // `[[keymap]]` → the engine's per-mode mapping table. This goes direct
@@ -718,10 +767,17 @@ impl App {
         // *notation* (`<Esc>`, `<CR>`), which the command line would consume as
         // real keys before the mapping was ever defined.
         for m in self.config.keymaps.clone() {
-            self.engine
-                .session
-                .keymap
-                .set(MapMode::parse(&m.mode), &m.lhs, &m.rhs);
+            // A mapping whose lhs doesn't parse is reported rather than
+            // dropped: a silent no-op here is exactly the failure mode that
+            // makes a config feel haunted.
+            if let Err(e) = self.engine.session.keymap.set_with_desc(
+                MapMode::parse(&m.mode),
+                &m.lhs,
+                &m.rhs,
+                m.desc.clone(),
+            ) {
+                self.message = format!("config: {e}");
+            }
         }
 
         // `[[plugin]]` → source the plugin's entry point now, unless it asked to
@@ -736,6 +792,12 @@ impl App {
         // any event can reach a callback.
         if !self.config.autocmds.is_empty() {
             let _ = self.engine.ensure_host();
+        }
+
+        // `[ai] enabled = true` → arm inline suggestions. The weights are still
+        // loaded lazily, on the first completion, so startup stays instant.
+        if self.config.ai.enabled {
+            self.set_ai_enabled(true);
         }
 
         self.fire_autocmd("VimEnter");
@@ -855,7 +917,7 @@ impl App {
     }
 
     /// Number of Settings rows: the editor options plus each LSP server.
-    pub const SETTINGS_EDITOR_OPTIONS: usize = 3; // drawer, mouse, icons
+    pub const SETTINGS_EDITOR_OPTIONS: usize = 4; // drawer, mouse, icons, AI
 
     pub fn settings_count(&self) -> usize {
         Self::SETTINGS_EDITOR_OPTIONS + self.project.lsp.len()
@@ -878,6 +940,7 @@ impl App {
             0 => self.toggle_startup_drawer(),
             1 => self.toggle_mouse(),
             2 => self.cycle_icon_mode(),
+            3 => self.toggle_ai(),
             i => self.toggle_lsp(i - Self::SETTINGS_EDITOR_OPTIONS),
         }
     }
@@ -1096,7 +1159,13 @@ impl App {
     /// effects the engine requested (`:w`/`:q`/…).
     pub fn feed_engine(&mut self, key: Key) {
         self.engine.session.feed(key);
+        // Every keystroke restarts the inline-suggestion idle countdown, so a
+        // completion is only ever asked for once typing has paused.
+        self.touch_ai();
         self.apply_effects();
+        // ...and the `'timeoutlen'` clock, so a half-typed chord resolves on
+        // its own and the which-key popup tracks what can still follow.
+        self.sync_keymap_pending();
     }
 
     /// Drain and perform the engine's queued [`ExEffect`]s. This is the host
@@ -1144,7 +1213,452 @@ impl App {
                 ExEffect::Tag(cmd) => self.host_tag(cmd),
                 ExEffect::OpenReplace { pattern } => self.open_replace(pattern),
                 ExEffect::Shell(command) => self.host_run_shell(command),
+                ExEffect::Ai(cmd) => self.host_ai(cmd),
+                ExEffect::HostAction(name) => self.host_action(&name),
+                ExEffect::Pin(cmd) => self.host_pin(cmd),
             }
+        }
+    }
+
+    /// Host side of the pinned-file commands. The engine owns the list; opening
+    /// a file and showing the menu need the buffer list and the UI.
+    fn host_pin(&mut self, cmd: PinCmd) {
+        match cmd {
+            // Reuse the ordinary open path, so a pinned file behaves exactly
+            // like one opened any other way (an existing tab is reused rather
+            // than duplicated).
+            PinCmd::Open(path) => self.new_file(&path),
+            PinCmd::Message(msg) => {
+                // Pins outlive the session, so every change is written through.
+                crate::data::save_pins(&self.root, self.engine.session.pins.files());
+                self.message = msg;
+            }
+            PinCmd::Menu(files) => {
+                self.message = if files.is_empty() {
+                    "no pinned files".to_string()
+                } else {
+                    files
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| format!("{}: {f}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join("  ")
+                };
+            }
+        }
+    }
+
+    /// Perform a named frontend action (`ExEffect::HostAction`).
+    ///
+    /// This registry is what makes the TUI's own vocabulary bindable. Before
+    /// it, [`Action`] and [`ExEffect`] were disjoint: the palette, the drawer,
+    /// the plugin manager and the help modal existed only behind hardcoded key
+    /// handlers, so no `[[keymap]]` entry could reach them. Now each has a name
+    /// that an Ex command — and therefore a mapping — can call for.
+    fn host_action(&mut self, name: &str) {
+        let action = match name {
+            "palette" => Action::OpenPalette,
+            "sidebar" => Action::ToggleSidebar,
+            "help" => Action::ToggleHelp,
+            "plugins" => Action::OpenPlugins,
+            "markdown" => Action::ToggleMarkdown,
+            "newfile" => Action::NewFile,
+            other => {
+                self.message = format!("E5555: unknown action: {other}");
+                return;
+            }
+        };
+        self.dispatch(action);
+    }
+
+    // --- inline AI suggestions ---------------------------------------------
+
+    /// Host side of the `:AI…` commands. The engine owns the suggestion state
+    /// machine; the model, its thread, and its weights are entirely here.
+    fn host_ai(&mut self, cmd: AiCmd) {
+        match cmd {
+            AiCmd::Enable(want) => {
+                let on = want.unwrap_or(!self.engine.session.suggest.enabled);
+                self.set_ai_enabled(on);
+                self.message = if on {
+                    match self.ai_status() {
+                        // A previous load already failed; saying "on" would be
+                        // a lie the user only discovers by waiting.
+                        Some(s) if s.is_failed() => s.describe(),
+                        _ => "inline AI suggestions on".to_string(),
+                    }
+                } else {
+                    "inline AI suggestions off".to_string()
+                };
+            }
+            AiCmd::Suggest => {
+                if !self.engine.session.suggest.enabled {
+                    self.set_ai_enabled(true);
+                }
+                self.engine.session.suggest.arm();
+                // Bypass the idle debounce: this *is* the explicit request.
+                // `checked_sub` because a monotonic clock started moments ago
+                // has nothing to subtract from — falling back to "now" just
+                // means the explicit request waits one debounce.
+                self.ai_idle_since =
+                    Some(Instant::now().checked_sub(self.debounce()).unwrap_or_else(Instant::now));
+            }
+            AiCmd::Status => match self.ai_status() {
+                // A failure is re-shown in full: `:AIStatus` is where someone
+                // goes *after* dismissing the panel, and sending them back to a
+                // clipped one-liner would be a dead end.
+                Some(status @ ctrlvim_ai::Status::Failed(_)) => {
+                    let ctrlvim_ai::Status::Failed(e) = &status else { unreachable!() };
+                    let e = e.clone();
+                    self.show_ai_error(&e);
+                }
+                Some(status) => self.message = status.describe(),
+                None => self.message = "AI: off (`:AI on` to enable)".to_string(),
+            },
+            AiCmd::Load => {
+                // Re-read `[ai]` before retrying. The overwhelmingly common
+                // reason to ask for an explicit load is that the previous one
+                // failed and the user has just edited the model repo or path in
+                // response — retrying with the config the editor booted with
+                // would fail identically, which makes `:AILoad` look broken and
+                // makes the advice in `gated_repo_help` untrue.
+                let reloaded = self.reload_ai_config();
+                self.ensure_ai().preload();
+                self.message = if reloaded {
+                    "AI: config reloaded, loading the model…".to_string()
+                } else {
+                    "AI: loading the model…".to_string()
+                };
+            }
+        }
+    }
+
+    /// Re-read the `[ai]` section from disk. Returns whether anything changed;
+    /// when it did, the worker is dropped so the next request builds one with
+    /// the new settings (the model repo, device, and precision are all fixed at
+    /// worker construction). An unchanged config keeps the worker — and its
+    /// already-loaded weights — exactly where they are.
+    fn reload_ai_config(&mut self) -> bool {
+        match Config::path() {
+            Some(path) => self.reload_ai_config_from(&path),
+            None => false,
+        }
+    }
+
+    /// [`reload_ai_config`](Self::reload_ai_config) against a specific file.
+    ///
+    /// Split out so the reload can be tested without reading — and depending
+    /// on — whoever's real `~/.config/ctrlvim/config.toml` happens to say, the
+    /// same hazard the render tests pin `App::config` to avoid.
+    pub fn reload_ai_config_from(&mut self, path: &Path) -> bool {
+        let fresh = Config::load_from(path).ai;
+        if fresh == self.config.ai {
+            return false;
+        }
+        self.config.ai = fresh;
+        self.ai = None;
+        if self.ai_enabled() {
+            self.engine.session.suggest.context = ContextWindow {
+                before: self.config.ai.context_before,
+                after: self.config.ai.context_after,
+            };
+        }
+        true
+    }
+
+    /// Report a model failure: a one-line summary on the status line, and the
+    /// whole explanation in the output panel.
+    ///
+    /// The panel matters. These errors are the only ones in the editor that
+    /// have to *teach* — "the repo is gated" is useless without the two
+    /// paragraphs saying what to do about it — and the status line clips at the
+    /// terminal edge, which silently ate exactly the actionable half. A failed
+    /// load parks the worker until `:AILoad` asks again, so this pops up once
+    /// per attempt rather than once per keystroke.
+    pub fn show_ai_error(&mut self, error: &str) {
+        self.message = format!("AI: {}", first_line(error));
+        // Only interrupt for something worth reading; a one-line failure is
+        // fully visible on the status line already.
+        if error.lines().count() < 2 {
+            return;
+        }
+        self.shell_title = "AI — model could not be loaded".to_string();
+        self.shell_output = error.lines().map(str::to_string).collect();
+        self.shell_scroll = 0;
+        self.shell_open = true;
+    }
+
+    /// Whether inline suggestions are currently being offered. This is the
+    /// *live* state, which is what the Settings row shows — `:AI on` and the
+    /// checkbox must never disagree about whether the feature is running.
+    pub fn ai_enabled(&self) -> bool {
+        self.engine.session.suggest.enabled
+    }
+
+    /// Settings-tab toggle: flip inline suggestions **and persist the choice**,
+    /// so it survives a restart. `:AI` is the session-scoped counterpart, the
+    /// same way `:set mouse` is to the mouse checkbox.
+    pub fn toggle_ai(&mut self) {
+        let on = !self.ai_enabled();
+        self.config.ai.enabled = on;
+        self.config.save();
+        self.set_ai_enabled(on);
+        self.message = format!(
+            "inline AI suggestions: {}",
+            if on { "on" } else { "off" }
+        );
+    }
+
+    /// Turn inline suggestions on or off, starting the worker on the way in and
+    /// dropping it (and its several gigabytes of weights) on the way out.
+    pub fn set_ai_enabled(&mut self, on: bool) {
+        self.engine.session.set_suggestions_enabled(on);
+        if on {
+            // How much buffer context a request carries is the engine's to
+            // slice but the user's to choose, so `[ai]` feeds it in here.
+            self.engine.session.suggest.context = ContextWindow {
+                before: self.config.ai.context_before,
+                after: self.config.ai.context_after,
+            };
+            self.ensure_ai();
+            self.ai_idle_since = Some(Instant::now());
+        } else {
+            self.ai = None;
+            self.ai_idle_since = None;
+        }
+    }
+
+    /// The worker, started if this is the first time it's needed.
+    fn ensure_ai(&mut self) -> &Completer {
+        self.ai
+            .get_or_insert_with(|| Completer::new(self.config.ai.clone()))
+    }
+
+    /// The model's status, or `None` when suggestions have never been on.
+    pub fn ai_status(&self) -> Option<AiStatus> {
+        self.ai.as_ref().map(|c| c.status())
+    }
+
+    /// A short status-line marker for the model's state, or `None` when there
+    /// is nothing worth the space.
+    pub fn ai_badge(&self) -> Option<&'static str> {
+        // "Thinking" is the engine's business (a request is out) rather than
+        // the worker's, because the worker is still `Ready` between the moment
+        // it finishes and the moment the reply is collected.
+        if self.engine.session.suggest.is_pending() {
+            return Some("AI …");
+        }
+        // Armed but never loaded still gets a marker: the user switched the
+        // feature on and should be able to see that it's on, even before the
+        // first completion has given the worker anything to load for.
+        Some(self.ai.as_ref()?.status().badge().unwrap_or("AI"))
+    }
+
+    /// The ghost text to draw, if any.
+    pub fn suggestion(&self) -> Option<&Suggestion> {
+        self.engine.session.suggest.current()
+    }
+
+    /// Note that the editor changed, restarting the idle countdown.
+    fn touch_ai(&mut self) {
+        if self.engine.session.suggest.enabled {
+            self.ai_idle_since = Some(Instant::now());
+        }
+    }
+
+    fn debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.config.ai.debounce_ms)
+    }
+
+    /// Drive the completion worker: issue a request once typing has paused, and
+    /// install anything that came back. Called once per main-loop turn, next to
+    /// [`poll_jobs`](Self::poll_jobs).
+    ///
+    /// Returns whether anything changed, so the caller knows to redraw.
+    pub fn poll_ai(&mut self) -> bool {
+        if self.ai.is_none() {
+            return false;
+        }
+        let mut changed = false;
+
+        // Drained into a Vec first, rather than handled inside the loop: acting
+        // on a reply mutates the app (installing ghost text, opening the error
+        // panel), which can't happen while the worker is still borrowed.
+        // Collecting also means a reply that landed during the last frame is
+        // shown now, before anything decides to ask again.
+        let replies: Vec<ctrlvim_ai::Reply> = {
+            let ai = self.ai.as_ref().expect("checked above");
+            std::iter::from_fn(|| ai.poll()).collect()
+        };
+        for reply in replies {
+            match reply.result {
+                Ok(text) if !text.is_empty() => {
+                    changed |= self.engine.session.fulfill_suggestion(reply.seq, &text);
+                }
+                Ok(_) => self.engine.session.fail_suggestion(reply.seq),
+                Err(e) => {
+                    self.engine.session.fail_suggestion(reply.seq);
+                    self.show_ai_error(&e);
+                    changed = true;
+                }
+            }
+        }
+
+        // Only ask once typing has actually paused, and only while a file
+        // buffer has focus — a completion for a buffer the user has navigated
+        // away from is wasted work.
+        let idle = self
+            .ai_idle_since
+            .is_some_and(|since| since.elapsed() >= self.debounce());
+        if idle && self.editor_focus() {
+            if let Some(req) = self.engine.session.suggest_request() {
+                if let Some(ai) = self.ai.as_ref() {
+                    ai.submit(AiRequest {
+                        seq: req.seq,
+                        prefix: req.prefix,
+                        suffix: req.suffix,
+                        filename: req.filename,
+                    });
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// How long the main loop may block waiting for a key.
+    ///
+    /// Normally a quarter second is plenty. While inline suggestions are armed
+    /// it has to be shorter than the debounce, or the request would be issued a
+    /// poll interval late — visibly so, on top of an already slow model. And
+    /// while a mapping is half-typed it must not outlast `'timeoutlen'`, or the
+    /// chord would resolve late by however much the poll overshot.
+    pub fn poll_interval(&self) -> std::time::Duration {
+        let idle = std::time::Duration::from_millis(250);
+        let mut wait = if self.ai.is_none() {
+            idle
+        } else {
+            (self.debounce() / 3).clamp(std::time::Duration::from_millis(25), idle)
+        };
+        if let Some(remaining) = self.keymap_timeout_remaining() {
+            wait = wait.min(remaining);
+        }
+        wait
+    }
+
+    /// Time left on the `'timeoutlen'` clock, or `None` when no mapping is
+    /// half-typed. Zero means it has already expired.
+    fn keymap_timeout_remaining(&self) -> Option<std::time::Duration> {
+        let started = self.keymap_pending_since?;
+        let len = self.engine.session.timeoutlen();
+        Some(len.saturating_sub(started.elapsed()))
+    }
+
+    /// Resolve a half-typed mapping whose `'timeoutlen'` has run out.
+    ///
+    /// Called from the event loop on every tick. An ambiguous chord
+    /// (`<leader>q` with `<leader>qq` also mapped) fires here; a prefix that
+    /// was never completed is replayed literally so the keys aren't lost.
+    pub fn tick_keymap_timeout(&mut self) {
+        if self.keymap_timeout_remaining() != Some(std::time::Duration::ZERO) {
+            return;
+        }
+        self.keymap_pending_since = None;
+        // The shell keeps its own buffer, since its keys never reach the
+        // engine; an ambiguous chord there resolves to the shorter mapping the
+        // same way it would in the editor.
+        if !self.shell_map_pending.is_empty() {
+            let pending = std::mem::take(&mut self.shell_map_pending);
+            if let ctrlvim_core::KeymapMatch::FullAmbiguous(rhs) =
+                self.engine.session.keymap.match_mode(MapMode::Normal, &pending)
+            {
+                self.run_mapped_ex(&rhs);
+            }
+        } else {
+            self.engine.session.keymap_timeout();
+            self.apply_effects();
+        }
+        // The chord resolved, so whatever the popup was offering is stale.
+        self.which_key = Vec::new();
+    }
+
+    /// Run a user's mapping from the *shell* (dashboard, plugin manager) —
+    /// where there is no editor buffer to feed keys into.
+    ///
+    /// The shell used to reimplement a cut-down leader machine of its own, so
+    /// only `<leader>1-9`, `<leader>d` and `<leader>S` worked there and a
+    /// user's `[[keymap]]` entries were silently editor-only. This consults the
+    /// one real table instead. Keys aren't fed to the engine — the session's
+    /// buffer isn't what's on screen — so only mappings that expand to an Ex
+    /// command mean anything here; the rest fall through to the shell's own
+    /// navigation keys.
+    ///
+    /// Returns whether the key was consumed.
+    pub fn shell_keymap(&mut self, key: Key) -> bool {
+        let km = &self.engine.session.keymap;
+        if self.shell_map_pending.is_empty() && !km.can_start(MapMode::Normal, key) {
+            return false;
+        }
+        self.shell_map_pending.push(key);
+        match km.match_mode(MapMode::Normal, &self.shell_map_pending) {
+            ctrlvim_core::KeymapMatch::Full(rhs) => {
+                self.shell_map_pending.clear();
+                self.sync_shell_pending();
+                self.run_mapped_ex(&rhs);
+                true
+            }
+            ctrlvim_core::KeymapMatch::FullAmbiguous(_) | ctrlvim_core::KeymapMatch::Prefix => {
+                self.sync_shell_pending();
+                true
+            }
+            ctrlvim_core::KeymapMatch::None => {
+                // Not a mapping after all. Drop the buffered keys and let the
+                // shell's own handler have this one.
+                self.shell_map_pending.clear();
+                self.sync_shell_pending();
+                false
+            }
+        }
+    }
+
+    /// Run a mapping's right-hand side in the shell, which can only honour the
+    /// Ex-command form (`:Files<CR>`). Anything else would need a buffer.
+    fn run_mapped_ex(&mut self, rhs: &[Key]) {
+        let text = ctrlvim_core::keys_notation(rhs);
+        let Some(cmd) = text.strip_prefix(':') else { return };
+        let cmd = cmd.strip_suffix("<CR>").unwrap_or(cmd);
+        if !cmd.is_empty() {
+            self.run_ex_command(cmd);
+        }
+    }
+
+    /// Mirror of [`sync_keymap_pending`](Self::sync_keymap_pending) for the
+    /// shell's own pending buffer.
+    fn sync_shell_pending(&mut self) {
+        if self.shell_map_pending.is_empty() {
+            self.keymap_pending_since = None;
+            self.which_key = Vec::new();
+        } else {
+            self.keymap_pending_since = Some(std::time::Instant::now());
+            self.which_key = self
+                .engine
+                .session
+                .keymap
+                .continuations(MapMode::Normal, &self.shell_map_pending);
+        }
+    }
+
+    /// Refresh the `'timeoutlen'` clock and the which-key popup after feeding a
+    /// key. Called wherever keys reach the engine.
+    fn sync_keymap_pending(&mut self) {
+        if self.engine.session.keymap_pending() {
+            // Restart the clock on every key: a chord in progress gets a full
+            // `'timeoutlen'` for its *next* key, as in Vim.
+            self.keymap_pending_since = Some(std::time::Instant::now());
+            self.which_key = self.engine.session.keymap_continuations();
+        } else {
+            self.keymap_pending_since = None;
+            self.which_key = Vec::new();
         }
     }
 

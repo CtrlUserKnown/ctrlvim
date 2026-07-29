@@ -63,6 +63,55 @@ pub enum ExEffect {
     /// Run a raw command line through the user's configured shell and show its
     /// output (`:!{cmd}`). The host owns the shell binary and the process.
     Shell(String),
+    /// An inline-AI-suggestion action. The engine owns the suggestion state
+    /// ([`crate::suggest`]); the model, its weights, and the worker thread are
+    /// the host's.
+    Ai(AiCmd),
+    /// Perform a named frontend action — the command palette, the file drawer,
+    /// the plugin manager, the help modal.
+    ///
+    /// These are pure UI, with no engine state behind them, so they get one
+    /// generic variant rather than one variant each. The point is that they
+    /// become *bindable*: the frontend's own action vocabulary used to be
+    /// reachable only from hardcoded key handlers, so `<leader>p` → command
+    /// palette was not expressible at all. Now every one of them is an Ex
+    /// command, and anything that can run an Ex command can reach it.
+    ///
+    /// An unknown name is reported by the host rather than ignored.
+    HostAction(String),
+    /// A pinned-file action (`:Pin`, `:PinGo 2`, …). The engine owns the list
+    /// ([`crate::pinned::PinList`]); opening the file and drawing the menu are
+    /// the host's, as with quickfix and tags.
+    Pin(PinCmd),
+}
+
+/// What the host should do for a `:Pin…` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinCmd {
+    /// Open a pinned file (`:PinGo 2`, `:PinNext`, `<M-1>`).
+    Open(String),
+    /// Show the pin list (`:PinList`) — the host renders it as a picker.
+    Menu(Vec<String>),
+    /// Report the outcome of a pin/unpin, since those have nothing to show.
+    Message(String),
+}
+
+/// What the host should do for an `:AI…` command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiCmd {
+    /// `:AI` (flip), `:AI on`, `:AI off` — turn inline suggestions on or off.
+    /// The host applies it via
+    /// [`Session::set_suggestions_enabled`](crate::Session::set_suggestions_enabled)
+    /// so it can start or stop the model worker at the same time.
+    Enable(Option<bool>),
+    /// `:AISuggest` — ask for a completion for the current cursor right now,
+    /// bypassing the host's idle debounce.
+    Suggest,
+    /// `:AIStatus` — report whether the model is loading, ready, or broken.
+    Status,
+    /// `:AILoad` — start loading the weights now rather than on first use, so
+    /// the first suggestion isn't also the first (slow) model load.
+    Load,
 }
 
 /// What the host should do for a tag command. The engine owns the tag table and
@@ -174,6 +223,8 @@ pub(crate) enum SetItem {
     Tabstop(i64),
     Shiftwidth(i64),
     Scrolloff(i64),
+    /// `'timeoutlen'`, in milliseconds.
+    Timeoutlen(i64),
     Foldmethod(ctrlvim_options::FoldMethod),
     Foldcolumn(i64),
     /// An unrecognized option name, reported as an error.
@@ -290,12 +341,41 @@ const TABLE: &[ExCommand] = &[
     ExCommand { name: "grep", aliases: &["gr"], desc: "run grep into the quickfix list" },
     ExCommand { name: "vimgrep", aliases: &["vim", "vimg"], desc: "search files into the quickfix list (:vimgrep /pat/)" },
 
+    // -- frontend panels (ExEffect::HostAction) -----------------------------
+    // These are the TUI's own actions, exposed as commands so they can be
+    // bound to a key like anything else.
+    ExCommand { name: "palette", aliases: &["Palette"], desc: "open the command palette" },
+    ExCommand { name: "sidebar", aliases: &["drawer", "NvimTree"], desc: "toggle the file drawer" },
+    ExCommand { name: "help", aliases: &["h"], desc: "show the keybinding help" },
+    ExCommand { name: "plugins", aliases: &["Plugins", "Lazy"], desc: "open the plugin manager" },
+    ExCommand { name: "markdown", aliases: &["Markdown"], desc: "toggle live markdown rendering" },
+
     // -- find & replace panel ----------------------------------------------
     ExCommand { name: "Find", aliases: &[], desc: "find & replace across the project (:Find [pattern])" },
     ExCommand { name: "Replace", aliases: &["Repl"], desc: "find & replace across the project" },
 
+    // -- pinned files -------------------------------------------------------
+    ExCommand { name: "Pin", aliases: &["PinAdd"], desc: "pin the current file for quick access" },
+    ExCommand { name: "PinRemove", aliases: &["Unpin"], desc: "unpin the current file" },
+    ExCommand { name: "PinClear", aliases: &[], desc: "unpin every file" },
+    ExCommand { name: "PinList", aliases: &["Pins"], desc: "show the pinned files" },
+    ExCommand { name: "PinGo", aliases: &[], desc: "jump to pinned file N (:PinGo 2)" },
+    ExCommand { name: "PinNext", aliases: &[], desc: "jump to the next pinned file" },
+    ExCommand { name: "PinPrev", aliases: &[], desc: "jump to the previous pinned file" },
+
+    // -- inline AI suggestions ---------------------------------------------
+    ExCommand { name: "AI", aliases: &["ai"], desc: "toggle inline AI suggestions (:AI on|off)" },
+    ExCommand { name: "AISuggest", aliases: &[], desc: "suggest a completion at the cursor now" },
+    ExCommand { name: "AIStatus", aliases: &[], desc: "show the AI completion model's state" },
+    ExCommand { name: "AILoad", aliases: &[], desc: "load the AI completion model now" },
+
     // -- scripting ----------------------------------------------------------
-    ExCommand { name: "map", aliases: &["nmap", "nnoremap", "noremap", "nore"], desc: "define a normal-mode mapping (:map lhs rhs)" },
+    ExCommand { name: "map", aliases: &["nmap", "nnoremap", "noremap", "nore"], desc: "define a normal-mode mapping (:map lhs rhs), or list them" },
+    ExCommand { name: "imap", aliases: &["inoremap"], desc: "define an insert-mode mapping (:imap jk <Esc>)" },
+    ExCommand { name: "vmap", aliases: &["vnoremap", "xmap", "xnoremap"], desc: "define a visual-mode mapping" },
+    ExCommand { name: "unmap", aliases: &["nunmap"], desc: "remove a normal-mode mapping (:unmap lhs)" },
+    ExCommand { name: "iunmap", aliases: &[], desc: "remove an insert-mode mapping" },
+    ExCommand { name: "vunmap", aliases: &["xunmap"], desc: "remove a visual-mode mapping" },
     ExCommand { name: "command", aliases: &["com", "comm"], desc: "define a user command (:command Name expansion)" },
     ExCommand { name: "comclear", aliases: &[], desc: "remove all user-defined commands" },
     ExCommand { name: "let", aliases: &[], desc: "set a script variable (:let g:x = 1)" },
@@ -359,10 +439,13 @@ pub(crate) enum ExParsed {
     Redo(usize),
     /// Apply option changes (`:set …`/`:setlocal …`/`:setglobal …`).
     Set { scope: SetScope, items: Vec<SetItem> },
-    /// Define a mapping (`:map`/`:nnoremap`/`:imap`/`:vmap` …).
-    Map { mode: crate::keymap::MapMode, lhs: String, rhs: String },
+    /// Define a mapping (`:map`/`:nnoremap`/`:imap`/`:vmap` …), optionally
+    /// with a `<desc=…>` for the keybinding help.
+    Map { mode: crate::keymap::MapMode, lhs: String, rhs: String, desc: Option<String> },
     /// Remove a mapping (`:unmap`/`:iunmap`/`:vunmap`).
     Unmap { mode: crate::keymap::MapMode, lhs: String },
+    /// List a mode's mappings (`:map` with no arguments).
+    ListMaps { mode: crate::keymap::MapMode },
     /// Define a user command (`:command Name expansion`).
     DefineCommand { name: String, repl: String },
     /// Remove all user-defined commands (`:comclear`).
@@ -387,6 +470,31 @@ fn split_first_word(arg: &str) -> (String, String) {
     }
 }
 
+/// Split a leading `<desc=…>` map-argument off a `:map` argument list, in the
+/// same position Vim takes `<silent>` and `<buffer>`:
+///
+/// ```text
+/// :nnoremap <desc=Save file> <leader>w :w<CR>
+/// ```
+///
+/// The description is what the keybinding help and which-key popup show, so
+/// it has to be settable wherever a mapping can be defined — not just in
+/// config. Unlike Vim's flags the value contains spaces, so it runs to the
+/// first `>`; a mapping whose description needs a literal `>` can be defined
+/// from config instead.
+fn split_desc_arg(arg: &str) -> (Option<String>, &str) {
+    let trimmed = arg.trim_start();
+    let Some(rest) = trimmed.strip_prefix("<desc=") else {
+        return (None, arg);
+    };
+    let Some(end) = rest.find('>') else {
+        return (None, arg);
+    };
+    let desc = rest[..end].trim();
+    let desc = (!desc.is_empty()).then(|| desc.to_string());
+    (desc, rest[end + 1..].trim_start())
+}
+
 /// Parse a `:set` argument list (`number nowrap ts=4`) into option changes.
 fn parse_set(arg: &str) -> Vec<SetItem> {
     arg.split_whitespace()
@@ -398,6 +506,7 @@ fn parse_set(arg: &str) -> Vec<SetItem> {
                     "tabstop" | "ts" => SetItem::Tabstop(n),
                     "shiftwidth" | "sw" => SetItem::Shiftwidth(n),
                     "scrolloff" | "so" => SetItem::Scrolloff(n),
+                    "timeoutlen" | "tm" => SetItem::Timeoutlen(n),
                     "foldcolumn" | "fdc" => SetItem::Foldcolumn(n),
                     // `'foldmethod'` takes a name, not a number.
                     "foldmethod" | "fdm" => match ctrlvim_options::FoldMethod::parse(value) {
@@ -482,9 +591,14 @@ pub(crate) fn parse_ex(cmd: &str) -> ExParsed {
                 "vmap" | "vnoremap" | "xmap" | "xnoremap" => crate::keymap::MapMode::Visual,
                 _ => crate::keymap::MapMode::Normal,
             };
+            // `:map` with no arguments lists the mode's mappings.
+            if arg.trim().is_empty() {
+                return ExParsed::ListMaps { mode };
+            }
+            let (desc, arg) = split_desc_arg(arg);
             let (lhs, rhs) = split_first_word(arg);
             if !lhs.is_empty() && !rhs.is_empty() {
-                return ExParsed::Map { mode, lhs, rhs };
+                return ExParsed::Map { mode, lhs, rhs, desc };
             }
             return ExParsed::Nop;
         }
@@ -566,10 +680,29 @@ pub(crate) fn parse_ex(cmd: &str) -> ExParsed {
         "Files" | "Explore" | "Ex" | "E" => ExEffect::OpenBrowser,
         // Bare `:Find` seeds itself from the word under the cursor, which only
         // the session knows — it fills the `None` in before the host sees it.
+        // Frontend panels. `parse_ex` stays pure: the host looks the name up in
+        // its own action registry.
+        "palette" | "Palette" => ExEffect::HostAction("palette".into()),
+        "sidebar" | "drawer" | "NvimTree" => ExEffect::HostAction("sidebar".into()),
+        "help" | "h" => ExEffect::HostAction("help".into()),
+        "plugins" | "Plugins" | "Lazy" => ExEffect::HostAction("plugins".into()),
+        "markdown" | "Markdown" => ExEffect::HostAction("markdown".into()),
+
         "Find" | "Replace" | "Repl" => {
             ExEffect::OpenReplace { pattern: (!arg.is_empty()).then(|| arg.to_string()) }
         }
         "dash" | "dashboard" | "Dash" | "Dashboard" => ExEffect::OpenDashboard,
+        // Inline AI suggestions. A bare `:AI` flips the switch; `:AI on`/`off`
+        // (and `:AI!`, the Vim spelling for "the other way") are explicit.
+        "AI" | "ai" => ExEffect::Ai(AiCmd::Enable(match arg {
+            "on" | "enable" | "1" => Some(true),
+            "off" | "disable" | "0" => Some(false),
+            _ if force => Some(false),
+            _ => None,
+        })),
+        "AISuggest" => ExEffect::Ai(AiCmd::Suggest),
+        "AIStatus" => ExEffect::Ai(AiCmd::Status),
+        "AILoad" => ExEffect::Ai(AiCmd::Load),
         // Scripting: run in the core (which owns the interpreters).
         "lua" if !arg.is_empty() => ExEffect::Lua(arg.to_string()),
         "luafile" | "source" | "so" => ExEffect::Source(arg.to_string()),
@@ -638,6 +771,31 @@ mod tests {
         // selecting or typing it always runs (rather than a fuzzy fallback).
         for cmd in commands() {
             assert!(is_ex_command(cmd.name), "catalog command {:?} is not recognized", cmd.name);
+        }
+    }
+
+    #[test]
+    fn every_command_the_parser_dispatches_is_in_the_catalog() {
+        // The other direction, which is the one that drifted: `:inoremap`,
+        // `:vnoremap` and the whole `:unmap` family parsed and ran for a long
+        // time while being absent from TABLE — so `is_ex_command` rejected
+        // them and they had no palette entry. `command_catalog_is_runnable`
+        // could not catch that, because it only walks TABLE.
+        //
+        // Anything the parser understands but the catalog doesn't list belongs
+        // in one of these two buckets, deliberately.
+        let dispatched = [
+            "map", "nmap", "nnoremap", "noremap", "nore", "imap", "inoremap", "vmap", "vnoremap",
+            "xmap", "xnoremap", "unmap", "nunmap", "iunmap", "vunmap", "xunmap", "command", "com",
+            "comm", "comclear", "set", "setl", "setlocal", "setg", "setglobal", "undo", "redo",
+            "earlier", "later", "lua", "source", "luafile",
+        ];
+        for name in dispatched {
+            assert!(
+                TABLE.iter().any(|c| c.spellings().any(|s| s == name)),
+                "the parser dispatches {name:?} but the catalog doesn't list it, so \
+                 `is_ex_command` rejects it and it gets no palette entry"
+            );
         }
     }
 
