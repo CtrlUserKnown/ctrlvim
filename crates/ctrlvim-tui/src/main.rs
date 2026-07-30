@@ -26,7 +26,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use ctrlvim::app::App;
+use ctrlvim::app::{Action, App};
 use ctrlvim::input;
 use ctrlvim::ui::{self, Zones};
 
@@ -204,13 +204,28 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
                 input::handle_key(&mut app, key);
             }
             Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(action) = zones.hit(m.column, m.row) {
-                    app.dispatch(action.clone());
+                if let Some(zone) = zones.hit_zone(m.column, m.row) {
+                    match &zone.action {
+                        // A click in the editor's text area: place the
+                        // cursor there instead of dispatching a plain
+                        // action, since the target depends on exactly where
+                        // in the zone the click landed.
+                        Action::EditorClick => {
+                            let col = m.column.saturating_sub(zone.area.x);
+                            let row = m.row.saturating_sub(zone.area.y);
+                            app.editor_click(col, row);
+                        }
+                        action => app.dispatch(action.clone()),
+                    }
                 }
             }
             // Mouse-wheel scrolling in the editor (opt-in via `mouse` config).
             Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => app.scroll_editor(3),
             Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => app.scroll_editor(-3),
+            // Horizontal wheel/touchpad scrolling — only moves anything under
+            // `'nowrap'` (see `App::scroll_editor_horiz`).
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollRight => app.scroll_editor_horiz(3),
+            Event::Mouse(m) if m.kind == MouseEventKind::ScrollLeft => app.scroll_editor_horiz(-3),
             // A resize can leave stale glyphs behind: ratatui only repaints
             // cells that changed since its last known buffer, and a terminal
             // that grew (or whose emulator redraws lazily mid-resize) can

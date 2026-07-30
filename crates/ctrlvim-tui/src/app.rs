@@ -23,9 +23,9 @@ use std::time::Instant;
 use ctrlvim_ai::{Completer, Request as AiRequest, Status as AiStatus};
 use ctrlvim_core::syntax::{self, Filetype};
 use ctrlvim_core::{
-    grep_text, AiCmd, BufferCmd, ContextWindow, Ctrlvim, Event, EventLoop, ExEffect, HlSpan, Jobs,
-    Key, LineBuffer, MapMode, Matcher, OutputParser, PinCmd, QfItem, QfKind, QuickfixCmd, Selection,
-    Suggestion, TagAddress, TagCmd, TimerService,
+    char_index_at, grep_text, width_upto, AiCmd, BufferCmd, ContextWindow, Ctrlvim, Event,
+    EventLoop, ExEffect, HlSpan, Jobs, Key, LineBuffer, MapMode, Matcher, OutputParser, PinCmd,
+    QfItem, QfKind, QuickfixCmd, Selection, Suggestion, TagAddress, TagCmd, TimerService,
 };
 
 use crate::config::{expand_tilde, Config, PluginEntry};
@@ -211,6 +211,11 @@ fn is_markdown_name(name: &str) -> bool {
 pub enum Action {
     /// Swallows a click (e.g. on overlay chrome) without doing anything.
     None,
+    /// A click landed in the file-buffer text area. Handled specially in the
+    /// event loop (which knows the raw mouse position and the zone's origin)
+    /// rather than through `dispatch`, so this carries no data — see
+    /// [`App::editor_click`].
+    EditorClick,
     SelectBuffer(usize),
     CloseBuffer(usize),
     GotoSection(DashboardSection),
@@ -374,6 +379,13 @@ pub struct App {
     view_top: usize,
     /// Editor viewport height, recorded by the renderer for scroll clamping.
     viewport_rows: std::cell::Cell<usize>,
+    /// Left edge of the editor viewport in screen cells — what the horizontal
+    /// mouse wheel moves. Only meaningful under `'nowrap'`; the render-time
+    /// clamp against the cursor works exactly like `view_top` above.
+    view_left: usize,
+    /// Editor viewport content width, recorded by the renderer for scroll
+    /// clamping and for translating a click's column back to a buffer column.
+    viewport_cols: std::cell::Cell<usize>,
 
     /// The inline-suggestion worker (CodeGemma on candle), created the first
     /// time suggestions are switched on — so an editor that never asks for AI
@@ -495,6 +507,8 @@ impl App {
             tags_loaded_at: None,
             view_top: 0,
             viewport_rows: std::cell::Cell::new(24),
+            view_left: 0,
+            viewport_cols: std::cell::Cell::new(80),
             ai: None,
             ai_idle_since: None,
             should_quit: false,
@@ -642,6 +656,10 @@ impl App {
             Action::ToggleStartupDrawer => self.toggle_startup_drawer(),
             Action::CloseSavePrompt => self.close_save_prompt(),
             Action::CloseShellOutput => self.shell_open = false,
+            // Handled directly in the event loop, which has the raw mouse
+            // position; reaching `dispatch` at all means it was cloned
+            // through some other path, so treat it as a no-op click.
+            Action::EditorClick => {}
         }
     }
 
@@ -1187,6 +1205,10 @@ impl App {
 
     /// Scroll the editor by `lines` (negative = up), when mouse support is on
     /// and a file buffer is focused. Moves the cursor, which drags the viewport.
+    ///
+    /// Works in *visual* rows — a closed fold is one row, and under `'wrap'`
+    /// a long line is several — via [`crate::wrap`], the same layer the
+    /// renderer uses, so this always scrolls exactly what's on screen.
     pub fn scroll_editor(&mut self, lines: i32) {
         if !self.config.mouse || !self.editor_focus() {
             return;
@@ -1194,9 +1216,12 @@ impl App {
         let text = self.editor_lines();
         let line_count = text.len();
         let rows = self.viewport_rows.get().max(1);
-        // Screen rows, not buffer lines: a closed fold is one row.
-        let max_top = self.folds().screen_line_count(line_count).saturating_sub(1);
-        let cur_row = self.screen_line_of(self.editor_cursor().0);
+        let cols = self.viewport_cols.get().max(1);
+        let wrap = self.wrap_enabled();
+        let vis = crate::wrap::visual_rows(&text, self.folds(), cols, wrap, line_count);
+        let max_top = vis.len().saturating_sub(1);
+        let (cur_line, cur_col) = self.editor_cursor();
+        let cur_row = crate::wrap::row_of(&vis, cur_line, cur_col);
 
         // Start from the row actually on screen, which may differ from the
         // stored offset after the cursor was moved by the keyboard.
@@ -1211,10 +1236,92 @@ impl App {
         let (first, last) = (self.view_top, self.view_top + rows - 1);
         if cur_row < first || cur_row > last {
             let row = cur_row.clamp(first, last);
-            let line = self.folds().buffer_line_of(row, line_count);
-            let col = self.editor_cursor().1;
-            self.engine.session.set_cursor_clamped(line, col);
+            if let Some(vr) = vis.get(row) {
+                self.engine.session.set_cursor_clamped(vr.line, cur_col);
+            }
         }
+    }
+
+    /// Scroll the editor sideways by `cols` (negative = left), when mouse
+    /// support is on, a file buffer is focused, and `'nowrap'` is set —
+    /// exactly like Vim, where `zl`/`zh` are no-ops under `'wrap'` because
+    /// the whole line is already on screen across several rows.
+    pub fn scroll_editor_horiz(&mut self, cols: i32) {
+        if !self.config.mouse || !self.editor_focus() || self.wrap_enabled() {
+            return;
+        }
+        let text = self.editor_lines();
+        let (cur_line, cur_col) = self.editor_cursor();
+        let raw = text.get(cur_line).map(String::as_str).unwrap_or("");
+        let cur_cells = width_upto(raw, cur_col);
+        let content_w = self.viewport_cols.get().max(1);
+
+        let effective = self.view_left.clamp(cur_cells.saturating_sub(content_w - 1), cur_cells);
+        self.view_left = if cols >= 0 {
+            effective + cols as usize
+        } else {
+            effective.saturating_sub(cols.unsigned_abs() as usize)
+        };
+
+        // Drag the cursor along only when the view would leave it behind.
+        let (first, last) = (self.view_left, self.view_left + content_w - 1);
+        if cur_cells < first || cur_cells > last {
+            let col = char_index_at(raw, cur_cells.clamp(first, last));
+            self.engine.session.set_cursor_clamped(cur_line, col);
+        }
+    }
+
+    /// Whether `'wrap'` is set for the active window: long lines wrap across
+    /// several rows instead of scrolling sideways.
+    pub fn wrap_enabled(&self) -> bool {
+        self.engine.session.editor.options().wrap()
+    }
+
+    /// This frame's resolved viewport: which buffer rows are on screen and,
+    /// under `'nowrap'`, how far scrolled sideways. `content_w`/`height` come
+    /// from the renderer, which is the only place that knows them.
+    pub fn editor_viewport(&self, content_w: usize, height: usize) -> crate::wrap::Viewport {
+        let lines = self.editor_lines();
+        let (cur_line, cur_col) = self.editor_cursor();
+        crate::wrap::compute(
+            &lines,
+            self.folds(),
+            self.wrap_enabled(),
+            content_w,
+            height,
+            cur_line,
+            cur_col,
+            self.view_top,
+            self.view_left,
+        )
+    }
+
+    /// Move the cursor to the buffer position under a click at `(col, row)`,
+    /// both relative to the text content area (i.e. already past the gutter)
+    /// — what the `Action::EditorClick` zone's rect gives the event loop.
+    pub fn editor_click(&mut self, col: u16, row: u16) {
+        if !self.editor_focus() {
+            return;
+        }
+        let content_w = self.viewport_cols.get().max(1);
+        let height = self.viewport_rows.get().max(1);
+        let vp = self.editor_viewport(content_w, height);
+        let lines = self.editor_lines();
+        let Some(&vr) = vp.rows.get(vp.top_row + row as usize) else {
+            // Clicked below the last line: Vim puts the cursor at its end.
+            let last = lines.len().saturating_sub(1);
+            let col = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+            self.engine.session.set_cursor_clamped(last, col);
+            return;
+        };
+        if vr.fold_head {
+            self.engine.session.set_cursor_clamped(vr.line, 0);
+            return;
+        }
+        let raw = lines.get(vr.line).map(String::as_str).unwrap_or("");
+        let base_cells = if self.wrap_enabled() { width_upto(raw, vr.seg_start) } else { vp.left_cells };
+        let char_col = char_index_at(raw, base_cells + col as usize);
+        self.engine.session.set_cursor_clamped(vr.line, char_col);
     }
 
     /// The stored viewport offset, in screen rows.
@@ -1227,6 +1334,12 @@ impl App {
     /// the cursor inside the window.
     pub fn set_viewport_rows(&self, rows: usize) {
         self.viewport_rows.set(rows);
+    }
+
+    /// Record the editor viewport's content width. Called from the renderer;
+    /// used for horizontal scroll clamping and click column translation.
+    pub fn set_viewport_cols(&self, cols: usize) {
+        self.viewport_cols.set(cols);
     }
 
     /// Feed one key to the engine's editing session, then perform any host
@@ -2493,32 +2606,6 @@ impl App {
     /// a summary for instead of the line's text.
     pub fn fold_head_at(&self, line: usize) -> Option<&ctrlvim_core::Fold> {
         self.folds().closed_at(line).filter(|f| f.start == line)
-    }
-
-    /// The buffer lines a viewport of `rows` rows shows, starting at screen row
-    /// `top`. With no closed folds this is just `top..top + rows`; with them,
-    /// hidden lines are skipped, so **the renderer must index lines through this
-    /// rather than assuming row == line**.
-    pub fn visible_lines(&self, top: usize, rows: usize, line_count: usize) -> Vec<usize> {
-        let folds = self.folds();
-        let mut out = Vec::with_capacity(rows);
-        let mut line = folds.buffer_line_of(top, line_count);
-        for _ in 0..rows {
-            if line >= line_count {
-                break;
-            }
-            out.push(line);
-            match folds.next_visible(line, 1, line_count) {
-                Some(next) => line = next,
-                None => break,
-            }
-        }
-        out
-    }
-
-    /// The screen row a buffer line draws on (its fold's row when hidden).
-    pub fn screen_line_of(&self, line: usize) -> usize {
-        self.folds().screen_line_of(line)
     }
 
     /// `hlsearch` match column ranges on `line` (empty when highlighting is off).

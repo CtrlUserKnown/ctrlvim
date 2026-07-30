@@ -42,11 +42,14 @@ impl Zones {
     }
     /// Top-most zone containing the point, or `None`.
     pub fn hit(&self, col: u16, row: u16) -> Option<&Action> {
-        self.0
-            .iter()
-            .rev()
-            .find(|z| contains(z.area, col, row))
-            .map(|z| &z.action)
+        self.hit_zone(col, row).map(|z| &z.action)
+    }
+
+    /// Like [`hit`](Self::hit), but returns the whole zone — its `area` too,
+    /// for an action (like [`Action::EditorClick`]) whose handler needs to
+    /// know where inside the zone the click landed.
+    pub fn hit_zone(&self, col: u16, row: u16) -> Option<&ClickZone> {
+        self.0.iter().rev().find(|z| contains(z.area, col, row))
     }
 }
 
@@ -142,7 +145,7 @@ fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     match &app.active_buffer().kind {
         BufferKind::Dashboard => dashboard::screen(f, app, content, zones),
         BufferKind::Plugins => plugins::screen(f, app, content),
-        BufferKind::File => filebuffer::screen(f, app, content),
+        BufferKind::File => filebuffer::screen(f, app, content, zones),
     }
     if let Some(pane) = qf_pane {
         quickfix::screen(f, app, pane, zones);

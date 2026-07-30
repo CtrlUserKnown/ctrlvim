@@ -1127,6 +1127,63 @@ fn cnext_walks_the_list_and_opens_the_right_file_and_line() {
 }
 
 #[test]
+fn clicking_a_wrapped_continuation_row_lands_on_the_right_column() {
+    let line = "abcdefghij".repeat(30); // 300 chars, wraps several times
+    let mut app = temp_project(&[("f.txt", &format!("{line}\n"))]);
+    app.open_file(0);
+
+    let backend = TestBackend::new(120, 40);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut zones = ui::Zones::default();
+    term.draw(|f| zones = ui::draw(f, &app)).unwrap();
+
+    let zone = zones.0.iter().find(|z| matches!(z.action, Action::EditorClick)).unwrap();
+    let content_w = zone.area.width as usize;
+
+    app.editor_click(3, 1);
+    assert_eq!(app.editor_cursor(), (0, content_w + 3));
+}
+
+#[test]
+fn clicking_a_row_lands_where_that_rows_text_actually_starts_even_with_wide_chars() {
+    // An em dash sits well before the wrap point, so this pins down whether a
+    // char whose on-screen width is ambiguous throws off the click math —
+    // not just whether plain ASCII wraps correctly.
+    let line = "Neovim is incredible — but its C codebase is a mountain of complexity. \
+                ctrlvim reimagines the core from the ground up in memory-safe Rust.";
+    let mut app = temp_project(&[("f.txt", &format!("{line}\n"))]);
+    app.open_file(0);
+
+    let backend = TestBackend::new(120, 40);
+    let mut term = Terminal::new(backend).unwrap();
+    let mut zones = ui::Zones::default();
+    let mut buf = None;
+    term.draw(|f| {
+        zones = ui::draw(f, &app);
+        buf = Some(f.buffer_mut().clone());
+    })
+    .unwrap();
+    let buf = buf.unwrap();
+    let zone = zones.0.iter().find(|z| matches!(z.action, Action::EditorClick)).unwrap();
+
+    // Read row 1's rendered text straight out of the buffer, then click at its
+    // very first cell: the cursor should land on whatever char is actually
+    // drawn there, regardless of how any earlier wide/ambiguous glyph was
+    // measured.
+    let row1_first_char: String = (0..3)
+        .map(|dx| buf[(zone.area.x + dx, zone.area.y + 1)].symbol().to_string())
+        .collect();
+    app.editor_click(0, 1);
+    let (line_no, col) = app.editor_cursor();
+    assert_eq!(line_no, 0);
+    let actual: String = app.editor_lines()[0].chars().skip(col).take(3).collect();
+    assert_eq!(
+        actual, row1_first_char,
+        "clicked column didn't land on the char actually rendered there"
+    );
+}
+
+#[test]
 fn quickfix_rows_are_clickable() {
     let mut app = temp_project(&[("a.rs", "hit one\nhit two\n")]);
     app.open_file(0);

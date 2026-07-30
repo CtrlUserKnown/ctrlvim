@@ -16,3 +16,4 @@ pub mod model;
 pub mod replace;
 pub mod theme;
 pub mod ui;
+pub mod wrap;
