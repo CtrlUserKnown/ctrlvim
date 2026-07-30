@@ -192,23 +192,22 @@ fn handle_finder(app: &mut App, key: KeyEvent) {
 fn handle_replace(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let results = app.replace.as_ref().is_some_and(|p| p.focus == Field::Results);
+    // Grep-only mode (`OpenGrepPrompt`) has no Replace field, so accepting a
+    // match must never rewrite anything — see `ReplacePanel::search_only`.
+    let search_only = app.replace.as_ref().is_some_and(|p| p.search_only);
 
     // Chords that work from every field, so accepting doesn't require a detour
     // through the results list first.
     match key.code {
         KeyCode::Esc => return app.dispatch(Action::CloseReplace),
         KeyCode::Tab => return app.replace_cycle(),
-        KeyCode::BackTab => {
-            // Shift-Tab walks the cycle backwards (twice forward, of three).
-            app.replace_cycle();
-            return app.replace_cycle();
-        }
+        KeyCode::BackTab => return app.replace_cycle_back(),
         KeyCode::Down => return app.replace_move(1),
         KeyCode::Up => return app.replace_move(-1),
         KeyCode::Char('n') if ctrl => return app.replace_move(1),
         KeyCode::Char('p') if ctrl => return app.replace_move(-1),
         KeyCode::Char('i') if ctrl => return app.replace_toggle_case(),
-        KeyCode::Char('a') if ctrl => return app.replace_accept_all(),
+        KeyCode::Char('a') if ctrl && !search_only => return app.replace_accept_all(),
         _ => {}
     }
 
@@ -217,17 +216,18 @@ fn handle_replace(app: &mut App, key: KeyEvent) {
             (KeyCode::Enter, _) => app.replace_jump(),
             (_, Some('j')) => app.replace_move(1),
             (_, Some('k')) => app.replace_move(-1),
-            (KeyCode::Char('y'), _) => app.replace_accept_one(),
-            (KeyCode::Char('Y'), _) => app.replace_accept_all(),
+            (KeyCode::Char('y'), _) if !search_only => app.replace_accept_one(),
+            (KeyCode::Char('Y'), _) if !search_only => app.replace_accept_all(),
             (_, Some('q')) => app.dispatch(Action::CloseReplace),
             _ => {}
         }
         return;
     }
 
-    // A text field: Enter accepts everything (the fields have nothing else to
-    // do with it), and the rest is plain typing.
+    // A text field: Enter jumps to the selected match in grep-only mode
+    // (there is nothing to replace), or accepts every replacement otherwise.
     match key.code {
+        KeyCode::Enter if search_only => app.replace_jump(),
         KeyCode::Enter => app.replace_accept_all(),
         _ if is_kill_to_start(&key) => app.replace_clear_to_start(),
         _ if is_word_backspace(&key) => app.replace_word_backspace(),
@@ -389,6 +389,12 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
         if c == Some('l') { app.dispatch(Action::GitLog); return; }
         if c == Some('d') { app.dispatch(Action::GitDiff); return; }
         if c == Some('F') { app.dispatch(Action::GitFetch); return; }
+        if c == Some('X') { app.dispatch(Action::DiscardSession); return; }
+        // ACTIONS panel rows with no existing binding elsewhere on the
+        // dashboard. `:`/`?` (Command Palette / Help) already work globally —
+        // their rows are discoverability only, same as `n`/`e` above.
+        if c == Some('/') { app.dispatch(Action::OpenGrepPrompt); return; }
+        if c == Some('q') { app.dispatch(Action::RunEx("qa".to_string())); return; }
     }
 
     // Settings: j/k scroll continuously through the EDITOR options and the

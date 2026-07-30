@@ -645,12 +645,24 @@ pub fn pins_path(root: &Path) -> Option<PathBuf> {
 /// [`pins_path`] so the read/write pair can be tested against a temp dir
 /// instead of the developer's real `~/.local/state`.
 fn pins_path_in(state: &Path, root: &Path) -> PathBuf {
-    let key: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-    state.join("ctrlvim").join("pins").join(format!("{key}.txt"))
+    state.join("ctrlvim").join("pins").join(format!("{}.txt", sanitize_path_key(root)))
+}
+
+/// Turn an absolute path into a filesystem-safe key: every non-alphanumeric
+/// byte becomes `_`. Used to derive a per-project (or per-file) state file
+/// name from a path that may contain `/` and other separators.
+pub(crate) fn sanitize_path_key(path: &Path) -> String {
+    path.to_string_lossy().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect()
+}
+
+/// Where a project's restorable editor session lives: the open buffer list
+/// (`index.tsv`) and, for any buffer with unsaved changes, a `recovery/`
+/// snapshot of its live text — so a crash or an accidental window close loses
+/// neither which files were open nor what was typed into them. Keyed by
+/// project root the same way [`pins_path`] is, since "what was open" is as
+/// project-specific as "what's pinned".
+pub fn session_dir(root: &Path) -> Option<PathBuf> {
+    state_dir().map(|s| s.join("ctrlvim").join("sessions").join(sanitize_path_key(root)))
 }
 
 /// Read a project's pinned files. Missing or unreadable is an empty list —

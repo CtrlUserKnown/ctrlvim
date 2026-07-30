@@ -138,6 +138,13 @@
       <div class="l">               <span class="s">separate preview window."</span><span class="op">,</span></div>
       <div class="l">    <span class="op">},</span></div>
       <div class="l"></div>
+      <div class="l">    <span class="t">Feature</span> <span class="op">{</span></div>
+      <div class="l">        name<span class="op">:</span> <span class="s">"Session persistence"</span><span class="op">,</span></div>
+      <div class="l">        note<span class="op">:</span> <span class="s">"Reopens your tabs, cursor and unsaved edits after</span></div>
+      <div class="l">               <span class="s">a crash or close — periodic hot-exit snapshots,</span></div>
+      <div class="l">               <span class="s">no swapfile — plus a dashboard panel to clear it."</span><span class="op">,</span></div>
+      <div class="l">    <span class="op">},</span></div>
+      <div class="l"></div>
       <div class="l"><span class="op">];</span></div>
       <div class="l"></div>
       <div class="l"><span class="c">// Next up: incremental parsing, an inline completion popup,</span></div>
@@ -248,7 +255,44 @@
       <div class="l"></div>
     </section>
 
-    <!-- ══ 5: keymaps.txt ════════════════════════════════════ -->
+    <!-- ══ 5: install.sh ═════════════════════════════════════ -->
+    <section class="buf" data-name="install.sh" data-ft="bash" data-icon="" id="buf-install">
+      <div class="l"><span class="c">#!/usr/bin/env sh</span></div>
+      <div class="l"><span class="c"># The fastest way onto cvi — no cloning by hand, no cargo commands</span></div>
+      <div class="l"><span class="c"># to remember. Installs to ~/.local — no root, ever, on its own say-so.</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="dim">$</span> curl -fsSL <span class="s">https://ctrluserknown.github.io/ctrlvim/install.sh</span> | sh</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## What it actually does</span></div>
+      <div class="l"></div>
+      <div class="l">  1. checks for git, cargo <span class="dim">(rustup.rs)</span> and a C compiler</div>
+      <div class="l">  2. clones ctrlvim into <span class="dim">~/.cache/ctrlvim/src</span> — or updates it, next run</div>
+      <div class="l">  3. runs <span class="key">make install PREFIX=~/.local</span> — the same target below,</div>
+      <div class="l">     nothing bespoke</div>
+      <div class="l">  4. adds <span class="dim">~/.local/bin</span> to your shell's PATH if it isn't there already</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## No prebuilt binaries yet</span></div>
+      <div class="l"></div>
+      <div class="l">There are no GitHub Releases for ctrlvim yet, so this always builds</div>
+      <div class="l">from source — Rust 1.80+ and a C compiler (Lua 5.4 and tree-sitter</div>
+      <div class="l">are vendored). This script is exactly <span class="key">make install</span>, just fetched</div>
+      <div class="l">for you first — no logic of its own to drift out of sync.</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## System-wide instead of ~/.local</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="dim">$</span> sudo sh -c <span class="s">"$(curl -fsSL https://ctrluserknown.github.io/ctrlvim/install.sh)"</span> -- --prefix /usr/local</div>
+      <div class="l"></div>
+      <div class="l"><span class="h2">## Prefer to see it first</span></div>
+      <div class="l"></div>
+      <div class="l"><span class="dim">$</span> git clone <span class="s">https://github.com/CtrlUserKnown/ctrlvim.git</span></div>
+      <div class="l"><span class="dim">$</span> cd ctrlvim &amp;&amp; sudo make install</div>
+      <div class="l"></div>
+      <div class="l"><span class="c">install.sh is a plain, readable POSIX shell script — no bootstrap</span></div>
+      <div class="l"><span class="c">binary, nothing to trust beyond what you can read in under a minute.</span></div>
+      <div class="l"></div>
+    </section>
+
+    <!-- ══ 6: keymaps.txt ════════════════════════════════════ -->
     <section class="buf" data-name="keymaps.txt" data-ft="help" data-icon="" id="buf-keymaps">
       <div class="l"><span class="h1">*ctrlvim-site-keymaps*</span></div>
       <div class="l"></div>
@@ -293,7 +337,7 @@
       <div class="l"></div>
     </section>
 
-    <!-- ══ 6: ai.md ══════════════════════════════════════════ -->
+    <!-- ══ 7: ai.md ══════════════════════════════════════════ -->
     <section class="buf" data-name="ai.md" data-ft="markdown" data-icon="" id="buf-ai">
       <div class="l"><span class="h1"># Inline AI suggestions</span></div>
       <div class="l"></div>
@@ -396,7 +440,7 @@
       <div class="l"></div>
     </section>
 
-    <!-- ══ 7: config.toml ════════════════════════════════════ -->
+    <!-- ══ 8: config.toml ════════════════════════════════════ -->
     <section class="buf" data-name="config.toml" data-ft="toml" data-icon="" id="buf-config">
       <div class="l"><span class="c"># ctrlvim is configured in TOML, not in a config script.</span></div>
       <div class="l"><span class="c">#</span></div>

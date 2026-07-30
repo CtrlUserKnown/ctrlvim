@@ -69,11 +69,14 @@ pub struct Buffer {
     /// Unsaved-changes flag, persisted per buffer across the engine's
     /// single-buffer facade (the engine owns the live value while active).
     pub modified: bool,
+    /// 0-based `(line, col)`, cached the same way `text`/`modified` are so a
+    /// tab remembers where you left it — including across a session restore.
+    pub cursor: (usize, usize),
 }
 
 impl Buffer {
     fn dashboard() -> Self {
-        Buffer { label: "Dashboard".into(), kind: BufferKind::Dashboard, path: None, text: Vec::new(), render_md: false, modified: false }
+        Buffer { label: "Dashboard".into(), kind: BufferKind::Dashboard, path: None, text: Vec::new(), render_md: false, modified: false, cursor: (0, 0) }
     }
     pub fn closable(&self) -> bool {
         !matches!(self.kind, BufferKind::Dashboard)
@@ -219,6 +222,9 @@ pub enum Action {
     GitLog,
     GitDiff,
     GitFetch,
+    /// `[X]` on the SESSIONS panel — wipe this project's saved tab list and
+    /// recovery snapshots (see `App::save_session`). Never touches real files.
+    DiscardSession,
     OpenFile(usize),
     OpenPlugins,
     OpenDashboard,
@@ -266,6 +272,9 @@ pub enum Action {
     CloseSavePrompt,
     /// Dismiss the `:!{cmd}` output overlay.
     CloseShellOutput,
+    /// Seed the command line with `vimgrep /`, leaving it open for the user
+    /// to type a pattern — the ACTIONS panel's "Find in Files" button.
+    OpenGrepPrompt,
 }
 
 pub struct App {
@@ -376,6 +385,10 @@ pub struct App {
     ai_idle_since: Option<Instant>,
 
     pub should_quit: bool,
+    /// When the open-buffer list was last flushed to disk for crash/session
+    /// recovery (see [`App::tick_session_snapshot`]). `None` means never —
+    /// which also means "write on the very first tick" once something is open.
+    session_snapshot_at: Option<Instant>,
 }
 
 /// A `:make`/`:grep` in flight: its output is reassembled into lines, parsed
@@ -485,6 +498,7 @@ impl App {
             ai: None,
             ai_idle_since: None,
             should_quit: false,
+            session_snapshot_at: None,
         }
     }
 
@@ -560,6 +574,7 @@ impl App {
             Action::GitLog => self.git_command("log --oneline --graph --decorate -40"),
             Action::GitDiff => self.git_command("diff HEAD"),
             Action::GitFetch => self.git_command("fetch --all --prune"),
+            Action::DiscardSession => self.discard_session(),
             Action::OpenFile(i) => self.open_file(i),
             Action::OpenPlugins => self.open_plugins(),
             Action::OpenDashboard => self.open_dashboard(),
@@ -616,6 +631,7 @@ impl App {
                 }
             }
             Action::CloseSidebar => self.close_sidebar(),
+            Action::OpenGrepPrompt => self.open_grep(None),
             Action::ToggleHelp => self.help_open = !self.help_open,
             Action::CloseHelp => self.help_open = false,
             Action::ToggleMarkdown => self.toggle_md_render(),
@@ -639,6 +655,7 @@ impl App {
             text: vec![String::new()],
             render_md: false,
             modified: false,
+            cursor: (0, 0),
         });
         self.set_active(self.buffers.len() - 1);
     }
@@ -1085,7 +1102,7 @@ impl App {
             .map(String::from)
             .collect();
         let render_md = is_markdown_name(&name); // live-render markdown by default
-        self.buffers.push(Buffer { label: name, kind: BufferKind::File, path: Some(path), text, render_md, modified: false });
+        self.buffers.push(Buffer { label: name, kind: BufferKind::File, path: Some(path), text, render_md, modified: false, cursor: (0, 0) });
         self.set_active(self.buffers.len() - 1);
     }
 
@@ -1100,7 +1117,7 @@ impl App {
         if let Some(i) = self.buffers.iter().position(|b| b.kind == BufferKind::Plugins) {
             self.set_active(i);
         } else {
-            self.buffers.push(Buffer { label: "Plugin Manager".into(), kind: BufferKind::Plugins, path: None, text: Vec::new(), render_md: false, modified: false });
+            self.buffers.push(Buffer { label: "Plugin Manager".into(), kind: BufferKind::Plugins, path: None, text: Vec::new(), render_md: false, modified: false, cursor: (0, 0) });
             self.set_active(self.buffers.len() - 1);
         }
     }
@@ -1144,17 +1161,21 @@ impl App {
         if matches!(self.active_buffer().kind, BufferKind::File) {
             self.buffers[self.active].text = self.engine.lines();
             self.buffers[self.active].modified = self.engine.is_modified();
+            self.buffers[self.active].cursor = self.editor_cursor();
         }
     }
 
     /// Load the active file buffer's cached text into the engine, restoring its
-    /// per-buffer dirty state (the engine's single buffer would otherwise reset).
+    /// per-buffer dirty state (the engine's single buffer would otherwise reset)
+    /// and cursor position (the engine's own `open` always starts at the top).
     fn load_active_into_engine(&mut self) {
         if matches!(self.active_buffer().kind, BufferKind::File) {
             let text = self.buffers[self.active].text.join("\n");
             let label = self.buffers[self.active].label.clone();
             self.engine.open(&text, Some(&label));
             self.engine.set_modified(self.buffers[self.active].modified);
+            let (line, col) = self.buffers[self.active].cursor;
+            self.engine.session.set_cursor_clamped(line, col);
         }
     }
 
@@ -2001,6 +2022,162 @@ impl App {
         true
     }
 
+    /// How often [`Self::tick_session_snapshot`] flushes open buffers to disk:
+    /// frequent enough that a crash loses at most a few seconds of typing,
+    /// infrequent enough that it's not a per-keystroke cost.
+    const SESSION_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Reopen the buffers a previous session in this project left open —
+    /// including any unsaved edits, recovered from the last flush rather than
+    /// the (older) content on disk — and restore the active tab and cursor.
+    /// Silently a no-op with no prior session, an unreadable one, or a buffer
+    /// whose file moved or was deleted since.
+    pub fn restore_session(&mut self) {
+        let Some(dir) = crate::data::session_dir(&self.root) else { return };
+        let Ok(index) = std::fs::read_to_string(dir.join("index.tsv")) else { return };
+        let mut active_idx = None;
+        for line in index.lines() {
+            let f: Vec<&str> = line.splitn(5, '\t').collect();
+            let [path, line_no, col, modified, active] = f[..] else { continue };
+            let path = PathBuf::from(path);
+            let already_open = self.buffers.iter().any(|b| b.path.as_deref() == Some(path.as_path()));
+            if !path.is_file() || already_open {
+                continue;
+            }
+            let mut text: Vec<String> =
+                std::fs::read_to_string(&path).unwrap_or_default().lines().map(String::from).collect();
+            let mut is_modified = false;
+            if modified == "1" {
+                let key = crate::data::sanitize_path_key(&path);
+                if let Ok(body) = std::fs::read_to_string(dir.join("recovery").join(format!("{key}.txt"))) {
+                    text = body.lines().map(String::from).collect();
+                    is_modified = true;
+                }
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let render_md = is_markdown_name(&name);
+            let cursor = (line_no.parse().unwrap_or(0), col.parse().unwrap_or(0));
+            self.buffers.push(Buffer {
+                label: name,
+                kind: BufferKind::File,
+                path: Some(path),
+                text,
+                render_md,
+                modified: is_modified,
+                cursor,
+            });
+            if active == "1" {
+                active_idx = Some(self.buffers.len() - 1);
+            }
+        }
+        // Direct assignment, not `set_active`: every buffer above is freshly
+        // pushed (nothing to snapshot away from), and `load_active_into_engine`
+        // below already applies the restored text, dirty flag, and cursor.
+        if let Some(idx) = active_idx {
+            self.active = idx;
+            self.load_active_into_engine();
+        }
+    }
+
+    /// Write the current session unconditionally. Called once on quit — from
+    /// the main loop, after it exits, so every path that sets `should_quit`
+    /// (`:q`, `:qa`, `:qa!`, Ctrl+C) is covered by one call site rather than
+    /// needing to remember to flush at each of them.
+    pub fn save_session(&mut self) {
+        self.write_session_state();
+    }
+
+    /// `[X]` on the SESSIONS panel — wipe this project's saved tab list and
+    /// recovery snapshots, so the next launch starts clean instead of
+    /// restoring what's on disk right now. Only ever touches ctrlvim's own
+    /// state directory; the project's real files are untouched. If editing
+    /// continues in this run, the next periodic snapshot writes fresh state
+    /// again for whatever is still open — this clears what's saved *now*, it
+    /// doesn't turn saving off.
+    fn discard_session(&mut self) {
+        match crate::data::session_dir(&self.root) {
+            Some(dir) if dir.exists() => {
+                let _ = std::fs::remove_dir_all(&dir);
+                self.message = "session state cleared".into();
+            }
+            _ => self.message = "no saved session state for this project".into(),
+        }
+    }
+
+    /// Whether any open file buffer has unsaved changes — the SESSIONS panel
+    /// uses this to flag that there's live recovery data worth keeping (or
+    /// clearing with `[X]`).
+    pub fn has_unsaved(&self) -> bool {
+        self.buffers
+            .iter()
+            .enumerate()
+            .any(|(i, b)| b.kind == BufferKind::File && if i == self.active { self.active_modified() } else { b.modified })
+    }
+
+    /// Periodic hot-exit flush, throttled to [`Self::SESSION_SNAPSHOT_INTERVAL`]
+    /// so a `kill -9` or power loss loses at most a few seconds of typing,
+    /// without hitting the filesystem on every poll tick. Call from the main
+    /// loop alongside `poll_jobs`/`poll_ai`.
+    pub fn tick_session_snapshot(&mut self) {
+        let due = self.session_snapshot_at.is_none_or(|t| t.elapsed() >= Self::SESSION_SNAPSHOT_INTERVAL);
+        if due {
+            self.write_session_state();
+            self.session_snapshot_at = Some(Instant::now());
+        }
+    }
+
+    /// Persist the open-buffer list (path, cursor, dirty flag, which tab is
+    /// active) plus, for every dirty buffer, a `recovery/` snapshot of its
+    /// live text — shared by [`Self::save_session`] and
+    /// [`Self::tick_session_snapshot`]. Best-effort throughout: losing session
+    /// state is not worth refusing to quit or interrupting editing over.
+    fn write_session_state(&mut self) {
+        self.snapshot_active();
+        let Some(dir) = crate::data::session_dir(&self.root) else { return };
+        let recovery_dir = dir.join("recovery");
+        let _ = std::fs::create_dir_all(&recovery_dir);
+
+        let mut index = String::new();
+        let mut keep = std::collections::HashSet::new();
+        for (i, b) in self.buffers.iter().enumerate() {
+            if b.kind != BufferKind::File {
+                continue;
+            }
+            let Some(path) = &b.path else { continue };
+            let key = crate::data::sanitize_path_key(path);
+            if b.modified {
+                let mut body = b.text.join("\n");
+                body.push('\n');
+                let _ = std::fs::write(recovery_dir.join(format!("{key}.txt")), body);
+                keep.insert(key);
+            } else {
+                let _ = std::fs::remove_file(recovery_dir.join(format!("{key}.txt")));
+            }
+            index.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                path.display(),
+                b.cursor.0,
+                b.cursor.1,
+                b.modified as u8,
+                (i == self.active) as u8,
+            ));
+        }
+        let _ = std::fs::write(dir.join("index.tsv"), index);
+
+        // Drop recovery snapshots for buffers that were closed or saved since
+        // the last flush — otherwise a later restore would "recover" edits
+        // that were already saved, or resurrect a tab that was deliberately
+        // closed.
+        if let Ok(entries) = std::fs::read_dir(&recovery_dir) {
+            for entry in entries.flatten() {
+                let stem = entry.path().file_stem().map(|s| s.to_string_lossy().into_owned());
+                if stem.is_some_and(|s| !keep.contains(&s)) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     /// Store a freshly-built list on the engine and report what came back.
     fn finish_quickfix(&mut self, items: Vec<QfItem>, title: String) {
         let n = items.len();
@@ -2763,6 +2940,14 @@ impl App {
         self.replace_search();
     }
 
+    /// Open the panel in grep-only mode (`OpenGrepPrompt` — the dashboard's
+    /// "Find in Files" button): no Replace field, and accepting a result
+    /// opens it rather than rewriting the project.
+    pub fn open_grep(&mut self, pattern: Option<String>) {
+        self.replace = Some(ReplacePanel::new_grep(pattern));
+        self.replace_search();
+    }
+
     /// Re-run the project search for the panel's current pattern.
     ///
     /// This is synchronous, like `:vimgrep` — the walk is bounded by
@@ -2866,7 +3051,14 @@ impl App {
     /// `<Tab>` — move focus Find → Replace → Results → Find.
     pub fn replace_cycle(&mut self) {
         if let Some(p) = &mut self.replace {
-            p.focus = p.focus.next();
+            p.cycle_focus();
+        }
+    }
+
+    /// `<S-Tab>` — move focus back one step.
+    pub fn replace_cycle_back(&mut self) {
+        if let Some(p) = &mut self.replace {
+            p.cycle_focus_back();
         }
     }
 
@@ -2900,6 +3092,9 @@ impl App {
     /// matches the line holds.
     pub fn replace_accept_one(&mut self) {
         let Some(panel) = &self.replace else { return };
+        if panel.search_only {
+            return;
+        }
         let Some(Ok(plan)) = panel.plan() else { return };
         let Some(hit) = panel.current() else { return };
         let (rel, line, col) = (hit.path.clone(), hit.line, hit.col);
@@ -2933,6 +3128,9 @@ impl App {
     /// `Y` — replace every occurrence in every matched file.
     pub fn replace_accept_all(&mut self) {
         let Some(panel) = &self.replace else { return };
+        if panel.search_only {
+            return;
+        }
         let Some(Ok(plan)) = panel.plan() else { return };
         if panel.hits.is_empty() {
             self.message = "no matches to replace".into();

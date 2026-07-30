@@ -153,6 +153,13 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
     // Apply config.toml (options, mappings, plugins) and fire `VimEnter` before
     // the first frame, so startup state is what the user configured.
     app.apply_config();
+    // Reattach to whatever this project had open last time — but only when no
+    // file was named explicitly. `cvi some/file.rs` is a deliberate ask for
+    // that one file, the way `vim some/file.rs` is, not a request to also
+    // resurrect an unrelated stale window.
+    if launch.files.is_empty() {
+        app.restore_session();
+    }
     // Files open after the config so options, mappings and the Lua host are all
     // in place before `BufEnter` fires for them.
     for path in &launch.files {
@@ -185,11 +192,13 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
             app.poll_jobs();
             app.poll_ai();
             app.tick_keymap_timeout();
+            app.tick_session_snapshot();
             continue;
         }
         app.poll_jobs();
         app.poll_ai();
         app.tick_keymap_timeout();
+        app.tick_session_snapshot();
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 input::handle_key(&mut app, key);
@@ -211,6 +220,10 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
             _ => {}
         }
     }
+    // Covers every path that sets `should_quit` (`:q`, `:qa`, `:qa!`,
+    // Ctrl+C) with one flush, so quitting is never worse for recovery than
+    // the periodic snapshot already taken during the session.
+    app.save_session();
     Ok(())
 }
 

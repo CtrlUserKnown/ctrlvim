@@ -75,14 +75,28 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         })
         .split(rows[0]);
 
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(3)])
-        .split(cols[0]);
+    // Grep-only mode drops the Replace box entirely — there is nothing to
+    // replace — and hands the freed row to the results list.
+    let (find_area, replace_area, results_area) = if panel.search_only {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3)])
+            .split(cols[0]);
+        (rows[0], None, rows[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(3), Constraint::Min(3)])
+            .split(cols[0]);
+        (rows[0], Some(rows[1]), rows[2])
+    };
 
-    input_box(f, panel, left[0], Field::Find, " 󰍉 Find ", &panel.find, zones);
-    input_box(f, panel, left[1], Field::Replace, " 󰛔 Replace ", &panel.replace, zones);
-    results(f, panel, left[2], zones);
+    let find_title = if panel.search_only { " 󰍉 Grep " } else { " 󰍉 Find " };
+    input_box(f, panel, find_area, Field::Find, find_title, &panel.find, zones);
+    if let Some(area) = replace_area {
+        input_box(f, panel, area, Field::Replace, " 󰛔 Replace ", &panel.replace, zones);
+    }
+    results(f, panel, results_area, zones);
     if show_preview {
         preview(f, app, panel, cols[1]);
     }
@@ -362,7 +376,21 @@ fn preview(f: &mut Frame, app: &App, panel: &ReplacePanel, area: Rect) {
             format!("{:>w$} ", n + 1, w = gutter),
             Style::default().fg(theme::fg_dim()),
         );
-        if n == hit.line {
+        if n == hit.line && panel.search_only {
+            // A plain match: highlight the line itself, no before/after diff
+            // — there is nothing for it to become.
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    num.clone(),
+                    Span::styled("▸ ", Style::default().fg(theme::orange())),
+                    Span::styled(
+                        h_window(&hit.text, offset, text_w),
+                        Style::default().fg(theme::orange()).add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                Rect { x: inner.x, y, width: inner.width, height: 1 },
+            );
+        } else if n == hit.line {
             // The match line, as a two-row diff.
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -404,24 +432,32 @@ fn preview(f: &mut Frame, app: &App, panel: &ReplacePanel, area: Rect) {
 
 /// The one-row key hint bar, which names what the *focused* field's keys do.
 fn hints(f: &mut Frame, panel: &ReplacePanel, area: Rect) {
-    let keys: &[(&str, &str)] = match panel.focus {
-        Field::Results => &[
-            ("j/k", "move"),
-            ("y", "replace one"),
-            ("Y", "replace all"),
-            ("⏎", "open"),
-            ("⇥", "field"),
-            ("^i", "case"),
-            ("esc", "close"),
-        ],
-        _ => &[
-            ("⇥", "next field"),
-            ("⏎", "replace all"),
-            ("^a", "replace all"),
-            ("^i", "case"),
-            ("↑↓", "matches"),
-            ("esc", "close"),
-        ],
+    let keys: &[(&str, &str)] = if panel.search_only {
+        if panel.focus == Field::Results {
+            &[("j/k", "move"), ("⏎", "open"), ("⇥", "field"), ("^i", "case"), ("esc", "close")]
+        } else {
+            &[("⇥", "next field"), ("⏎", "open"), ("↑↓", "matches"), ("^i", "case"), ("esc", "close")]
+        }
+    } else {
+        match panel.focus {
+            Field::Results => &[
+                ("j/k", "move"),
+                ("y", "replace one"),
+                ("Y", "replace all"),
+                ("⏎", "open"),
+                ("⇥", "field"),
+                ("^i", "case"),
+                ("esc", "close"),
+            ],
+            _ => &[
+                ("⇥", "next field"),
+                ("⏎", "replace all"),
+                ("^a", "replace all"),
+                ("^i", "case"),
+                ("↑↓", "matches"),
+                ("esc", "close"),
+            ],
+        }
     };
     let mut spans = Vec::new();
     for (key, what) in keys {

@@ -100,17 +100,23 @@ fn columns_layout(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         .spacing(2)
         .split(area);
 
-    // Left column: quick ACTIONS over the (tall) RECENT FILES list.
+    // Left column: quick ACTIONS, then RECENT FILES sized to its (at most 8)
+    // rows rather than stretching to fill the column — a tall terminal used
+    // to leave it mostly blank space instead of handing that room to
+    // anything else.
+    let recent_h = app.project.recent_files.len().max(1) as u16 + 2;
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(3)])
+        .constraints([Constraint::Length(8), Constraint::Length(recent_h), Constraint::Min(0)])
         .spacing(1)
         .split(cols[0]);
     actions_panel(f, left[0], zones);
     let inner = titled_panel(f, left[1], "RECENT FILES", theme::blue());
     recent_files_rows(f, app, inner, zones, true);
 
-    // Right: SESSIONS over STATS.
+    // Right: SESSIONS, GIT STATUS, then STATS — also sized to its (fixed)
+    // three rows instead of a `Min` that let it swallow the rest of the
+    // column.
     let sessions = &app.project.sessions;
     let git_h = git_panel_height(app);
     let right = Layout::default()
@@ -118,25 +124,13 @@ fn columns_layout(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         .constraints([
             Constraint::Length(sessions.len().max(1) as u16 * 2 + 3),
             Constraint::Length(git_h),
-            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Min(0),
         ])
         .spacing(1)
         .split(cols[1]);
 
-    let s_inner = titled_panel(f, right[0], "SESSIONS", theme::green());
-    let mut s_lines: Vec<Line> = Vec::new();
-    for s in sessions {
-        s_lines.push(Line::from(vec![
-            Span::styled(s.name.clone(), Style::default().fg(theme::fg())),
-            Span::raw("  "),
-            Span::styled(s.last.clone(), Style::default().fg(theme::fg_dim())),
-        ]));
-        s_lines.push(Line::from(Span::styled(
-            format!("⌸ {} · {} files", s.branch, s.files),
-            Style::default().fg(theme::fg_dim()),
-        )));
-    }
-    f.render_widget(Paragraph::new(s_lines).style(Style::default().bg(theme::bg_dark())), s_inner);
+    sessions_rows(f, app, right[0], zones);
 
     // GIT STATUS panel ([g] expands it with remote / last commit / untracked).
     let g_inner = titled_panel(f, right[1], "[g] GIT STATUS", theme::purple());
@@ -158,14 +152,69 @@ fn columns_layout(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     f.render_widget(Paragraph::new(stats).style(Style::default().bg(theme::bg_dark())), st_inner);
 }
 
+/// The SESSIONS panel: one two-line row per recent project. The row for the
+/// project currently open (`SessionEntry::last == "this session"`) carries a
+/// right-aligned `[X]` badge — `App::discard_session` — that wipes its saved
+/// tab list and unsaved-edit recovery snapshots, plus a `+` marker when there
+/// are unsaved changes worth either keeping or clearing.
+fn sessions_rows(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
+    let inner = titled_panel(f, area, "SESSIONS", theme::green());
+    for (i, s) in app.project.sessions.iter().enumerate() {
+        let y = inner.y + i as u16 * 2;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let is_current = s.last == "this session";
+
+        let mut spans = vec![
+            Span::styled(s.name.clone(), Style::default().fg(theme::fg())),
+            Span::raw("  "),
+            Span::styled(s.last.clone(), Style::default().fg(theme::fg_dim())),
+        ];
+        if is_current && app.has_unsaved() {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("+", Style::default().fg(theme::orange())));
+        }
+        let row1 = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        if is_current {
+            let badge = hint_badge('X');
+            let used: u16 = spans.iter().map(|s| s.width() as u16).sum();
+            let bw = badge.width() as u16;
+            if inner.width > used + bw {
+                spans.push(Span::styled(" ".repeat((inner.width - used - bw) as usize), Style::default().bg(theme::bg_dark())));
+            }
+            let bx = inner.x + inner.width.saturating_sub(bw);
+            spans.push(badge);
+            zones.push(Rect { x: bx, y, width: bw.min(inner.width), height: 1 }, Action::DiscardSession);
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(theme::bg_dark())), row1);
+
+        if y + 1 < inner.y + inner.height {
+            let row2 = Rect { x: inner.x, y: y + 1, width: inner.width, height: 1 };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("⌸ {} · {} files", s.branch, s.files),
+                    Style::default().fg(theme::fg_dim()),
+                )))
+                .style(Style::default().bg(theme::bg_dark())),
+                row2,
+            );
+        }
+    }
+}
+
 /// The quick-ACTIONS pane: clickable **New File** and **Find Files** rows, each
 /// with its keyboard shortcut — the dashboard home for these actions instead of
 /// tucking them into the status-line hints.
 fn actions_panel(f: &mut Frame, area: Rect, zones: &mut Zones) {
     let inner = titled_panel(f, area, "ACTIONS", theme::cyan());
-    let rows: [(char, ratatui::style::Color, &str, char, Action); 2] = [
+    let rows: [(char, ratatui::style::Color, &str, char, Action); 6] = [
         ('N', theme::green(), "New File", 'n', Action::NewFile),
         ('F', theme::blue(), "Find Files", 'e', Action::OpenFinder),
+        ('G', theme::orange(), "Find in Files", '/', Action::OpenGrepPrompt),
+        ('P', theme::purple(), "Command Palette", ':', Action::OpenPalette),
+        ('H', theme::cyan(), "Help", '?', Action::ToggleHelp),
+        ('Q', theme::fg_dim(), "Quit", 'q', Action::RunEx("qa".to_string())),
     ];
     for (i, (letter, color, label, key, action)) in rows.into_iter().enumerate() {
         if i as u16 >= inner.height {

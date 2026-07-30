@@ -60,6 +60,10 @@ pub struct ReplacePanel {
     pub truncated: bool,
     /// Distinct files the hits fall in, for the counts line.
     pub files: usize,
+    /// True for the grep entry point (`OpenGrepPrompt`): no Replace field,
+    /// and accepting a result opens it instead of rewriting the project. See
+    /// `ui/replace.rs` and `input.rs`'s `handle_replace`.
+    pub search_only: bool,
 }
 
 impl ReplacePanel {
@@ -76,7 +80,15 @@ impl ReplacePanel {
             ignorecase: false,
             truncated: false,
             files: 0,
+            search_only: false,
         }
+    }
+
+    /// Open in grep-only mode — the dashboard's "Find in Files" button.
+    pub fn new_grep(pattern: Option<String>) -> ReplacePanel {
+        let mut p = ReplacePanel::new(pattern);
+        p.search_only = true;
+        p
     }
 
     /// The compiled plan for the current fields, or the reason there isn't one.
@@ -147,6 +159,28 @@ impl ReplacePanel {
         }
         let last = self.hits.len() - 1;
         self.selected = (self.selected as i32 + dir).clamp(0, last as i32) as usize;
+    }
+
+    /// The next field in the focus cycle, skipping Replace in grep-only mode
+    /// where it isn't shown.
+    fn next_focus(&self) -> Field {
+        let n = self.focus.next();
+        if self.search_only && n == Field::Replace { n.next() } else { n }
+    }
+
+    /// `<Tab>` — advance focus one step.
+    pub fn cycle_focus(&mut self) {
+        self.focus = self.next_focus();
+    }
+
+    /// `<S-Tab>` — move focus back one step. Backward is forward twice around
+    /// the full three-field cycle; in grep-only mode's two-field cycle,
+    /// forward and backward are the same single step.
+    pub fn cycle_focus_back(&mut self) {
+        self.cycle_focus();
+        if !self.search_only {
+            self.cycle_focus();
+        }
     }
 
     /// The highlighted hit, if any.

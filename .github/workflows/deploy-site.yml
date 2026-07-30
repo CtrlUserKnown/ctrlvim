@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'site/**'
+      - 'install.sh'
       - '.github/workflows/deploy-site.yml'
   workflow_dispatch:
 
@@ -27,6 +28,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/configure-pages@v5
+
+      # Mirror the canonical root install.sh into the published site, so both
+      # raw.githubusercontent.com/.../install.sh and <pages>/install.sh work,
+      # and the "install" buffer's one-liner on the site is never stale
+      # relative to what's actually at the repo root.
+      - name: Stage root files
+        run: cp install.sh site/
 
       - uses: actions/upload-pages-artifact@v3
         with:

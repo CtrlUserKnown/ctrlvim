@@ -1826,6 +1826,49 @@ fn typing_in_find_re_searches_but_typing_in_replace_does_not() {
     assert_eq!(panel.hits[0].preview, "let gadget = 1;");
 }
 
+// --- grep-only mode (`OpenGrepPrompt`) -------------------------------------
+
+#[test]
+fn grep_only_mode_has_no_replace_field() {
+    let mut app = replace_project();
+    app.open_grep(Some("widget".into()));
+    let panel = app.replace.as_ref().unwrap();
+    assert!(panel.search_only);
+    assert_eq!(hit_locs(&app), vec!["alpha.rs:0", "alpha.rs:2", "beta.rs:0"]);
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["Grep", "Matches", "widget", "alpha.rs"]);
+    assert!(!out.contains("Replace"), "grep mode must not show a Replace field:\n{out}");
+}
+
+#[test]
+fn grep_only_mode_enter_jumps_instead_of_rewriting_the_project() {
+    let mut app = replace_project();
+    let alpha = app.root.join("alpha.rs");
+    let before = std::fs::read_to_string(&alpha).unwrap();
+    app.open_grep(Some("widget".into())); // focus starts on Find
+    press(&mut app, KeyCode::Enter);
+    // Jumped: the panel closed and the match's file is open, unmodified.
+    assert!(app.replace.is_none(), "Enter should close the panel by jumping");
+    assert_eq!(app.active_buffer().path.as_deref(), Some(alpha.as_path()));
+    assert_eq!(std::fs::read_to_string(&alpha).unwrap(), before, "grep must never rewrite files");
+}
+
+#[test]
+fn grep_only_mode_disables_the_replace_shortcuts() {
+    use ctrlvim::replace::Field;
+    let mut app = replace_project();
+    let alpha = app.root.join("alpha.rs");
+    let before = std::fs::read_to_string(&alpha).unwrap();
+    app.open_grep(Some("widget".into()));
+    press(&mut app, KeyCode::Tab); // → Results (Replace is skipped)
+    assert_eq!(app.replace.as_ref().unwrap().focus, Field::Results);
+    key(&mut app, 'y');
+    key(&mut app, 'Y');
+    input::handle_key(&mut app, KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(std::fs::read_to_string(&alpha).unwrap(), before, "y/Y/^a must be no-ops in grep mode");
+    assert!(app.replace.is_some(), "the panel should still be open");
+}
+
 #[test]
 fn accepting_one_occurrence_edits_only_that_match() {
     let mut app = replace_project();

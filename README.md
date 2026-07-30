@@ -75,7 +75,18 @@ cargo test --workspace         # run all tests
 ```
 
 Or install it. Building needs Rust 1.80+ and a C compiler (Lua 5.4 and
-tree-sitter are vendored; on macOS that means `xcode-select --install`):
+tree-sitter are vendored; on macOS that means `xcode-select --install`) —
+there are no prebuilt release binaries yet, so every path below builds from
+source:
+
+```sh
+curl -fsSL https://ctrluserknown.github.io/ctrlvim/install.sh | sh
+```
+
+Installs to `~/.local` — no root needed. It's a plain POSIX shell script that
+clones the repo (or updates an existing clone) and runs `make install` for
+you; read it before piping it to `sh` if you'd rather see exactly what it
+does first. Or skip the installer and drive the Makefile yourself:
 
 ```sh
 sudo make install                 # /usr/local/bin/cvi
