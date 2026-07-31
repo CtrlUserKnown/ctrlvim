@@ -1314,6 +1314,28 @@ impl App {
         self.engine.session.editor.options().wrap()
     }
 
+    /// `'cursorline'` — whether to tint the line the cursor is on.
+    pub fn cursorline_enabled(&self) -> bool {
+        self.engine.session.editor.options().cursorline()
+    }
+
+    /// The cursor shape `'guicursor'` asks for in the current mode. Drives the
+    /// real terminal cursor; see `main.rs`'s `apply_cursor_style`.
+    pub fn cursor_style(&self) -> ctrlvim_core::CursorStyle {
+        self.engine
+            .session
+            .editor
+            .options()
+            .cursor_style(self.editor_mode())
+    }
+
+    /// `'scrolloff'` — rows to keep between the cursor and the window edge.
+    /// Negative values aren't meaningful here (Vim only uses them for the
+    /// `'scrolloff'`-as-percentage extension, which this doesn't implement).
+    pub fn scrolloff(&self) -> usize {
+        self.engine.session.editor.options().scrolloff().max(0) as usize
+    }
+
     /// This frame's resolved viewport: which buffer rows are on screen and,
     /// under `'nowrap'`, how far scrolled sideways. `content_w`/`height` come
     /// from the renderer, which is the only place that knows them.
@@ -1330,6 +1352,7 @@ impl App {
             cur_col,
             self.view_top,
             self.view_left,
+            self.scrolloff(),
         )
     }
 
@@ -2165,6 +2188,44 @@ impl App {
             self.timers = Some(timers);
         }
         self.jobs.as_mut()
+    }
+
+    /// Take delivery of the project data gathered in the background, so the
+    /// dashboard's panels fill themselves in a moment after startup instead of
+    /// holding up the first frame. See [`crate::data::Project::load`].
+    pub fn poll_project(&mut self) -> bool {
+        if !self.project.poll() {
+            return false;
+        }
+        self.after_project_loaded();
+        true
+    }
+
+    /// Record how long startup actually took, called once the app is built and
+    /// the first frame is about to draw.
+    ///
+    /// The dashboard's `startup` stat used to be stamped part-way through
+    /// `Project::load`, which both missed the config/session work that came
+    /// after it and — now that gathering is off-thread — would read as a
+    /// meaningless 0ms. Time-to-first-frame is the number a user is actually
+    /// judging when they say the editor felt slow to open.
+    pub fn mark_first_frame(&mut self, start: Instant) {
+        self.project.stats.startup_ms = start.elapsed().as_millis();
+    }
+
+    /// Block until the project data is in. See [`crate::data::Project::wait`].
+    pub fn wait_for_project(&mut self) {
+        self.project.wait();
+        self.after_project_loaded();
+    }
+
+    /// Re-derive the state that shadows `project`'s own fields.
+    fn after_project_loaded(&mut self) {
+        // `lsp_enabled` is indexed in lockstep with `project.lsp` (the settings
+        // rows read `lsp_enabled[i]` while iterating it), so the two have to be
+        // resized together or that indexing panics the moment the real list
+        // arrives over the empty placeholder.
+        self.lsp_enabled = self.project.lsp.iter().map(|s| s.installed).collect();
     }
 
     /// Drain background job output. Called from the main loop's poll tick so a

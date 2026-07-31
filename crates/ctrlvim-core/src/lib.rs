@@ -10,6 +10,7 @@
 pub mod syntax;
 
 pub use ctrlvim_api::ApiContext;
+pub use ctrlvim_options::{CursorShape, CursorStyle};
 pub use ctrlvim_treesitter::{HlKind, HlSpan};
 pub use ctrlvim_async::{Event, EventLoop, Jobs, LineBuffer, TimerService};
 pub use ctrlvim_editor::{

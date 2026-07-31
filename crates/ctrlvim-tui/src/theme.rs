@@ -243,6 +243,19 @@ pub fn set_by_name(name: &str) -> bool {
     }
 }
 
+/// A foreground that stays readable on top of any accent-colored background —
+/// the cursor block, an icon chip, a selected badge.
+///
+/// `theme::bg()` looks like the natural choice for inverse video, and is
+/// wrong: under the default Terminal theme it is [`Color::Reset`], which the
+/// terminal resolves to its *default foreground* — usually light. The glyph
+/// then dissolves into the accent instead of punching out of it, which is
+/// exactly how the cursor became invisible. Accents are always opaque and
+/// bright, so black reads against all of them regardless of theme.
+pub fn on_accent() -> Color {
+    Color::Black
+}
+
 // Field accessors — the render code reads colors through these so switching the
 // active theme reflows the whole UI without threading a `&Theme` everywhere.
 pub fn bg() -> Color {

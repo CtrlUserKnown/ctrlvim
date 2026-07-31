@@ -2891,6 +2891,10 @@ impl Session {
                     // The window's live fold state tracks the resolved value.
                     self.folds_mut().enabled = v;
                 }
+                SetItem::Cursorline(op) => {
+                    let v = op.apply(self.editor.options().cursorline());
+                    self.set_window_opt(scope, v, |g| &mut g.cursorline, |w| &mut w.cursorline);
+                }
                 // Buffer-local booleans.
                 SetItem::Expandtab(op) => {
                     let v = op.apply(self.editor.options().expandtab());
@@ -2952,6 +2956,9 @@ impl Session {
                 SetItem::Foldmethod(m) => {
                     self.set_window_opt(scope, m, |g| &mut g.foldmethod, |w| &mut w.foldmethod);
                 }
+                // Global-only, as in Vim — the cursor is a property of the
+                // terminal, not of whichever split currently has focus.
+                SetItem::Guicursor(spec) => self.editor.global_options.guicursor = spec,
                 SetItem::Unknown(name) => {
                     self.effects.push(ExEffect::Message(format!(
                         "E518: Unknown option: {name}"

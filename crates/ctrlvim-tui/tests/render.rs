@@ -31,6 +31,10 @@ fn temp_project(files: &[(&str, &str)]) -> App {
         fs::write(dir.join(name), content).unwrap();
     }
     let mut app = App::with_root(dir, Instant::now());
+    // Project data is gathered on a worker thread so it can't stall startup;
+    // these tests act on `recent_files` straight away, so block for it here
+    // rather than racing the worker.
+    app.wait_for_project();
     // `App::with_root` loads the *developer's* `~/.config/ctrlvim/config.toml`,
     // which would make these tests depend on whoever runs them — a machine with
     // `drawer = true` renders a different screen. Pin the defaults instead.
@@ -213,6 +217,7 @@ fn expand_git_reveals_more_when_repo() {
     // Uses the crate's own directory (inside a git repo) so git data exists.
     let root = std::env::current_dir().unwrap();
     let mut app = App::with_root(root, Instant::now());
+    app.wait_for_project();
     if app.project.git.is_none() {
         return; // not run inside a repo; nothing to assert
     }
@@ -246,7 +251,9 @@ fn conflicted_project() -> App {
     // Expected to fail — this is the conflict under test.
     let _ = Command::new("git").arg("-C").arg(&dir).args(["merge", "other"]).output();
     // Re-read now that the directory is a repo.
-    App::with_root(dir, Instant::now())
+    let mut app = App::with_root(dir, Instant::now());
+    app.wait_for_project();
+    app
 }
 
 #[test]
@@ -2520,4 +2527,111 @@ fn reloading_picks_up_every_ai_knob_not_just_the_repo() {
     // The context window lives in the engine, so it has to be pushed across.
     assert_eq!(app.engine.session.suggest.context.before, 5);
     let _ = fs::remove_file(&path);
+}
+
+// --- cursor + viewport options ---------------------------------------------
+
+/// The rendered line numbers of the file-buffer rows, in order — which is what
+/// says where the viewport actually sits.
+fn visible_line_numbers(app: &App) -> Vec<usize> {
+    render(app, 60, 14)
+        .lines()
+        .filter_map(|row| {
+            let t = row.trim_start();
+            let num: String = t.chars().take_while(char::is_ascii_digit).collect();
+            (!num.is_empty() && t[num.len()..].starts_with("  line")).then(|| num.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn scrolloff_keeps_the_cursor_away_from_the_window_edge() {
+    let mut app = long_file();
+    app.run_ex_command("set scrolloff=0");
+    for _ in 0..20 {
+        key(&mut app, 'j');
+    }
+    let flush = visible_line_numbers(&app);
+    assert_eq!(*flush.last().unwrap(), 21, "cursor sits on the last row: {flush:?}");
+
+    // The same position with a margin has to show more lines below the cursor.
+    app.run_ex_command("set scrolloff=4");
+    let padded = visible_line_numbers(&app);
+    assert_eq!(*padded.last().unwrap(), 25, "four rows below the cursor: {padded:?}");
+}
+
+#[test]
+fn scrolloff_is_given_up_rather_than_scrolling_past_the_last_line() {
+    let mut app = long_file();
+    app.run_ex_command("set scrolloff=5");
+    for _ in 0..45 {
+        key(&mut app, 'j'); // past the end; clamps to line 40
+    }
+    let rows = visible_line_numbers(&app);
+    assert_eq!(*rows.last().unwrap(), 40, "stops at the last line: {rows:?}");
+}
+
+/// The screen row a piece of rendered text landed on.
+fn row_of(buf: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+    for y in 0..buf.area.height {
+        let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        if row.contains(needle) {
+            return y;
+        }
+    }
+    panic!("{needle:?} never rendered");
+}
+
+#[test]
+fn cursorline_tints_the_cursor_line_and_nocursorline_stops() {
+    let mut app = long_file();
+    // Compare a column past the end of the text, where nothing but the line
+    // tint can account for a difference. Rows are located by content: the
+    // buffer does not start at screen row 0 (there is a tab bar above it).
+    let x = 40;
+    app.run_ex_command("set nocursorline");
+    let plain = render_cells(&app, 60, 14);
+    let (cur, other) = (row_of(&plain, "line 01"), row_of(&plain, "line 03"));
+    assert_eq!(
+        plain[(x, cur)].style().bg,
+        plain[(x, other)].style().bg,
+        "without 'cursorline' every line shares a background"
+    );
+
+    app.run_ex_command("set cursorline");
+    let lit = render_cells(&app, 60, 14);
+    assert_ne!(
+        lit[(x, cur)].style().bg,
+        lit[(x, other)].style().bg,
+        "'cursorline' tints the cursor's line"
+    );
+}
+
+#[test]
+fn the_cursor_block_stays_readable_whatever_the_theme() {
+    use ratatui::style::Color;
+    // The Terminal theme's `bg` is `Color::Reset`. Drawing the cursor's glyph
+    // in it renders as the terminal's *default foreground*, so the cursor
+    // dissolves into its own highlight instead of punching out of it. This is
+    // a regression guard for exactly that, and it deliberately does not name a
+    // theme: `theme::set_by_name` is process-global and these tests run in
+    // parallel, so asserting against whichever theme is active is the only
+    // stable thing to do.
+    let mut app = long_file();
+    key(&mut app, 'l'); // off column 0, so the cursor sits on a letter
+    let buf = render_cells(&app, 60, 14);
+    let y = row_of(&buf, "line 01");
+    // The cursor is the one cell on that row drawn with an inverted-looking
+    // background — every other cell shares the buffer background.
+    let text_bg = buf[(58, y)].style().bg;
+    let cursor = (0..buf.area.width)
+        .map(|x| buf[(x, y)].clone())
+        .find(|c| c.style().bg != text_bg)
+        .expect("a block cursor is drawn on the cursor's line");
+    assert_ne!(
+        cursor.style().fg,
+        Some(Color::Reset),
+        "the cursor glyph must not be drawn in Color::Reset"
+    );
+    assert_eq!(cursor.style().fg, Some(ctrlvim::theme::on_accent()));
 }

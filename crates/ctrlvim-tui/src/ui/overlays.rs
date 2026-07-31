@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use ctrlvim_core::MapMode;
+use ctrlvim_core::{display_width, MapMode};
 
 use crate::app::{Action, App};
 use crate::theme;
@@ -68,6 +68,12 @@ pub fn explorer(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         Line::from(Span::styled("/ to search", Style::default().fg(theme::fg_dim())))
     };
     line_at!(y, search_line);
+    // While `/` has focus the drawer owns the real cursor, so it tracks the
+    // text being typed rather than staying behind on the file.
+    if app.drawer_search && y < bottom {
+        let right = x + text_w.saturating_sub(1);
+        f.set_cursor_position(((x + 1 + display_width(&app.drawer_query) as u16).min(right), y));
+    }
     y += 2;
 
     // Project root (the real cwd directory name).
@@ -170,6 +176,14 @@ pub fn palette(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         ])).style(Style::default().bg(theme::bg_dark())),
         Rect { x: inner.x + 1, y: inner.y, width: inner.width.saturating_sub(2), height: 1 },
     );
+    // The palette draws after the body, so claiming the real cursor here is
+    // what moves it off the file and onto the command line. It sits on the
+    // `▏` bar, one cell past the `:` prompt and the typed text.
+    let right = inner.x + inner.width.saturating_sub(1);
+    f.set_cursor_position((
+        (inner.x + 2 + display_width(&app.palette_query) as u16).min(right),
+        inner.y,
+    ));
     // Divider.
     if inner.height > 1 {
         f.render_widget(

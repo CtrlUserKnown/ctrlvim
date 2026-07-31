@@ -124,8 +124,10 @@ pub struct Stats {
     pub startup_ms: u128,
     pub plugins_loaded: usize,
     pub plugins_total: usize,
-    /// Lines of code, already thousands-grouped for display.
-    pub loc: String,
+    /// Lines of code, already thousands-grouped for display. `None` until the
+    /// background count finishes — counting means reading every source file in
+    /// the project, which is far too slow to block the first frame on.
+    pub loc: Option<String>,
 }
 
 /// A file's icon chip: a Nerd Font glyph plus the single-letter fallback shown

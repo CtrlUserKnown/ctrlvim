@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::app::{Action, App};
 use crate::replace::{Field, ReplacePanel};
-use ctrlvim_core::ReplaceHit;
+use ctrlvim_core::{display_width, ReplaceHit};
 use crate::theme;
 
 use super::{centered, row_style, selection_bar, Zones};
@@ -159,6 +159,13 @@ fn input_box(
         spans.push(Span::styled("▏", Style::default().fg(accent)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
+    // …and so does the real terminal cursor. The glyph prefix is three cells
+    // wide (` 󰍉 ` / ` 󰛔 `), and an empty field shows a hint the cursor sits in
+    // front of rather than after.
+    if focused {
+        let right = inner.x + inner.width.saturating_sub(1);
+        f.set_cursor_position(((inner.x + 3 + display_width(value) as u16).min(right), inner.y));
+    }
 
     // Right-aligned status on each prompt, the way the browser shows `11 / 11`:
     // the live 'ignorecase' state on Find, the match count on Replace.

@@ -57,6 +57,24 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// Whether the editor's own cursor is the one the terminal should show.
+///
+/// Exactly one surface may place the real cursor per frame, and overlays draw
+/// after the body — so an overlay that takes typing just sets it again and
+/// wins. The editor has to opt *out* instead, because a modal that takes no
+/// text (help, the save prompt, `:!` output) would otherwise leave a cursor
+/// blinking on the file behind it. When nobody claims it, ratatui hides it,
+/// which is the right answer for those modals.
+fn editor_owns_cursor(app: &App) -> bool {
+    !app.palette_open
+        && !app.help_open
+        && !app.shell_open
+        && !app.drawer_search
+        && app.save_prompt.is_none()
+        && app.finder.is_none()
+        && app.replace.is_none()
+}
+
 /// Draw the whole UI and return the frame's click zones.
 pub fn draw(f: &mut Frame, app: &App) -> Zones {
     let mut zones = Zones::default();
@@ -75,7 +93,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
         .split(area);
 
     shell::tab_bar(f, app, rows[0], &mut zones);
-    body(f, app, rows[1], &mut zones);
+    body(f, app, rows[1], &mut zones, editor_owns_cursor(app));
     shell::status_line(f, app, rows[2]);
 
     // Overlays, drawn last (and registered last, so they win hit-testing).
@@ -109,7 +127,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
 }
 
 /// The padded content region between the tab bar and status line.
-fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
+fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_cursor: bool) {
     // Padding to echo the prototype's generous 32px content padding.
     let inner = Rect {
         x: area.x + 2,
@@ -145,7 +163,7 @@ fn body(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     match &app.active_buffer().kind {
         BufferKind::Dashboard => dashboard::screen(f, app, content, zones),
         BufferKind::Plugins => plugins::screen(f, app, content),
-        BufferKind::File => filebuffer::screen(f, app, content, zones),
+        BufferKind::File => filebuffer::screen(f, app, content, zones, owns_cursor),
     }
     if let Some(pane) = qf_pane {
         quickfix::screen(f, app, pane, zones);
@@ -188,15 +206,12 @@ pub fn titled_panel_with_right(
 
 /// The colored two-letter file icon chip (` R `), bg = file color.
 ///
-/// The letter is always drawn in black: the chip's `bg(color)` is always an
-/// opaque, bright accent, so black gives reliable contrast regardless of
-/// theme — unlike `theme::bg_dark()`, which is `Color::Reset` under the
-/// Terminal theme and renders as the terminal's (often light) default
-/// foreground instead of a dark one.
+/// The letter is drawn in [`theme::on_accent`], which documents why a chip
+/// can't use `theme::bg_dark()` for this.
 pub fn icon_chip(letter: char, color: Color) -> Span<'static> {
     Span::styled(
         format!(" {letter} "),
-        Style::default().fg(Color::Black).bg(color),
+        Style::default().fg(theme::on_accent()).bg(color),
     )
 }
 

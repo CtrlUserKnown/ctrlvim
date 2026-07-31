@@ -16,6 +16,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use ctrlvim_core::display_width;
+
 use crate::app::{Action, App};
 use crate::theme;
 
@@ -132,6 +134,13 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             Span::styled("▏", Style::default().fg(theme::fg())),
         ]);
         f.render_widget(Paragraph::new(prompt), pinner);
+        // The finder takes typing, so it claims the real cursor. ` 🔍 ` is an
+        // emoji: two cells wide plus its two spaces, hence the 4-cell offset.
+        let right_edge = pinner.x + pinner.width.saturating_sub(1);
+        f.set_cursor_position((
+            (pinner.x + 4 + display_width(&finder.query) as u16).min(right_edge),
+            pinner.y,
+        ));
         // Right side: for a `:`-command, what Enter will do; when a typed name
         // matches nothing, a hint that Enter creates that file; otherwise the
         // match count.

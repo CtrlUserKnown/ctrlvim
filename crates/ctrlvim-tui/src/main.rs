@@ -15,6 +15,7 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
     MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -173,12 +174,19 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
         let abs = first.canonicalize().unwrap_or_else(|_| first.clone());
         app.open_path(abs, buffer_name(first));
     }
+    // Everything that has to happen before the first frame has now happened.
+    app.mark_first_frame(start);
     let mut zones = Zones::default();
+    // Last cursor shape written to the terminal. `'guicursor'` is per-mode, so
+    // this changes on every `i`/`Esc`; re-emitting the escape only when it
+    // actually differs keeps a keystroke from writing one every frame.
+    let mut cursor_style = None;
 
     while !app.should_quit {
         terminal.draw(|f| {
             zones = ui::draw(f, &app);
         })?;
+        apply_cursor_style(terminal.backend_mut(), app.cursor_style(), &mut cursor_style);
 
         // Block for the next event (with a poll so resize repaints promptly).
         // The timeout is also where background job output and finished AI
@@ -189,6 +197,7 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
         // ...and where a half-typed mapping's `'timeoutlen'` runs out, which
         // is what lets `<leader>q` and `<leader>qq` coexist.
         if !event::poll(app.poll_interval())? {
+            app.poll_project();
             app.poll_jobs();
             app.poll_lua();
             app.poll_ai();
@@ -196,6 +205,7 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
             app.tick_session_snapshot();
             continue;
         }
+        app.poll_project();
         app.poll_jobs();
         app.poll_lua();
         app.poll_ai();
@@ -244,6 +254,34 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
     Ok(())
 }
 
+/// Push the shape `'guicursor'` asks for to the terminal, if it changed.
+///
+/// A terminal cursor can only be one of six shapes (DECSCUSR), so the `ver25`
+/// / `hor20` percentages Vim allows collapse onto bar and underline — the
+/// width is not expressible and is dropped. A terminal that doesn't implement
+/// DECSCUSR ignores the sequence and keeps its own shape, which is why this
+/// never checks whether it worked.
+fn apply_cursor_style(
+    out: &mut impl io::Write,
+    want: ctrlvim_core::CursorStyle,
+    last: &mut Option<ctrlvim_core::CursorStyle>,
+) {
+    use ctrlvim_core::CursorShape;
+    if *last == Some(want) {
+        return;
+    }
+    *last = Some(want);
+    let style = match (want.shape, want.blink) {
+        (CursorShape::Block, false) => SetCursorStyle::SteadyBlock,
+        (CursorShape::Block, true) => SetCursorStyle::BlinkingBlock,
+        (CursorShape::Vertical, false) => SetCursorStyle::SteadyBar,
+        (CursorShape::Vertical, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Horizontal, false) => SetCursorStyle::SteadyUnderScore,
+        (CursorShape::Horizontal, true) => SetCursorStyle::BlinkingUnderScore,
+    };
+    let _ = execute!(out, style);
+}
+
 fn setup_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -276,7 +314,14 @@ fn disable_key_disambiguation(out: &mut impl io::Write) {
 fn restore_terminal(terminal: &mut Term) -> io::Result<()> {
     disable_raw_mode()?;
     disable_key_disambiguation(terminal.backend_mut());
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        // Hand the shell back its own cursor: quitting from insert mode would
+        // otherwise leave a bar behind in whatever ran `cvi`.
+        SetCursorStyle::DefaultUserShape,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -288,7 +333,12 @@ fn install_panic_hook() {
         let mut stdout = io::stdout();
         let _ = disable_raw_mode();
         disable_key_disambiguation(&mut stdout);
-        let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            stdout,
+            SetCursorStyle::DefaultUserShape,
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
         original(info);
     }));
 }

@@ -225,6 +225,7 @@ pub(crate) enum SetItem {
     Splitbelow(BoolOp),
     Splitright(BoolOp),
     Foldenable(BoolOp),
+    Cursorline(BoolOp),
     Tabstop(i64),
     Shiftwidth(i64),
     Scrolloff(i64),
@@ -232,6 +233,8 @@ pub(crate) enum SetItem {
     Timeoutlen(i64),
     Foldmethod(ctrlvim_options::FoldMethod),
     Foldcolumn(i64),
+    /// `'guicursor'`, kept as the raw spec string (see `resolve_guicursor`).
+    Guicursor(String),
     /// An unrecognized option name, reported as an error.
     Unknown(String),
 }
@@ -509,6 +512,10 @@ fn parse_set(arg: &str) -> Vec<SetItem> {
             if let Some((name, value)) = tok.split_once('=') {
                 let n: i64 = value.parse().unwrap_or(0);
                 return match name {
+                    // A string option, so it takes `value` whole. Splitting
+                    // `parse_set` on whitespace is what keeps a spec like
+                    // `a:block,i:ver25` in one token.
+                    "guicursor" | "gcr" => SetItem::Guicursor(value.to_string()),
                     "tabstop" | "ts" => SetItem::Tabstop(n),
                     "shiftwidth" | "sw" => SetItem::Shiftwidth(n),
                     "scrolloff" | "so" => SetItem::Scrolloff(n),
@@ -546,6 +553,7 @@ fn parse_set(arg: &str) -> Vec<SetItem> {
                 "splitbelow" | "sb" => SetItem::Splitbelow(op),
                 "splitright" | "spr" => SetItem::Splitright(op),
                 "foldenable" | "fen" => SetItem::Foldenable(op),
+                "cursorline" | "cul" => SetItem::Cursorline(op),
                 other => SetItem::Unknown(other.to_string()),
             }
         })

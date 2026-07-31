@@ -147,7 +147,13 @@ fn columns_layout(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     let stats = vec![
         stat("startup", format!("{}ms", stats_data.startup_ms), theme::green()),
         stat("plugins", format!("{}/{}", stats_data.plugins_loaded, stats_data.plugins_total), theme::cyan()),
-        stat("loc", stats_data.loc.clone(), theme::purple()),
+        // `…` while the background count is still running — a real number
+        // needs every source file read, which does not block startup.
+        stat(
+            "loc",
+            stats_data.loc.clone().unwrap_or_else(|| "…".to_string()),
+            theme::purple(),
+        ),
     ];
     f.render_widget(Paragraph::new(stats).style(Style::default().bg(theme::bg_dark())), st_inner);
 }

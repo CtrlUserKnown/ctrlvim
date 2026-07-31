@@ -120,6 +120,11 @@ impl Viewport {
 /// scroll-offsets the mouse wheel moves (in rows / cells); both get clamped
 /// here against the cursor so keyboard movement scrolls the view without the
 /// app having to track it — the same trick the old vertical-only code used.
+///
+/// `scrolloff` is Vim's `'scrolloff'`: how many rows to keep between the
+/// cursor and the top/bottom edge. It is measured in *screen* rows, not buffer
+/// lines, so a wrapped line's segments each count — which is what Vim does
+/// too.
 #[allow(clippy::too_many_arguments)]
 pub fn compute(
     lines: &[String],
@@ -131,11 +136,26 @@ pub fn compute(
     cursor_col: usize,
     view_top: usize,
     view_left: usize,
+    scrolloff: usize,
 ) -> Viewport {
     let rows = visual_rows(lines, folds, content_w, wrap, lines.len());
     let height = height.max(1);
     let cur_row = row_of(&rows, cursor_line, cursor_col);
-    let top_row = view_top.clamp(cur_row.saturating_sub(height - 1), cur_row);
+    // A margin wider than half the window can't be honored on both sides at
+    // once, so Vim shrinks it to fit — the same clamp the engine's
+    // `Window::scroll_to_cursor` applies.
+    let so = scrolloff.min(height.saturating_sub(1) / 2);
+    // The window of legal `top_row` values. `hi` keeps `so` rows above the
+    // cursor, `lo` keeps `so` below it. `lo` additionally refuses to scroll
+    // past the last row: near the end of the buffer Vim lets the margin
+    // shrink rather than reveal blank space below the text.
+    let hi = cur_row.saturating_sub(so);
+    let max_top = rows.len().saturating_sub(height);
+    // `.min(hi)` keeps the range non-empty for `clamp`, which panics if its
+    // bounds cross — they can't here (`so <= (height-1)/2` guarantees it), but
+    // the renderer is the wrong place to find out we were wrong about that.
+    let lo = (cur_row + so).saturating_sub(height - 1).min(max_top).min(hi);
+    let top_row = view_top.clamp(lo, hi);
 
     let left_cells = if wrap {
         0
@@ -201,14 +221,67 @@ mod tests {
     #[test]
     fn compute_scrolls_left_to_keep_cursor_visible() {
         let lines = vec!["0123456789".to_string()];
-        let vp = compute(&lines, &folds(), false, 4, 10, 0, 9, 0, 0);
+        let vp = compute(&lines, &folds(), false, 4, 10, 0, 9, 0, 0, 0);
         assert_eq!(vp.left_cells, 6); // cursor at cell 9, width 4 -> left = 9-3
     }
 
     #[test]
     fn compute_no_horizontal_scroll_when_wrapped() {
         let lines = vec!["0123456789".to_string()];
-        let vp = compute(&lines, &folds(), true, 4, 10, 0, 9, 0, 0);
+        let vp = compute(&lines, &folds(), true, 4, 10, 0, 9, 0, 0, 0);
         assert_eq!(vp.left_cells, 0);
+    }
+
+    /// 40 single-char lines, so screen rows and buffer lines are 1:1.
+    fn numbered(n: usize) -> Vec<String> {
+        (0..n).map(|i| i.to_string()).collect()
+    }
+
+    #[test]
+    fn scrolloff_keeps_a_margin_below_the_cursor() {
+        let lines = numbered(40);
+        // Cursor on line 12, 10-row window, margin 3: the cursor may sit no
+        // lower than row 6 of the window, so the view starts at 12+3-9 = 6.
+        let vp = compute(&lines, &folds(), false, 20, 10, 12, 0, 0, 0, 3);
+        assert_eq!(vp.top_row, 6);
+        // Without the margin the cursor is allowed onto the last row.
+        let vp = compute(&lines, &folds(), false, 20, 10, 12, 0, 0, 0, 0);
+        assert_eq!(vp.top_row, 3);
+    }
+
+    #[test]
+    fn scrolloff_keeps_a_margin_above_the_cursor() {
+        let lines = numbered(40);
+        // Scrolled to row 20 by the wheel, cursor at line 22, margin 3: the
+        // view has to back off to 19 so three rows stay above the cursor.
+        let vp = compute(&lines, &folds(), false, 20, 10, 22, 0, 20, 0, 3);
+        assert_eq!(vp.top_row, 19);
+    }
+
+    #[test]
+    fn scrolloff_is_not_honored_at_the_top_of_the_buffer() {
+        let lines = numbered(40);
+        // There is nothing above line 1 to show, so the margin just shrinks
+        // rather than scrolling to a negative row.
+        let vp = compute(&lines, &folds(), false, 20, 10, 1, 0, 0, 0, 8);
+        assert_eq!(vp.top_row, 0);
+    }
+
+    #[test]
+    fn scrolloff_never_scrolls_past_the_last_row() {
+        let lines = numbered(20);
+        // Cursor on the final line with a big margin: Vim shows the last row
+        // at the bottom of the window instead of scrolling into blank space.
+        let vp = compute(&lines, &folds(), false, 20, 10, 19, 0, 0, 0, 5);
+        assert_eq!(vp.top_row, 10); // 20 rows - 10 high
+    }
+
+    #[test]
+    fn scrolloff_larger_than_half_the_window_is_clamped_to_fit() {
+        let lines = numbered(40);
+        // Margin 99 in a 9-row window can't hold on both sides; it becomes 4,
+        // which centers the cursor. Crucially this must not panic.
+        let vp = compute(&lines, &folds(), false, 20, 9, 20, 0, 0, 0, 99);
+        assert_eq!(vp.top_row, 16);
     }
 }

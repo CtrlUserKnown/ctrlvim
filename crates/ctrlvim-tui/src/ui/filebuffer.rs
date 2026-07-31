@@ -26,7 +26,7 @@ use crate::theme;
 use crate::ui::Zones;
 use crate::wrap;
 
-pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
+pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_cursor: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -58,6 +58,7 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
 
     // Cursor color tracks the mode: green in insert, blue otherwise.
     let cursor_color = if app.editor_mode() == "i" { theme::green() } else { theme::blue() };
+    let cursorline = app.cursorline_enabled();
 
     // The inline AI suggestion, if the model has one for this cursor.
     let ghost = app.suggestion();
@@ -170,6 +171,18 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
 
         let right = area.x + area.width;
 
+        // `'cursorline'`: tint the cursor's whole buffer line, gutter included,
+        // the way Vim does. It goes on before the selection, search and cursor
+        // paints below so those still read on top of it. A wrapped line gets
+        // every one of its rows — `'cursorline'` follows the buffer line, not
+        // the screen row.
+        if cursorline && i == cur_line {
+            f.buffer_mut().set_style(
+                Rect { x: area.x, y, width: area.width, height: 1 },
+                Style::default().bg(theme::bg_highlight()),
+            );
+        }
+
         // Visual-mode selection: paint the selection background over the
         // already-rendered cells so the user can see what they're highlighting.
         // set_style repaints the background without touching the glyphs, so
@@ -188,7 +201,9 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             if let Some((lo, hi)) = clip_range(lo, hi, raw_seg_start, raw_seg_end) {
                 paint_range(
                     f, raw, lo, hi, raw_base_cells, text_x, right, y,
-                    Style::default().fg(theme::bg()).bg(theme::search()),
+                    // `on_accent`, not `bg()`: a search match has the same
+                    // dissolve-into-the-highlight problem the cursor had.
+                    Style::default().fg(theme::on_accent()).bg(theme::search()),
                 );
             }
         }
@@ -232,10 +247,20 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
                 f.render_widget(
                     Paragraph::new(Span::styled(
                         ch.to_string(),
-                        Style::default().fg(theme::bg()).bg(cursor_color),
+                        Style::default().fg(theme::on_accent()).bg(cursor_color),
                     )),
                     Rect { x: cx, y, width: w, height: 1 },
                 );
+                // Put the *real* terminal cursor on the same cell. The painted
+                // block carries the mode color, which a hardware cursor can't;
+                // the hardware cursor carries the `'guicursor'` shape and is
+                // what terminals, screen readers and IME popups actually track.
+                // Overlaying both is deliberate: it is the one arrangement
+                // where the cursor stays visible no matter how the terminal
+                // draws (or hides) its own.
+                if owns_cursor {
+                    f.set_cursor_position((cx, y));
+                }
             }
         }
     }

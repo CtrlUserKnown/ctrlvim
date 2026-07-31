@@ -39,6 +39,90 @@ impl FoldMethod {
     }
 }
 
+/// The shape a terminal cursor takes, as named by `'guicursor'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// `block` — fills the cell.
+    #[default]
+    Block,
+    /// `ver{N}` — a vertical bar down the left of the cell.
+    Vertical,
+    /// `hor{N}` — a horizontal bar along the bottom of the cell.
+    Horizontal,
+}
+
+/// A resolved `'guicursor'` entry: how the cursor should look in one mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    /// The `N` in `ver25`/`hor20`: percent of the cell the bar covers, and
+    /// always 100 for a block. A terminal cursor can't actually be sized, so
+    /// nothing renders this yet — it is parsed and kept because dropping it
+    /// would make `:set guicursor?` echo back something the user never typed.
+    pub percent: u8,
+    /// Whether the spec asked for blinking (`blinkon`/`blinkoff` both
+    /// non-zero). Vim's default spec asks for no blinking at all.
+    pub blink: bool,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self {
+        CursorStyle { shape: CursorShape::Block, percent: 100, blink: false }
+    }
+}
+
+/// Neovim's own `'guicursor'` default.
+pub const DEFAULT_GUICURSOR: &str = "n-v-c-sm:block,i-ci-ve:ver25,r-cr-o:hor20";
+
+/// Resolve `'guicursor'` for one mode.
+///
+/// `mode` is a [`Mode::short_name`](../ctrlvim_editor/mode/enum.Mode.html)-style
+/// short name; the visual variants (`V`, CTRL-V) are folded onto `v` since
+/// `'guicursor'` has no separate entries for them.
+///
+/// Entries are applied in order so a later one wins, which is what lets the
+/// idiomatic `:set guicursor=a:block,i:ver25` work: `a:` seeds every mode and
+/// the specific entry then overrides it. Unparseable arguments — including the
+/// highlight-group names Vim allows here, which have no meaning for a terminal
+/// cursor — are skipped rather than failing the whole spec.
+pub fn resolve_guicursor(spec: &str, mode: &str) -> CursorStyle {
+    let mode = match mode {
+        "V" | "\u{16}" => "v",
+        m => m,
+    };
+    let mut style = CursorStyle::default();
+    // Blink is only on when a spec asks for it *and* neither phase is zero;
+    // tracked separately because the two args can arrive in either order.
+    let (mut blink_on, mut blink_off) = (None::<u32>, None::<u32>);
+    for entry in spec.split(',') {
+        let Some((modes, args)) = entry.split_once(':') else { continue };
+        if !modes.split('-').any(|m| m == "a" || m == mode) {
+            continue;
+        }
+        for arg in args.split('-') {
+            if arg == "block" {
+                style.shape = CursorShape::Block;
+                style.percent = 100;
+            } else if let Some(n) = arg.strip_prefix("ver").and_then(|n| n.parse().ok()) {
+                style.shape = CursorShape::Vertical;
+                style.percent = n;
+            } else if let Some(n) = arg.strip_prefix("hor").and_then(|n| n.parse().ok()) {
+                style.shape = CursorShape::Horizontal;
+                style.percent = n;
+            } else if let Some(n) = arg.strip_prefix("blinkon").and_then(|n| n.parse().ok()) {
+                blink_on = Some(n);
+            } else if let Some(n) = arg.strip_prefix("blinkoff").and_then(|n| n.parse().ok()) {
+                blink_off = Some(n);
+            }
+            // `blinkwait` and highlight-group names are accepted and ignored.
+        }
+    }
+    style.blink = matches!((blink_on, blink_off), (Some(on), Some(off)) if on > 0 && off > 0)
+        || matches!((blink_on, blink_off), (Some(on), None) if on > 0)
+        || matches!((blink_on, blink_off), (None, Some(off)) if off > 0);
+    style
+}
+
 /// Global option values (the fallback layer).
 #[derive(Debug, Clone)]
 pub struct GlobalOptions {
@@ -49,6 +133,12 @@ pub struct GlobalOptions {
     pub relativenumber: bool,
     pub wrap: bool,
     pub scrolloff: i64,
+    /// Highlight the line the cursor is on (`'cursorline'`).
+    pub cursorline: bool,
+    /// Per-mode cursor shape (`'guicursor'`). Stored as the raw spec string so
+    /// `:set guicursor?` round-trips; parsed on demand by
+    /// [`resolve_guicursor`].
+    pub guicursor: String,
     pub iskeyword: String,
     pub foldenable: bool,
     pub foldmethod: FoldMethod,
@@ -79,6 +169,8 @@ impl Default for GlobalOptions {
             relativenumber: false,
             wrap: true,
             scrolloff: 0,
+            cursorline: false,
+            guicursor: DEFAULT_GUICURSOR.to_string(),
             iskeyword: "@,48-57,_,192-255".to_string(),
             foldenable: true,
             foldmethod: FoldMethod::Manual,
@@ -115,6 +207,7 @@ pub struct WindowOptions {
     pub relativenumber: Option<bool>,
     pub wrap: Option<bool>,
     pub scrolloff: Option<i64>,
+    pub cursorline: Option<bool>,
     pub foldenable: Option<bool>,
     pub foldmethod: Option<FoldMethod>,
     pub foldcolumn: Option<i64>,
@@ -187,6 +280,17 @@ impl OptionContext<'_> {
     pub fn scrolloff(&self) -> i64 {
         self.window.scrolloff.unwrap_or(self.global.scrolloff)
     }
+    pub fn cursorline(&self) -> bool {
+        self.window.cursorline.unwrap_or(self.global.cursorline)
+    }
+    /// The raw `'guicursor'` spec. Global-only, as in Vim.
+    pub fn guicursor(&self) -> &str {
+        &self.global.guicursor
+    }
+    /// The cursor style `'guicursor'` asks for in `mode`.
+    pub fn cursor_style(&self, mode: &str) -> CursorStyle {
+        resolve_guicursor(&self.global.guicursor, mode)
+    }
     pub fn foldenable(&self) -> bool {
         self.window.foldenable.unwrap_or(self.global.foldenable)
     }
@@ -201,6 +305,74 @@ impl OptionContext<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_guicursor_matches_neovims_modes() {
+        let g = |m| resolve_guicursor(DEFAULT_GUICURSOR, m);
+        // n-v-c-sm:block
+        assert_eq!(g("n").shape, CursorShape::Block);
+        assert_eq!(g("v").shape, CursorShape::Block);
+        assert_eq!(g("c").shape, CursorShape::Block);
+        // i-ci-ve:ver25
+        assert_eq!(g("i").shape, CursorShape::Vertical);
+        assert_eq!(g("i").percent, 25);
+        // r-cr-o:hor20
+        assert_eq!(g("r").shape, CursorShape::Horizontal);
+        assert_eq!(g("r").percent, 20);
+        // Nothing in the default spec asks to blink.
+        assert!(!g("n").blink);
+    }
+
+    #[test]
+    fn visual_line_and_block_share_the_visual_entry() {
+        // `'guicursor'` has no `V` or CTRL-V entry, so both fold onto `v`.
+        let spec = "n:block,v:ver25";
+        assert_eq!(resolve_guicursor(spec, "V").shape, CursorShape::Vertical);
+        assert_eq!(resolve_guicursor(spec, "\u{16}").shape, CursorShape::Vertical);
+    }
+
+    #[test]
+    fn a_seeds_every_mode_and_a_later_entry_overrides_it() {
+        let spec = "a:block,i:ver25";
+        assert_eq!(resolve_guicursor(spec, "n").shape, CursorShape::Block);
+        assert_eq!(resolve_guicursor(spec, "i").shape, CursorShape::Vertical);
+    }
+
+    #[test]
+    fn blink_needs_a_nonzero_phase() {
+        assert!(resolve_guicursor("n:block-blinkon500-blinkoff500", "n").blink);
+        // Vim's documented way to switch blinking off is a zero phase.
+        assert!(!resolve_guicursor("n:block-blinkon0-blinkoff0", "n").blink);
+        assert!(!resolve_guicursor("n:block-blinkwait700", "n").blink);
+    }
+
+    #[test]
+    fn unknown_arguments_are_skipped_not_fatal() {
+        // `Cursor`/`lCursor` are highlight groups — legal in Vim, meaningless
+        // for a terminal cursor. The shape in the same entry must still apply.
+        let s = resolve_guicursor("n-v-c:block-Cursor/lCursor,i:ver25-lCursor", "i");
+        assert_eq!(s.shape, CursorShape::Vertical);
+        assert_eq!(s.percent, 25);
+        // A malformed entry with no colon is ignored rather than poisoning it.
+        assert_eq!(resolve_guicursor("garbage,i:ver25", "i").shape, CursorShape::Vertical);
+    }
+
+    #[test]
+    fn a_mode_the_spec_never_mentions_falls_back_to_a_block() {
+        assert_eq!(resolve_guicursor("i:ver25", "n"), CursorStyle::default());
+    }
+
+    #[test]
+    fn cursorline_is_window_local_over_global() {
+        let mut g = GlobalOptions::default();
+        let b = BufferOptions::default();
+        let mut w = WindowOptions::default();
+        assert!(!OptionContext { global: &g, buffer: &b, window: &w }.cursorline());
+        g.cursorline = true;
+        assert!(OptionContext { global: &g, buffer: &b, window: &w }.cursorline());
+        w.cursorline = Some(false);
+        assert!(!OptionContext { global: &g, buffer: &b, window: &w }.cursorline());
+    }
 
     #[test]
     fn buffer_local_overrides_global() {

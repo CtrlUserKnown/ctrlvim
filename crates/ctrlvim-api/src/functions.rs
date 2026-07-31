@@ -372,12 +372,14 @@ fn ctrlvim_get_option_value(cx: &mut ApiContext, name: String) -> Result<Object>
         "splitbelow" | "sb" => Object::Boolean(o.splitbelow()),
         "splitright" | "spr" => Object::Boolean(o.splitright()),
         "foldenable" | "fen" => Object::Boolean(o.foldenable()),
+        "cursorline" | "cul" => Object::Boolean(o.cursorline()),
         "tabstop" | "ts" => Object::Integer(o.tabstop()),
         "shiftwidth" | "sw" => Object::Integer(o.shiftwidth()),
         "scrolloff" | "so" => Object::Integer(o.scrolloff()),
         "foldcolumn" | "fdc" => Object::Integer(o.foldcolumn()),
         "foldmethod" | "fdm" => Object::str(o.foldmethod().as_str().to_string()),
         "iskeyword" | "isk" => Object::str(o.iskeyword().to_string()),
+        "guicursor" | "gcr" => Object::str(o.guicursor().to_string()),
         _ => return Err(Error::validation(format!("E518: Unknown option: {name}"))),
     })
 }

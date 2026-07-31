@@ -12,6 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
 use crate::model::{
@@ -28,27 +29,128 @@ pub struct Project {
     pub plugins: Vec<Plugin>,
     pub lsp: Vec<LspServer>,
     pub stats: Stats,
+    /// Delivers the gathered project exactly once, then is dropped. `None`
+    /// means the data has already arrived (or the worker died) and there is
+    /// nothing left to wait for.
+    rx: Option<mpsc::Receiver<Gathered>>,
+}
+
+/// Everything [`gather`] digs up about a project, produced off-thread.
+struct Gathered {
+    recent_files: Vec<FileEntry>,
+    git: Option<GitStatus>,
+    sessions: Vec<SessionEntry>,
+    plugins: Vec<Plugin>,
+    lsp: Vec<LspServer>,
+    loc: usize,
+}
+
+/// Walk the project and collect the dashboard's data. Every part of this
+/// touches the disk — a full recursive walk, a `stat` per file, three `git`
+/// subprocesses, and a read of every source file — which is why it runs on a
+/// worker rather than in front of the first frame.
+fn gather(root: &Path) -> Gathered {
+    let scanned = scan_files(root);
+    let git = load_git(root);
+    let sessions = load_sessions(root, git.as_ref(), scanned.len());
+    Gathered {
+        recent_files: recent_files(&scanned),
+        loc: count_loc(root, &scanned),
+        git,
+        sessions,
+        plugins: load_plugins(),
+        lsp: detect_lsp(),
+    }
 }
 
 impl Project {
-    /// Gather everything for `root`. `start` is the process start instant, used
-    /// to report a real startup time.
+    /// Start gathering everything for `root`. `start` is the process start
+    /// instant, seeding the `startup` stat that
+    /// [`App::mark_first_frame`](crate::app::App::mark_first_frame) then
+    /// finalizes once the app is actually ready to draw.
+    ///
+    /// None of this blocks: [`gather`] runs on a worker thread and the project
+    /// comes back empty, to be filled in by [`Project::poll`] a moment later.
+    ///
+    /// Gathering is disk-bound and unboundedly so — it reads every source file
+    /// in the tree. Measured cold on a 629 MB checkout it took 19 seconds, and
+    /// every one of those was spent before the first frame could draw, which
+    /// is what made `cvi` look like it had hung on launch. Nothing on screen
+    /// needs this data to exist in order to render: the panels are all lists,
+    /// and an empty list is a state they already had to handle for a project
+    /// with no files, no git, and no plugins.
     pub fn load(root: PathBuf, start: Instant) -> Self {
-        let scanned = scan_files(&root);
-        let recent_files = recent_files(&scanned);
-        let loc = count_loc(&root, &scanned);
-        let git = load_git(&root);
-        let plugins = load_plugins();
-        let lsp = detect_lsp();
-        let sessions = load_sessions(&root, git.as_ref(), scanned.len());
-        let plugins_loaded = plugins.iter().filter(|p| p.status == PluginStatus::Loaded).count();
-        let stats = Stats {
-            startup_ms: start.elapsed().as_millis(),
-            plugins_loaded,
-            plugins_total: plugins.len(),
-            loc: group_thousands(loc),
-        };
-        Project { root, recent_files, git, sessions, plugins, lsp, stats }
+        let (tx, rx) = mpsc::channel();
+        let dir = root.clone();
+        // Detached: there is exactly one message, nobody joins, and quitting
+        // early just makes the send fail against a dropped receiver.
+        std::thread::spawn(move || {
+            let _ = tx.send(gather(&dir));
+        });
+        Project {
+            root,
+            recent_files: Vec::new(),
+            git: None,
+            sessions: Vec::new(),
+            plugins: Vec::new(),
+            lsp: Vec::new(),
+            stats: Stats {
+                startup_ms: start.elapsed().as_millis(),
+                plugins_loaded: 0,
+                plugins_total: 0,
+                loc: None,
+            },
+            rx: Some(rx),
+        }
+    }
+
+    /// Take delivery of the gathered project if the worker has finished.
+    /// Returns `true` when the dashboard now has something new to show.
+    ///
+    /// Called from the event loop's idle tick, so the panels fill themselves
+    /// in without the user having to touch anything.
+    pub fn poll(&mut self) -> bool {
+        let Some(rx) = &self.rx else { return false };
+        match rx.try_recv() {
+            Ok(g) => {
+                self.apply(g);
+                true
+            }
+            // The worker panicked: stop asking, and leave the panels empty
+            // rather than showing half-gathered data as if it were complete.
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+        }
+    }
+
+    /// Block until the gather finishes.
+    ///
+    /// The event loop never wants this — it has frames to draw and polls
+    /// instead — but a caller with no screen to fill in the meantime does.
+    /// Tests are the main one: they act on `recent_files` immediately, and
+    /// without a barrier they would race the worker and see an empty project.
+    pub fn wait(&mut self) {
+        let Some(rx) = self.rx.take() else { return };
+        if let Ok(g) = rx.recv() {
+            self.apply(g);
+        }
+        self.rx = None;
+    }
+
+    fn apply(&mut self, g: Gathered) {
+        self.stats.plugins_loaded =
+            g.plugins.iter().filter(|p| p.status == PluginStatus::Loaded).count();
+        self.stats.plugins_total = g.plugins.len();
+        self.stats.loc = Some(group_thousands(g.loc));
+        self.recent_files = g.recent_files;
+        self.git = g.git;
+        self.sessions = g.sessions;
+        self.plugins = g.plugins;
+        self.lsp = g.lsp;
+        self.rx = None;
     }
 }
 
@@ -149,6 +251,11 @@ const CODE_EXTS: &[&str] = &[
     "cpp", "hpp", "cc", "go", "rb", "sh", "yaml", "yml", "html", "css", "txt",
 ];
 
+/// Total lines across the project's source files.
+///
+/// Capped at 4000 files because this reads every one of them end to end: the
+/// dashboard wants a sense of scale, not an exact figure, and an unbounded
+/// version of this on a monorepo would never finish.
 fn count_loc(root: &Path, scanned: &[Scanned]) -> usize {
     scanned
         .iter()
