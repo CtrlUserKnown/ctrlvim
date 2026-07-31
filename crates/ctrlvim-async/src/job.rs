@@ -14,11 +14,35 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc::Sender;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::event::Event;
+
+/// The writable half of a [`Jobs::spawn_persistent`] child's stdin. Bytes
+/// queued with [`JobStdin::write`] are written in order on the job's own
+/// tokio task; dropping (or [`JobStdin::close`]ing) the last handle closes
+/// the child's stdin, which is how a well-behaved LSP server (or any process
+/// that reads until EOF) learns the conversation is over.
+#[derive(Clone)]
+pub struct JobStdin {
+    tx: UnboundedSender<Vec<u8>>,
+}
+
+impl JobStdin {
+    /// Queue `data` to be written to the child's stdin. Silently dropped if
+    /// the process already exited — a write racing a server's own shutdown
+    /// is not an error the caller needs to handle.
+    pub fn write(&self, data: Vec<u8>) {
+        let _ = self.tx.send(data);
+    }
+
+    /// Explicitly close stdin now, rather than waiting for every clone to
+    /// drop — the caller-facing spelling of "I'm done sending".
+    pub fn close(self) {}
+}
 
 /// Spawns programs onto a tokio runtime, tagging each with an id the caller
 /// uses to match output and exit events.
@@ -77,12 +101,12 @@ impl Jobs {
             let err_tx = tx.clone();
             let pump_out = async move {
                 if let Some(pipe) = stdout.as_mut() {
-                    pump(pipe, id, &out_tx).await;
+                    pump(pipe, id, &out_tx, |id, data| Event::ProcessOutput { id, data }).await;
                 }
             };
             let pump_err = async move {
                 if let Some(pipe) = stderr.as_mut() {
-                    pump(pipe, id, &err_tx).await;
+                    pump(pipe, id, &err_tx, |id, data| Event::ProcessOutput { id, data }).await;
                 }
             };
             let status = tokio::join!(pump_out, pump_err, child.wait()).2;
@@ -102,10 +126,91 @@ impl Jobs {
     pub fn spawn_shell(&mut self, shell: &str, command: &str, cwd: &Path) -> u64 {
         self.spawn(shell, &["-c".to_string(), command.to_string()], cwd)
     }
+
+    /// Spawn a long-lived process with a writable stdin and *separate*
+    /// stdout/stderr streams (`Event::ProcessStdout`/`ProcessStderr`) — what
+    /// an LSP server (framed JSON-RPC on stdout, free-form logs on stderr) or
+    /// a stdin-fed formatter needs, and what [`Jobs::spawn`] deliberately
+    /// doesn't provide (merged output, no stdin).
+    ///
+    /// Returns immediately with the job id and a [`JobStdin`] to write to;
+    /// the process runs in the background exactly like [`Jobs::spawn`].
+    pub fn spawn_persistent(&mut self, program: &str, args: &[String], cwd: &Path) -> (u64, JobStdin) {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let tx = self.tx.clone();
+        let program_owned = program.to_string();
+        let mut command = Command::new(&program_owned);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let (stdin_tx, mut stdin_rx) = unbounded_channel::<Vec<u8>>();
+
+        self.handle.spawn(async move {
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = tx.send(Event::ProcessStderr {
+                        id,
+                        data: format!("{program_owned}: {e}\n").into_bytes(),
+                    });
+                    let _ = tx.send(Event::ProcessExit { id, code: 127 });
+                    return;
+                }
+            };
+
+            let mut stdin = child.stdin.take();
+            let mut stdout = child.stdout.take();
+            let mut stderr = child.stderr.take();
+
+            let write_stdin = async move {
+                if let Some(pipe) = stdin.as_mut() {
+                    while let Some(chunk) = stdin_rx.recv().await {
+                        if pipe.write_all(&chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Every sender (the `JobStdin` the caller holds, plus any
+                    // clones) is gone, or a write failed — either way, close
+                    // stdin so a process reading until EOF can proceed.
+                    let _ = pipe.shutdown().await;
+                }
+            };
+            let out_tx = tx.clone();
+            let pump_out = async move {
+                if let Some(pipe) = stdout.as_mut() {
+                    pump(pipe, id, &out_tx, |id, data| Event::ProcessStdout { id, data }).await;
+                }
+            };
+            let err_tx = tx.clone();
+            let pump_err = async move {
+                if let Some(pipe) = stderr.as_mut() {
+                    pump(pipe, id, &err_tx, |id, data| Event::ProcessStderr { id, data }).await;
+                }
+            };
+            let status = tokio::join!(write_stdin, pump_out, pump_err, child.wait()).3;
+
+            let code = match status {
+                Ok(status) => status.code().unwrap_or(-1) as i64,
+                Err(_) => -1,
+            };
+            let _ = tx.send(Event::ProcessExit { id, code });
+        });
+
+        (id, JobStdin { tx: stdin_tx })
+    }
 }
 
-/// Forward everything a pipe produces onto the event queue.
-async fn pump<R>(pipe: &mut R, id: u64, tx: &Sender<Event>)
+/// Forward everything a pipe produces onto the event queue, wrapped by `mk`
+/// into whichever `Event` variant the caller's stream should become
+/// (`ProcessOutput` for a merged stream, `ProcessStdout`/`ProcessStderr` for
+/// a [`Jobs::spawn_persistent`] job's separate ones).
+async fn pump<R>(pipe: &mut R, id: u64, tx: &Sender<Event>, mk: impl Fn(u64, Vec<u8>) -> Event)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -114,7 +219,7 @@ where
         match pipe.read(&mut buf).await {
             Ok(0) | Err(_) => return,
             Ok(n) => {
-                if tx.send(Event::ProcessOutput { id, data: buf[..n].to_vec() }).is_err() {
+                if tx.send(mk(id, buf[..n].to_vec())).is_err() {
                     // The editor is gone; stop reading.
                     return;
                 }
@@ -227,6 +332,71 @@ mod tests {
         let (out, code) = run("ctrlvim-definitely-not-a-program", &[]);
         assert_eq!(code, 127);
         assert!(out.contains("ctrlvim-definitely-not-a-program"));
+    }
+
+    #[test]
+    fn spawn_persistent_writes_to_stdin_and_reads_stdout_separately_from_stderr() {
+        let el = EventLoop::new();
+        let svc = TimerService::new(el.sender()).unwrap();
+        let mut jobs = Jobs::new(svc.runtime().handle().clone(), el.sender());
+        let (_id, stdin) =
+            jobs.spawn_persistent("sh", &["-c".to_string(), "cat; echo oops >&2".to_string()], Path::new("."));
+        stdin.write(b"hello ".to_vec());
+        stdin.write(b"world".to_vec());
+        stdin.close();
+
+        let mut out = String::new();
+        let mut err = String::new();
+        loop {
+            match el.wait(Duration::from_secs(10)) {
+                Some(Event::ProcessStdout { data, .. }) => out.push_str(&String::from_utf8_lossy(&data)),
+                Some(Event::ProcessStderr { data, .. }) => err.push_str(&String::from_utf8_lossy(&data)),
+                Some(Event::ProcessExit { code, .. }) => {
+                    assert_eq!(code, 0);
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(out, "hello world", "cat echoes exactly what stdin sent, nothing from stderr mixed in");
+        assert_eq!(err.trim(), "oops", "stderr arrives on its own event, not merged into stdout");
+    }
+
+    #[test]
+    fn spawn_persistent_closing_stdin_lets_a_read_until_eof_process_exit() {
+        let el = EventLoop::new();
+        let svc = TimerService::new(el.sender()).unwrap();
+        let mut jobs = Jobs::new(svc.runtime().handle().clone(), el.sender());
+        let (_id, stdin) = jobs.spawn_persistent("cat", &[], Path::new("."));
+        // No writes at all — closing stdin immediately should still let `cat`
+        // see EOF and exit cleanly rather than hang forever.
+        stdin.close();
+
+        match el.wait(Duration::from_secs(10)) {
+            Some(Event::ProcessExit { code, .. }) => assert_eq!(code, 0),
+            other => panic!("expected a prompt exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_persistent_a_missing_program_still_exits() {
+        let el = EventLoop::new();
+        let svc = TimerService::new(el.sender()).unwrap();
+        let mut jobs = Jobs::new(svc.runtime().handle().clone(), el.sender());
+        let (_id, _stdin) = jobs.spawn_persistent("ctrlvim-definitely-not-a-program", &[], Path::new("."));
+
+        let mut err = String::new();
+        loop {
+            match el.wait(Duration::from_secs(10)) {
+                Some(Event::ProcessStderr { data, .. }) => err.push_str(&String::from_utf8_lossy(&data)),
+                Some(Event::ProcessExit { code, .. }) => {
+                    assert_eq!(code, 127);
+                    break;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(err.contains("ctrlvim-definitely-not-a-program"), "{err}");
     }
 
     #[test]

@@ -9,6 +9,8 @@
 //! wiring an actual LSP client to the resulting binary) lives in `ctrlvim-tui`
 //! and a future `ctrlvim-lsp`, respectively.
 
+pub mod lint;
+
 use std::path::{Path, PathBuf};
 
 /// What a [`Tool`] is used for, mirroring the three things Mason manages

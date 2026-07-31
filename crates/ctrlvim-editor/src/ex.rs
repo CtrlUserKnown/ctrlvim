@@ -83,6 +83,11 @@ pub enum ExEffect {
     /// ([`crate::pinned::PinList`]); opening the file and drawing the menu are
     /// the host's, as with quickfix and tags.
     Pin(PinCmd),
+    /// `:Lint` — run the linter for the current buffer's filetype and fill
+    /// the quickfix list from its output. The engine doesn't know what a
+    /// "filetype" or a "linter" is (that's `ctrlvim-tools`/`ctrlvim-core`
+    /// territory) — this is a bare request, same shape as `CloseApp`.
+    Lint,
 }
 
 /// What the host should do for a `:Pin…` command.
@@ -340,6 +345,7 @@ const TABLE: &[ExCommand] = &[
     ExCommand { name: "make", aliases: &[], desc: "build the project into the quickfix list" },
     ExCommand { name: "grep", aliases: &["gr"], desc: "run grep into the quickfix list" },
     ExCommand { name: "vimgrep", aliases: &["vim", "vimg"], desc: "search files into the quickfix list (:vimgrep /pat/)" },
+    ExCommand { name: "lint", aliases: &["Lint"], desc: "run the linter for this filetype into the quickfix list" },
 
     // -- frontend panels (ExEffect::HostAction) -----------------------------
     // These are the TUI's own actions, exposed as commands so they can be

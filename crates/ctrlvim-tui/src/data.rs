@@ -507,6 +507,30 @@ pub(crate) fn lsp_server_from_tool(tool: &ctrlvim_tools::Tool) -> LspServer {
     }
 }
 
+/// Every `<config>/ctrlvim/pack/*/start/*` directory — the plugins Neovim's
+/// own native package loading puts on `'runtimepath'` automatically, with no
+/// plugin manager involved. `.../opt/*` plugins are deliberately excluded:
+/// those are lazy (`:packadd`-gated) in Neovim and stay that way here, so a
+/// plugin dropped in `opt/` doesn't silently become eager just because its
+/// `require()` path would otherwise resolve.
+pub(crate) fn pack_start_dirs() -> Vec<PathBuf> {
+    let Some(pack) = config_dir().map(|c| c.join("ctrlvim").join("pack")) else {
+        return Vec::new();
+    };
+    let mut dirs = Vec::new();
+    let Ok(groups) = fs::read_dir(&pack) else { return dirs };
+    for group in groups.flatten() {
+        let start = group.path().join("start");
+        let Ok(entries) = fs::read_dir(&start) else { continue };
+        for e in entries.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                dirs.push(e.path());
+            }
+        }
+    }
+    dirs
+}
+
 /// Scan the conventional pack directory for installed plugins.
 /// `<config>/ctrlvim/pack/*/start/*` are loaded, `.../opt/*` are lazy.
 fn load_plugins() -> Vec<Plugin> {

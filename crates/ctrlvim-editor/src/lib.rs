@@ -27,7 +27,7 @@ pub mod tags;
 pub mod textobject;
 pub mod window;
 
-pub use editor::{BufferState, Editor};
+pub use editor::{BufferState, Editor, ExtmarkMeta, FloatConfig, FloatRelative};
 pub use fold::{Fold, Folds};
 pub use ex::{
     commands as ex_commands, is_ex_command, AiCmd, BufferCmd, ExCommand, ExEffect, PinCmd,

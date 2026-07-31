@@ -13,9 +13,9 @@ pub use ctrlvim_api::ApiContext;
 pub use ctrlvim_treesitter::{HlKind, HlSpan};
 pub use ctrlvim_async::{Event, EventLoop, Jobs, LineBuffer, TimerService};
 pub use ctrlvim_editor::{
-    ex_commands, is_ex_command, AiCmd, BufferCmd, Editor, ExCommand, ExEffect, Fold, Folds, Frame,
-    Key, Mode, Mods, PinCmd, QfItem, QfKind, QuickfixCmd, QuickfixList, Selection, Session, SpecialKey,
-    TagCmd, VisualKind,
+    ex_commands, is_ex_command, AiCmd, BufferCmd, Editor, ExCommand, ExEffect, ExtmarkMeta,
+    FloatConfig, FloatRelative, Fold, Folds, Frame, Key, Mode, Mods, PinCmd, QfItem, QfKind,
+    QuickfixCmd, QuickfixList, Selection, Session, SpecialKey, TagCmd, VisualKind,
 };
 pub use ctrlvim_editor::suggest::{
     Accept as SuggestAccept, ContextWindow, InlineSuggest, SuggestRequest, Suggestion,
@@ -152,12 +152,35 @@ impl Ctrlvim {
         self.host.is_some()
     }
 
+    /// Drain the Lua host's pending timers/process I/O and `vim.schedule`
+    /// queue, if a host exists yet — see [`Host::poll`]. A no-op (not an
+    /// error) before any Lua has run, matching the host's own lazy creation:
+    /// nothing has anything queued yet either.
+    pub fn poll_lua_host(&mut self) -> Result<usize, String> {
+        match self.host.as_ref() {
+            Some(host) => host.poll().map_err(|e| e.to_string()),
+            None => Ok(0),
+        }
+    }
+
     /// Create the Lua host if it doesn't exist, so plugins can be loaded and
     /// autocmds registered before any `:lua` is typed.
     pub fn ensure_host(&mut self) -> Result<(), String> {
         if self.host.is_none() {
             self.host = Some(Host::new(Editor::new()).map_err(|e| e.to_string())?);
         }
+        Ok(())
+    }
+
+    /// Add a directory to the Lua host's `require()` search path (creating
+    /// the host first if needed) — see [`Host::add_runtime_path`]. The
+    /// frontend calls this once per plugin directory (`[[plugin]]` entries
+    /// and `pack/*/start/*`) before sourcing any config, so a multi-file
+    /// plugin's own internal `require()` calls resolve the way they would
+    /// under Neovim's runtimepath.
+    pub fn add_runtime_path(&mut self, dir: impl Into<std::path::PathBuf>) -> Result<(), String> {
+        self.ensure_host()?;
+        self.host.as_ref().unwrap().add_runtime_path(dir.into());
         Ok(())
     }
 
@@ -243,6 +266,24 @@ mod tests {
         ctrlvim.feed("ifoo <Esc>");
         assert_eq!(ctrlvim.lines(), vec!["foo world"]);
         assert_eq!(ctrlvim.mode(), "n");
+    }
+
+    #[test]
+    fn poll_lua_host_is_a_harmless_noop_before_any_lua_runs() {
+        let mut ctrlvim = Ctrlvim::new();
+        assert!(!ctrlvim.has_host());
+        assert_eq!(ctrlvim.poll_lua_host(), Ok(0));
+    }
+
+    #[test]
+    fn poll_lua_host_drains_a_scheduled_callback() {
+        let mut ctrlvim = Ctrlvim::new();
+        ctrlvim.run_lua("_G.ran = false; vim.schedule(function() _G.ran = true end)").unwrap();
+        // Not run yet — proves this is really testing the poll, not just
+        // that `vim.schedule`'s callback ran inline.
+        ctrlvim.run_lua("assert(_G.ran == false)").unwrap();
+        ctrlvim.poll_lua_host().unwrap();
+        ctrlvim.run_lua("assert(_G.ran == true, 'poll_lua_host should have run it')").unwrap();
     }
 
     #[test]

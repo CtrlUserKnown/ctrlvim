@@ -347,6 +347,8 @@ pub struct App {
     job: Option<RunningJob>,
     /// The `:!{cmd}` job currently filling [`App::shell_output`], if any.
     shell_job: Option<RunningShell>,
+    /// The `:Lint` job currently in flight, if any.
+    lint_job: Option<RunningLint>,
     /// The tool install currently running through `shell_job`, if any: its
     /// name, its row index in `project.lsp`, and the job id — so completion
     /// is attributed to the right job even if a `:!{cmd}` interleaves.
@@ -423,6 +425,18 @@ struct RunningShell {
     output: Vec<String>,
 }
 
+/// A `:Lint` in flight — unlike `:make`/`:grep`, the linter's output isn't
+/// line-oriented (it's one JSON blob at exit), and it needs a writable
+/// stdin (the buffer content), so it runs through `Jobs::spawn_persistent`
+/// with separate stdout/stderr streams rather than `RunningJob`'s merged,
+/// line-buffered path.
+struct RunningLint {
+    id: u64,
+    def: &'static ctrlvim_tools::lint::LintDef,
+    path: PathBuf,
+    stdout: Vec<u8>,
+}
+
 /// Cached highlight spans plus the buffer state they were computed from.
 struct SyntaxCache {
     /// Active buffer, a hash of its text, and the visible window (`top`,
@@ -463,6 +477,28 @@ impl App {
         }
         let config = Config::load();
         let mut engine = Ctrlvim::new();
+        // Every pack `start/*` plugin goes on the `require()` search path
+        // unconditionally — matching Neovim's own native package loading,
+        // which puts them on `'runtimepath'` with no plugin manager involved.
+        // A library-shaped plugin (no `init.lua`, e.g. `nvim-lspconfig`) never
+        // gets *sourced* by anything here; this only makes its `lua/` tree
+        // resolvable to whichever `[[plugin]]` config actually `require()`s it.
+        for dir in crate::data::pack_start_dirs() {
+            let _ = engine.add_runtime_path(dir);
+        }
+        // `[[plugin]]` entries also go on the search path — `path` may be a
+        // directory (per its documented shape) or, for the legacy single-file
+        // startup convention below, a `.lua` file whose parent directory is
+        // what should actually be searched.
+        for p in &config.plugins {
+            let expanded = expand_tilde(&p.path);
+            let root = if expanded.is_dir() {
+                expanded
+            } else {
+                expanded.parent().map(Path::to_path_buf).unwrap_or(expanded)
+            };
+            let _ = engine.add_runtime_path(root);
+        }
         let startup_message = load_startup_plugins(&mut engine, &config.plugins);
         App {
             engine,
@@ -496,6 +532,7 @@ impl App {
             timers: None,
             job: None,
             shell_job: None,
+            lint_job: None,
             installing_tool: None,
             shell_open: false,
             keymap_pending_since: None,
@@ -1403,6 +1440,7 @@ impl App {
                 ExEffect::Ai(cmd) => self.host_ai(cmd),
                 ExEffect::HostAction(name) => self.host_action(&name),
                 ExEffect::Pin(cmd) => self.host_pin(cmd),
+                ExEffect::Lint => self.host_lint(),
             }
         }
     }
@@ -2002,6 +2040,58 @@ impl App {
         });
     }
 
+    /// `:Lint` — run the linter `ctrlvim_tools::lint` names for the active
+    /// buffer's filetype, feeding it the buffer's *live* content over stdin
+    /// (not what's on disk) and collecting its output for [`App::poll_jobs`]
+    /// to parse into quickfix once the process exits.
+    fn host_lint(&mut self) {
+        let Some(ft) = self.editor_filetype() else {
+            self.message = ":Lint: no filetype for this buffer".into();
+            return;
+        };
+        let Some(def) = ctrlvim_tools::lint::for_filetype(ft.name()) else {
+            self.message = format!(":Lint: no linter configured for {}", ft.name());
+            return;
+        };
+        let tool = ctrlvim_tools::REGISTRY.iter().find(|t| t.name == def.name);
+        let installed = tool.is_some_and(|t| ctrlvim_tools::locate(t).is_some());
+        if !installed {
+            self.message = format!(":Lint: {} not found (install it from the Settings tab)", def.binary);
+            return;
+        }
+
+        let path = crate::lint::qf_path(self.active_buffer().path.as_ref(), &self.active_buffer().label);
+        let content = self.editor_lines().join("\n");
+        let (program, args) = crate::lint::build_command(def, &path.to_string_lossy());
+
+        let root = self.root.clone();
+        let jobs = match self.jobs_mut() {
+            Some(jobs) => jobs,
+            None => {
+                self.message = "E902: could not start the job runtime".into();
+                return;
+            }
+        };
+        let (id, stdin) = jobs.spawn_persistent(program, &args, &root);
+        stdin.write(content.into_bytes());
+        stdin.close();
+
+        self.message = format!(":Lint {}: running…", def.name);
+        self.lint_job = Some(RunningLint { id, def, path, stdout: Vec::new() });
+    }
+
+    /// Install a finished `:Lint` job's parsed output into the quickfix list.
+    fn finish_lint(&mut self, job: RunningLint, code: i64) {
+        // Both ported linters (`shellcheck`, `ruff`) use `ignore_exitcode =
+        // true` in their real `nvim-lint` definitions — a nonzero exit is
+        // how they report "diagnostics found", not "the linter itself
+        // failed" — so `code` only makes it into the title, never gates
+        // whether output gets parsed.
+        let items = crate::lint::parse_output(job.def, &job.stdout, &job.path);
+        let title = format!(":Lint {} (exit {code})", job.def.name);
+        self.finish_quickfix(items, title);
+    }
+
     /// `:!{cmd}` — run a raw command line through the configured shell
     /// ([`Config::shell`]) and collect its output for the overlay (see
     /// [`App::poll_jobs`]).
@@ -2088,6 +2178,7 @@ impl App {
         }
         let mut finished = None;
         let mut shell_finished = None;
+        let mut lint_finished = None;
         for event in events {
             match event {
                 Event::ProcessOutput { id, data } => {
@@ -2104,6 +2195,17 @@ impl App {
                         job.output.extend(lines);
                     }
                 }
+                // `:Lint` runs through `spawn_persistent` (separate stdout/
+                // stderr, no merging) since its output is one JSON blob at
+                // exit, not line-oriented — stderr is drained but discarded
+                // (a linter's stderr is its own diagnostics/warnings about
+                // itself, not something quickfix should show).
+                Event::ProcessStdout { id, data } => {
+                    if let Some(job) = self.lint_job.as_mut().filter(|j| j.id == id) {
+                        job.stdout.extend_from_slice(&data);
+                    }
+                }
+                Event::ProcessStderr { .. } => {}
                 Event::ProcessExit { id, code } => {
                     if let Some(job) = self.job.as_mut().filter(|j| j.id == id) {
                         if let Some(last) = job.lines.flush() {
@@ -2119,6 +2221,10 @@ impl App {
                             job.output.push(last);
                         }
                         shell_finished = self.shell_job.take().map(|j| (j, code));
+                        continue;
+                    }
+                    if self.lint_job.as_ref().is_some_and(|j| j.id == id) {
+                        lint_finished = self.lint_job.take().map(|j| (j, code));
                     }
                 }
                 // Timers/RPC are not wired into the frontend yet.
@@ -2131,6 +2237,9 @@ impl App {
         }
         if let Some((job, code)) = shell_finished {
             self.finish_shell(job, code);
+        }
+        if let Some((job, code)) = lint_finished {
+            self.finish_lint(job, code);
         }
         true
     }
@@ -2225,6 +2334,17 @@ impl App {
             .iter()
             .enumerate()
             .any(|(i, b)| b.kind == BufferKind::File && if i == self.active { self.active_modified() } else { b.modified })
+    }
+
+    /// Drain the Lua host's timers/process I/O and `vim.schedule` queue.
+    /// Call from the main loop alongside `poll_jobs`/`poll_ai` — anything
+    /// that spawned a `vim.uv` process (a real LSP server, once `vim.lsp` is
+    /// wired up beyond this crate) or deferred work via `vim.schedule`
+    /// otherwise never gets it run. A no-op before any Lua has executed.
+    pub fn poll_lua(&mut self) {
+        if let Err(e) = self.engine.poll_lua_host() {
+            self.message = format!("lua: {}", first_line(&e));
+        }
     }
 
     /// Periodic hot-exit flush, throttled to [`Self::SESSION_SNAPSHOT_INTERVAL`]

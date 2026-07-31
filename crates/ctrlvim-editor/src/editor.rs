@@ -10,8 +10,27 @@ use crate::quickfix::QuickfixList;
 use crate::tags::{TagMatches, TagStack, TagTable};
 use crate::window::{Frame, Window};
 use ctrlvim_options::{BufferOptions, GlobalOptions, OptionContext};
-use ctrlvim_text::{Buffer, MarkStore, Registers, UndoTree};
+use ctrlvim_text::{Buffer, MarkStore, Namespace, Registers, UndoTree};
 use ctrlvim_types::{BufferId, Position, WindowId};
+use std::collections::HashMap;
+
+/// Decoration data for one extmark, alongside its position in
+/// [`BufferState::marks`] (which only tracks the gravity-following position
+/// itself — this is everything `nvim_buf_set_extmark`'s `opts` dict can carry
+/// that a renderer needs: `vim.diagnostic`'s underlines and inline messages
+/// are exactly this).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExtmarkMeta {
+    /// The end of the marked range, if it covers more than one position
+    /// (`opts.end_row`/`opts.end_col` in real Neovim).
+    pub end_line: Option<usize>,
+    pub end_col: Option<usize>,
+    /// Highlight group to apply across the marked range.
+    pub hl_group: Option<String>,
+    /// Virtual text chunks appended after the line (`opts.virt_text`): each
+    /// is `(text, highlight_group)`.
+    pub virt_text: Vec<(String, Option<String>)>,
+}
 
 /// Everything the editor knows about one buffer. Combines the text engine
 /// pieces (`ctrlvim-text`) with editor-level metadata.
@@ -19,6 +38,10 @@ pub struct BufferState {
     pub text: Buffer,
     pub undo: UndoTree,
     pub marks: MarkStore,
+    /// Decoration data for extmarks that carry more than a bare position —
+    /// see [`ExtmarkMeta`]. Keyed the same way a mark itself is: namespace +
+    /// id. An extmark with no entry here is a plain position-only mark.
+    pub extmark_meta: HashMap<(Namespace, u32), ExtmarkMeta>,
     pub options: BufferOptions,
     pub name: Option<String>,
     /// Neovim's `b:changedtick`, bumped on every text change.
@@ -35,6 +58,7 @@ impl BufferState {
             text,
             undo,
             marks: MarkStore::new(),
+            extmark_meta: HashMap::new(),
             options: BufferOptions::default(),
             name,
             changedtick: 1,
@@ -53,6 +77,30 @@ impl BufferState {
     }
 }
 
+/// Where a floating window is positioned (`nvim_open_win`'s `relative`).
+/// `Editor` (the default) anchors are absolute over the whole editor grid;
+/// `Cursor` anchors are relative to the current window's cursor — what a
+/// hover/signature-help popup wants, so it tracks the cursor across scrolls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatRelative {
+    Editor,
+    Cursor,
+}
+
+/// A floating window's placement — `nvim_open_win`'s `config` dict, the
+/// subset that matters without a real compositor: no z-index stacking rules
+/// beyond "opened later draws on top", no `relative = 'win'` (anchoring to
+/// another *window* rather than the cursor or the whole editor).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FloatConfig {
+    pub relative: FloatRelative,
+    pub row: i64,
+    pub col: i64,
+    pub width: usize,
+    pub height: usize,
+    pub border: bool,
+}
+
 /// The editor context.
 pub struct Editor {
     buffers: Vec<Option<BufferState>>,
@@ -60,6 +108,11 @@ pub struct Editor {
     current_window: WindowId,
     /// Split layout for the (single, for now) tabpage.
     pub layout: Frame,
+    /// Floating windows, deliberately *not* part of [`Editor::layout`] — a
+    /// float is drawn on top of the split layout, not a participant in it
+    /// (closing the last split must still refuse; a float never counts).
+    /// Ordered by open time, which doubles as z-order (later draws on top).
+    floats: Vec<(WindowId, FloatConfig)>,
     pub registers: Registers,
     pub global_options: GlobalOptions,
     /// The quickfix list (`:make`, `:grep`, `:vimgrep`). One global list, as in
@@ -78,12 +131,13 @@ impl Editor {
     /// Create an editor with a single empty buffer shown in a single window.
     pub fn new() -> Self {
         let buf = BufferState::new(Buffer::new(), None);
-        let win = Window::new(BufferId(0));
+        let win = Window::new(BufferId(1));
         Editor {
             buffers: vec![Some(buf)],
             windows: vec![Some(win)],
-            current_window: WindowId(0),
-            layout: Frame::Leaf(WindowId(0)),
+            current_window: WindowId(1),
+            layout: Frame::Leaf(WindowId(1)),
+            floats: Vec::new(),
             registers: Registers::new(),
             global_options: GlobalOptions::default(),
             quickfix: QuickfixList::new(),
@@ -98,18 +152,38 @@ impl Editor {
         let bid = self.current_buffer_id();
         let buf = Buffer::from_str(text);
         let state = BufferState::new(buf, name.map(str::to_string));
-        self.buffers[bid.0 as usize] = Some(state);
+        self.buffers[(bid.0 - 1) as usize] = Some(state);
         self.window_mut(self.current_window).unwrap().cursor = Position::default();
     }
 
     /// Create a new buffer, returning its id.
     pub fn create_buffer(&mut self, text: Buffer, name: Option<String>) -> BufferId {
-        let id = BufferId(self.buffers.len() as u32);
+        let id = BufferId(self.buffers.len() as u32 + 1);
         self.buffers.push(Some(BufferState::new(text, name)));
         id
     }
 
+    /// Every live buffer id, in creation order (`nvim_list_bufs`).
+    pub fn buffer_ids(&self) -> Vec<BufferId> {
+        self.buffers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.is_some().then(|| BufferId(i as u32 + 1)))
+            .collect()
+    }
+
     // --- handle resolution ---
+    //
+    // Handles are 1-based, matching real Neovim exactly: `0` is a reserved
+    // sentinel a caller uses to mean "the current buffer/window" (real
+    // `nvim_buf_*`/`nvim_win_*` resolve it that way; ctrlvim's own
+    // `nvim_*` functions ask the caller to fetch the current handle
+    // explicitly instead — see `ctrlvim-api/src/functions.rs`'s note on
+    // this). What matters here is that `0` is *never* a real buffer or
+    // window, because vendored Neovim runtime Lua (`vim.diagnostic`,
+    // among others) asserts exactly that. Internally, `self.buffers`/
+    // `self.windows` stay 0-indexed `Vec`s; handle `N` lives at index
+    // `N - 1`.
 
     pub fn current_window_id(&self) -> WindowId {
         self.current_window
@@ -120,19 +194,23 @@ impl Editor {
     }
 
     pub fn window(&self, id: WindowId) -> Option<&Window> {
-        self.windows.get(id.0 as usize).and_then(|w| w.as_ref())
+        let idx = id.0.checked_sub(1)?;
+        self.windows.get(idx as usize).and_then(|w| w.as_ref())
     }
 
     pub fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
-        self.windows.get_mut(id.0 as usize).and_then(|w| w.as_mut())
+        let idx = id.0.checked_sub(1)?;
+        self.windows.get_mut(idx as usize).and_then(|w| w.as_mut())
     }
 
     pub fn buffer(&self, id: BufferId) -> Option<&BufferState> {
-        self.buffers.get(id.0 as usize).and_then(|b| b.as_ref())
+        let idx = id.0.checked_sub(1)?;
+        self.buffers.get(idx as usize).and_then(|b| b.as_ref())
     }
 
     pub fn buffer_mut(&mut self, id: BufferId) -> Option<&mut BufferState> {
-        self.buffers.get_mut(id.0 as usize).and_then(|b| b.as_mut())
+        let idx = id.0.checked_sub(1)?;
+        self.buffers.get_mut(idx as usize).and_then(|b| b.as_mut())
     }
 
     // --- convenience accessors for the current window/buffer ---
@@ -188,7 +266,7 @@ impl Editor {
     pub fn split_current_placed(&mut self, vertical: bool, before: bool) -> WindowId {
         let cur = self.current_window;
         let bufid = self.window(cur).unwrap().buffer;
-        let new_id = WindowId(self.windows.len() as u32);
+        let new_id = WindowId(self.windows.len() as u32 + 1);
         self.windows.push(Some(Window::new(bufid)));
         // The new window inherits the current one's cursor, as Vim does — a
         // split shows the same view twice rather than jumping to the top.
@@ -252,9 +330,52 @@ impl Editor {
         }
     }
 
-    /// All window ids in layout order (`ctrlvim_list_wins`).
+    /// All window ids in layout order, followed by any open floats
+    /// (`nvim_list_wins` includes floats in the current tabpage).
     pub fn window_ids(&self) -> Vec<WindowId> {
-        self.layout.windows()
+        let mut ids = self.layout.windows();
+        ids.extend(self.float_ids());
+        ids
+    }
+
+    /// Open a floating window over `buffer` — `nvim_open_win` with a real
+    /// buffer's worth of behavior (cursor/text access through the ordinary
+    /// [`Editor::window`] accessors) but none of the split-layout machinery.
+    pub fn open_float(&mut self, buffer: BufferId, config: FloatConfig) -> WindowId {
+        let new_id = WindowId(self.windows.len() as u32 + 1);
+        let mut win = Window::new(buffer);
+        win.width = config.width;
+        win.height = config.height;
+        self.windows.push(Some(win));
+        self.floats.push((new_id, config));
+        new_id
+    }
+
+    /// Close a floating window. Returns `false` if `id` isn't an open float
+    /// (including a *split* window — use [`Editor::close_window`] for those).
+    pub fn close_float(&mut self, id: WindowId) -> bool {
+        let before = self.floats.len();
+        self.floats.retain(|(fid, _)| *fid != id);
+        if self.floats.len() == before {
+            return false;
+        }
+        if let Some(idx) = id.0.checked_sub(1).map(|i| i as usize).filter(|i| *i < self.windows.len()) {
+            self.windows[idx] = None;
+        }
+        if self.current_window == id {
+            self.current_window = self.layout.windows()[0];
+        }
+        true
+    }
+
+    /// Ids of every open float, in open order (which doubles as z-order).
+    pub fn float_ids(&self) -> Vec<WindowId> {
+        self.floats.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// A float's placement config, if `id` is an open float.
+    pub fn float_config(&self, id: WindowId) -> Option<&FloatConfig> {
+        self.floats.iter().find(|(fid, _)| *fid == id).map(|(_, c)| c)
     }
 
     pub fn window_count(&self) -> usize {
@@ -279,8 +400,8 @@ impl Editor {
         match self.layout.without(id) {
             Some(new_layout) => {
                 self.layout = new_layout;
-                if (id.0 as usize) < self.windows.len() {
-                    self.windows[id.0 as usize] = None;
+                if let Some(idx) = id.0.checked_sub(1).map(|i| i as usize).filter(|i| *i < self.windows.len()) {
+                    self.windows[idx] = None;
                 }
                 if self.current_window == id {
                     self.current_window = self.layout.windows()[0];
@@ -340,12 +461,14 @@ impl Editor {
         }
     }
 
-    /// Close every window except the current one (`<C-w>o` / `:only`).
+    /// Close every *split* window except the current one (`<C-w>o` /
+    /// `:only`). Floats are a separate lifecycle (see [`Editor::floats`]) —
+    /// `:only` in real Neovim doesn't touch them either.
     pub fn only_current_window(&mut self) {
         let cur = self.current_window;
-        for id in self.window_ids() {
+        for id in self.layout.windows() {
             if id != cur {
-                self.windows[id.0 as usize] = None;
+                self.windows[(id.0 - 1) as usize] = None;
             }
         }
         self.layout = Frame::Leaf(cur);
@@ -397,7 +520,7 @@ mod tests {
     fn split_builds_frame_tree() {
         let mut ed = Editor::new();
         let w2 = ed.split_current(true);
-        assert_eq!(ed.layout.windows(), vec![WindowId(0), w2]);
+        assert_eq!(ed.layout.windows(), vec![WindowId(1), w2]);
         assert!(matches!(ed.layout, Frame::Row(_)));
     }
 
@@ -407,5 +530,54 @@ mod tests {
         assert_eq!(ed.options().tabstop(), 8);
         ed.cur_buffer_mut().options.tabstop = Some(2);
         assert_eq!(ed.options().tabstop(), 2);
+    }
+
+    fn float_config() -> FloatConfig {
+        FloatConfig { relative: FloatRelative::Cursor, row: 1, col: 0, width: 40, height: 3, border: true }
+    }
+
+    #[test]
+    fn a_float_is_not_part_of_the_split_layout() {
+        let mut ed = Editor::new();
+        let buf = ed.create_buffer(Buffer::new(), None);
+        let float_id = ed.open_float(buf, float_config());
+        // The float is a real, addressable window...
+        assert_eq!(ed.window(float_id).unwrap().buffer, buf);
+        // ...but not a leaf in the split tree, so closing "the last window"
+        // (the one real split) must still be refused regardless of it.
+        assert_eq!(ed.layout.windows(), vec![WindowId(1)]);
+        assert!(!ed.close_window(WindowId(1)), "the only split window can't be closed");
+    }
+
+    #[test]
+    fn window_ids_lists_floats_after_splits() {
+        let mut ed = Editor::new();
+        let w2 = ed.split_current(true);
+        let buf = ed.create_buffer(Buffer::new(), None);
+        let float_id = ed.open_float(buf, float_config());
+        assert_eq!(ed.window_ids(), vec![WindowId(1), w2, float_id]);
+    }
+
+    #[test]
+    fn close_float_removes_it_but_not_a_split_window() {
+        let mut ed = Editor::new();
+        let buf = ed.create_buffer(Buffer::new(), None);
+        let float_id = ed.open_float(buf, float_config());
+        assert!(ed.close_float(float_id));
+        assert!(ed.window(float_id).is_none());
+        assert!(ed.float_ids().is_empty());
+        // Not a float (it's the real split window) — refuses rather than
+        // silently doing nothing useful.
+        assert!(!ed.close_float(WindowId(1)));
+    }
+
+    #[test]
+    fn float_config_is_retrievable_and_absent_for_non_floats() {
+        let mut ed = Editor::new();
+        let buf = ed.create_buffer(Buffer::new(), None);
+        let cfg = float_config();
+        let float_id = ed.open_float(buf, cfg);
+        assert_eq!(ed.float_config(float_id), Some(&cfg));
+        assert_eq!(ed.float_config(WindowId(1)), None);
     }
 }

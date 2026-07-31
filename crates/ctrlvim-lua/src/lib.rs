@@ -8,6 +8,7 @@
 pub mod convert;
 pub mod host;
 pub mod reg;
+pub mod vendored;
 
 pub use host::Host;
 pub use reg::LuaRefStore;

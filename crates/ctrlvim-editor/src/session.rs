@@ -1823,6 +1823,7 @@ impl Session {
                 },
                 title: ":make".into(),
             })),
+            "lint" | "Lint" => self.queue_effect(ExEffect::Lint),
             "grep" | "gr" => {
                 let words: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
                 if words.is_empty() {

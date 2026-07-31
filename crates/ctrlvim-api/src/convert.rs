@@ -78,10 +78,27 @@ impl FromObject for BufferId {
     fn from_object(obj: &Object, ctx: &str) -> Result<Self> {
         match obj {
             Object::Buffer(b) => Ok(*b),
-            // Neovim accepts integer 0 to mean "current buffer" at the API edge;
-            // callers resolve 0 specially. Here we pass the raw id through.
+            // Real Neovim also accepts integer 0 to mean "current buffer" —
+            // safe there because a real buffer handle is never 0 (the first
+            // buffer is 1). ctrlvim's ids are 0-based, so 0 is a legitimate
+            // buffer, not a free sentinel; callers that want "the current
+            // buffer" must fetch it explicitly via `nvim_get_current_buf()`,
+            // same as any other handle. A plain integer is still accepted
+            // here (matching how a handle round-trips through Lua as a
+            // number) — it just isn't given special-cased meaning at 0.
             Object::Integer(i) if *i >= 0 => Ok(BufferId(*i as u32)),
             other => Err(type_err(ctx, "buffer", other)),
+        }
+    }
+}
+
+impl FromObject for WindowId {
+    fn from_object(obj: &Object, ctx: &str) -> Result<Self> {
+        match obj {
+            Object::Window(w) => Ok(*w),
+            // See the `BufferId` impl above: no special meaning for 0 here.
+            Object::Integer(i) if *i >= 0 => Ok(WindowId(*i as u32)),
+            other => Err(type_err(ctx, "window", other)),
         }
     }
 }

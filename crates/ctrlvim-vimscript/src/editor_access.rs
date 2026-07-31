@@ -23,4 +23,8 @@ impl EditorAccess for Editor {
         let Position { line, col } = self.cursor();
         (line as i64 + 1, col as i64 + 1)
     }
+
+    fn buffer_name(&self) -> String {
+        self.cur_buffer().name.clone().unwrap_or_default()
+    }
 }

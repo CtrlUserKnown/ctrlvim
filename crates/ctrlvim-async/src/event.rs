@@ -16,9 +16,19 @@ pub enum Event {
     TimerFired(u64),
     /// An incoming RPC request/notification (raw msgpack bytes).
     RpcMessage(Vec<u8>),
-    /// A spawned process wrote to stdout.
+    /// A spawned process wrote to stdout or stderr — merged into one stream
+    /// (`Jobs::spawn`/`spawn_shell`), which is what a compiler/`:make`-style
+    /// consumer wants (diagnostics on either stream, in order).
     ProcessOutput { id: u64, data: Vec<u8> },
-    /// A spawned process exited.
+    /// A persistent process's stdout, kept separate from stderr
+    /// (`Jobs::spawn_persistent`) — required for anything that frames a
+    /// protocol over stdout (LSP's `Content-Length`-prefixed JSON-RPC): a
+    /// server's own stderr logging must never be able to corrupt the stream.
+    ProcessStdout { id: u64, data: Vec<u8> },
+    /// A persistent process's stderr, kept separate from stdout for the same
+    /// reason (`Jobs::spawn_persistent`).
+    ProcessStderr { id: u64, data: Vec<u8> },
+    /// A spawned process exited (either spawn path).
     ProcessExit { id: u64, code: i64 },
 }
 

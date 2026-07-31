@@ -190,12 +190,14 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
         // is what lets `<leader>q` and `<leader>qq` coexist.
         if !event::poll(app.poll_interval())? {
             app.poll_jobs();
+            app.poll_lua();
             app.poll_ai();
             app.tick_keymap_timeout();
             app.tick_session_snapshot();
             continue;
         }
         app.poll_jobs();
+        app.poll_lua();
         app.poll_ai();
         app.tick_keymap_timeout();
         app.tick_session_snapshot();

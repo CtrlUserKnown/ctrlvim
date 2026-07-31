@@ -12,6 +12,7 @@ pub mod config;
 pub mod data;
 pub mod icons;
 pub mod input;
+pub mod lint;
 pub mod model;
 pub mod replace;
 pub mod theme;

@@ -17,6 +17,13 @@ ctrlvim-async.workspace = true
 mlua.workspace = true
 tree-sitter-json = "0.24"
 tree-sitter-rust = "0.24"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-lua = "0.5.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-bash = "0.25.1"
 
 [[bin]]
 name = "ctrlvim-demo"

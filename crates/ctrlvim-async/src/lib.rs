@@ -19,7 +19,7 @@ pub mod server;
 pub mod timer;
 
 pub use event::{Event, EventLoop};
-pub use job::{Jobs, LineBuffer};
+pub use job::{JobStdin, Jobs, LineBuffer};
 pub use timer::{TimerHandle, TimerService};
 
 pub use server::{Connection, RpcServer};

@@ -12,6 +12,7 @@ ctrlvim-api.workspace = true
 ctrlvim-async.workspace = true
 ctrlvim-treesitter.workspace = true
 mlua.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tree-sitter-json = "0.24"

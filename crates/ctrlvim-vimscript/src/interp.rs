@@ -15,6 +15,11 @@ pub trait EditorAccess {
     fn set_line(&mut self, lnum: i64, text: &str);
     /// `(1-based line, 1-based col)`.
     fn cursor(&self) -> (i64, i64);
+    /// The current buffer's name/path (`expand('%')`), empty for an unnamed
+    /// buffer.
+    fn buffer_name(&self) -> String {
+        String::new()
+    }
 }
 
 /// A no-op editor for pure-Vimscript evaluation/tests.

@@ -50,9 +50,129 @@ pub fn call(name: &str, args: &[Object], editor: &mut dyn EditorAccess) -> Optio
             Ok(Object::Integer(0))
         }
         "line2byte" => Ok(Object::Integer(1)),
+        // filesystem / path — what `vim.lsp`'s root-dir detection and
+        // logging (`vim.lsp.log`) need just to *load*, plus the handful of
+        // other path builtins lspconfig-style configs reach for constantly.
+        "stdpath" => Ok(Object::str(stdpath(&to_string(arg(args, 0))))),
+        "mkdir" => Ok(Object::Integer(mkdir(args))),
+        "isdirectory" => Ok(Object::Integer(std::path::Path::new(&to_string(arg(args, 0))).is_dir() as i64)),
+        "executable" => Ok(Object::Integer(executable(&to_string(arg(args, 0))) as i64)),
+        "getcwd" => Ok(Object::str(
+            std::env::current_dir().ok().and_then(|p| p.to_str().map(str::to_string)).unwrap_or_default(),
+        )),
+        "expand" => Ok(Object::str(expand(&to_string(arg(args, 0)), editor))),
+        "fnamemodify" => Ok(Object::str(fnamemodify(&to_string(arg(args, 0)), &to_string(arg(args, 1))))),
+        "fnameescape" => Ok(Object::str(to_string(arg(args, 0)))),
+        "getregionpos" => Ok(getregionpos(args)),
         _ => return None,
     };
     Some(r)
+}
+
+/// `getregionpos(pos1, pos2, opts)` — a *charwise-only* approximation: real
+/// Vim can split a region into several `[start, end]` pairs (one per row,
+/// for a blockwise or multi-line region); this always returns the single
+/// range `{pos1, pos2}` unchanged. That's exactly what `vim.hl.range` (the
+/// only vendored caller) needs for `'v'`/`'V'` (char/linewise) — it reads
+/// only the first and last element of the result, which are the same
+/// element here. `opts.type = 'b'` (blockwise) would need real per-row
+/// splitting; that's a known, narrow gap, not silently wrong for the common
+/// case.
+fn getregionpos(args: &[Object]) -> Object {
+    let pos1 = arg(args, 0).clone();
+    let pos2 = arg(args, 1).clone();
+    Object::Array(vec![Object::Array(vec![pos1, pos2])])
+}
+
+/// `stdpath({what})` — ctrlvim's own directories, mirroring the shape (not
+/// the exact paths) of Neovim's `stdpath()`: `config`/`data`/`cache`/`state`
+/// under the usual XDG bases (or their macOS/Windows equivalents Neovim
+/// itself falls back to — matched here only via `$HOME`-relative defaults,
+/// the common case). `log` aliases `state`, matching real Neovim.
+fn stdpath(what: &str) -> String {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let xdg = |var: &str, fallback: &str| -> std::path::PathBuf {
+        std::env::var_os(var).map(std::path::PathBuf::from).unwrap_or_else(|| {
+            home.clone().unwrap_or_default().join(fallback)
+        })
+    };
+    let dir = match what {
+        "config" => xdg("XDG_CONFIG_HOME", ".config").join("ctrlvim"),
+        "data" => xdg("XDG_DATA_HOME", ".local/share").join("ctrlvim"),
+        "cache" => xdg("XDG_CACHE_HOME", ".cache").join("ctrlvim"),
+        "state" | "log" => xdg("XDG_STATE_HOME", ".local/state").join("ctrlvim"),
+        "run" => std::env::temp_dir().join("ctrlvim"),
+        _ => home.unwrap_or_default().join(".ctrlvim"),
+    };
+    dir.to_string_lossy().into_owned()
+}
+
+/// `mkdir({path}, [{flags}])` — `'p'` in flags creates parents, matching
+/// Vim's own flag character. Returns `1`/`0` like the real builtin (not an
+/// error) so a caller that only checks truthiness doesn't need `pcall`.
+fn mkdir(args: &[Object]) -> i64 {
+    let path = to_string(arg(args, 0));
+    let flags = to_string(arg(args, 1));
+    let result = if flags.contains('p') { std::fs::create_dir_all(&path) } else { std::fs::create_dir(&path) };
+    result.is_ok() as i64
+}
+
+/// `executable({name})` — a bare name is resolved against `$PATH`; a path
+/// (containing a separator) is checked directly.
+fn executable(name: &str) -> bool {
+    if name.contains('/') {
+        return std::path::Path::new(name).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// `expand({expr})` — only the handful of `%`-forms `vim.lsp`/lspconfig
+/// actually use: `%:p` (current buffer's absolute path) and its bare `%`.
+/// Anything else (globs, `<cword>`, other modifiers) returns the input
+/// unchanged rather than guessing — a real gap, not a silent wrong answer.
+fn expand(expr: &str, editor: &dyn EditorAccess) -> String {
+    if let Some(rest) = expr.strip_prefix('%') {
+        let name = editor.buffer_name();
+        return match rest {
+            "" => name,
+            ":p" => std::fs::canonicalize(&name)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(name),
+            _ => name,
+        };
+    }
+    expr.to_string()
+}
+
+/// `fnamemodify({fname}, {mods})` — only `:p` (absolute), `:h` (head/dirname),
+/// `:t` (tail/basename), and `:e` (extension) are implemented; an
+/// unrecognized modifier is a no-op (returns `fname` unchanged) rather than
+/// an error, matching Vim's own behavior for modifiers it doesn't recognize
+/// in a chain.
+fn fnamemodify(fname: &str, mods: &str) -> String {
+    let mut cur = fname.to_string();
+    for part in mods.split(':').filter(|p| !p.is_empty()) {
+        cur = match part {
+            "p" => std::fs::canonicalize(&cur).ok().map(|p| p.to_string_lossy().into_owned()).unwrap_or(cur),
+            "h" => std::path::Path::new(&cur)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            "t" => std::path::Path::new(&cur)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(cur),
+            "e" => std::path::Path::new(&cur)
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            _ => cur,
+        };
+    }
+    cur
 }
 
 fn arg(args: &[Object], i: usize) -> &Object {

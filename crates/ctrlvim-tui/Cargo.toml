@@ -24,6 +24,7 @@ ctrlvim-tools.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml_edit.workspace = true
 
 [[bin]]

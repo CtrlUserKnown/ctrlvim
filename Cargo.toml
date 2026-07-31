@@ -47,8 +47,9 @@ crossterm = "0.28"
 ropey = "1.6"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml_edit = { version = "0.22", features = ["serde"] }
-mlua = { version = "0.9", features = ["lua54", "vendored"] }
+mlua = { version = "0.9", features = ["lua54", "vendored", "serialize"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "net", "io-util", "macros"] }
 rmpv = "1"
 thiserror = "1"

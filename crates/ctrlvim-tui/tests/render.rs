@@ -1029,6 +1029,40 @@ fn vimgrep_with_no_matches_reports_instead_of_opening() {
     assert!(app.message.contains("no matches"), "got {:?}", app.message);
 }
 
+// --- `:Lint` -----------------------------------------------------------------
+
+#[test]
+fn lint_runs_a_real_shellcheck_and_fills_the_quickfix_list() {
+    if std::process::Command::new("shellcheck").arg("--version").output().is_err() {
+        eprintln!("skipping: shellcheck not installed");
+        return;
+    }
+    // Unquoted `$1` is a classic shellcheck SC2086 finding.
+    let mut app = temp_project(&[("check.sh", "#!/bin/sh\necho $1\n")]);
+    app.open_file(0);
+    typ(&mut app, ":Lint");
+    press(&mut app, KeyCode::Enter);
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while app.engine.session.quickfix().is_empty() && Instant::now() < deadline {
+        app.poll_jobs();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let qf = app.engine.session.quickfix();
+    assert!(!qf.is_empty(), "shellcheck should report the unquoted $1 (message: {:?})", app.message);
+    assert!(qf.items().iter().any(|item| item.text.to_lowercase().contains("quote")), "got {:?}", qf.items());
+}
+
+#[test]
+fn lint_reports_when_no_linter_is_configured_for_the_filetype() {
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.open_file(0);
+    typ(&mut app, ":Lint");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.message.contains("no linter configured"), "got {:?}", app.message);
+}
+
 // --- `:!{cmd}` shell overlay -------------------------------------------------
 
 #[test]
