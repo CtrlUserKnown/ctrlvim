@@ -34,7 +34,7 @@ jobs:
       # and the "install" buffer's one-liner on the site is never stale
       # relative to what's actually at the repo root.
       - name: Stage root files
-        run: cp install.sh site/
+        run: mkdir -p site && cp install.sh site/
 
       - uses: actions/upload-pages-artifact@v3
         with:
