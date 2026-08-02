@@ -1,5 +1,16 @@
 # LSP, linting, formatting & tool management — plan
 
+> **Superseded.** The baked-in registry this document describes (phase 5,
+> `ctrlvim-tools::REGISTRY`) was removed: the compiled editor no longer has
+> any built-in knowledge of specific language servers, linkers, formatters,
+> or linters. That's now entirely the user's `lsp.lua` (see
+> `crates/ctrlvim-tui/src/lsp_config.rs`) — a server not declared there does
+> not exist anywhere in the editor. `:Lint` (phase 6-adjacent, hardcoded
+> `shellcheck`/`ruff` parsers) was removed outright rather than genericized;
+> a data-driven replacement is future work, not started. The real LSP
+> client work below (phases 2-4) still describes what was actually built —
+> `ctrlvim-lsp` — just now driven by `lsp.lua` instead of the registry.
+
 Status: **phase 5 (Tool Manager) implemented; phases 1-4 (the real LSP
 client) not started.** This is the scoped-down alternative to a general
 plugin ecosystem: bake in LSP + linters + formatters + a Mason-style
@@ -33,10 +44,17 @@ plugins on top of components.
   long-lived processes, so `Jobs::spawn_shell` (already used for `:!{cmd}`)
   was sufficient.
 
-Still open from the original registry design: no GitHub-release-binary
-install method yet (several LSP servers — `lua_ls`, `marksman`, `jdtls`,
-`lemminx`, `mesonlsp` — and `shellcheck` are marked `Unsupported` until one
-exists).
+Update: the GitHub-release-binary gap is closed, just not as part of that
+static registry (which no longer exists — see the "Superseded" note above).
+`cvi tool fetch-release` is a generic downloader an `lsp.lua` `install` line
+can call directly: it resolves a tag (or `latest`) through the GitHub API,
+downloads a named asset, extracts `.tar.gz`/`.zip`/a bare binary, strips
+leading path components, and `chmod +x`'s the result under
+`~/.local/share/ctrlvim/tools/<name>/` — exactly where `locate()`
+(`crates/ctrlvim-tui/src/data.rs`) already looks, alongside `$PATH`, when
+deciding whether a declared server is installed and what to spawn. See
+`docs/lsp.example.lua`'s `lua_ls` entry for the shape. Source:
+`crates/ctrlvim-tui/src/tool_fetch.rs`.
 
 ## Where things stood before the Tool Manager work
 

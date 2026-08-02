@@ -21,9 +21,17 @@ pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     let mut spans: Vec<Span> = Vec::new();
     let mut x = area.x;
 
-    for (i, buf) in app.buffers.iter().enumerate() {
+    // The Dashboard is a real buffer (so `:dash`/`<leader>d` have somewhere to
+    // switch to) but it isn't a "tab" — it never gets a chip here, and it's
+    // excluded from the numbering `:b N`/`<leader>N`/`gt` use too (see
+    // `App::tab_indices`).
+    for (i, buf) in app.buffers.iter().enumerate().filter(|(_, b)| b.closable()) {
         let active = i == app.active;
-        let dot = if active { theme::green() } else { theme::border() };
+        // The dot doubles as a pin toggle (harpoon): lit when this file is
+        // pinned, dim otherwise. Which tab is active is already conveyed by
+        // the bold/bright label, so the dot doesn't need to repeat that.
+        let pinned = app.engine.session.pins.slot_of(&buf.label).is_some();
+        let dot = if pinned { theme::green() } else { theme::border() };
         let text_color = if active { theme::fg() } else { theme::fg_dim() };
         let weight = if active { Modifier::BOLD } else { Modifier::empty() };
 
@@ -31,6 +39,7 @@ pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         // " ● label "
         let lead = " ● ";
         spans.push(Span::styled(lead, Style::default().fg(dot).bg(theme::bg_dark())));
+        let dot_x = start + 1; // the "●" glyph itself, between the leading spaces
         x += lead.chars().count() as u16;
 
         let label = format!("{} ", buf.label);
@@ -51,14 +60,19 @@ pub fn tab_bar(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
         // Whole tab (except the × glyph) selects the buffer.
         let tab_w = x - start;
         zones.push(Rect { x: start, y: area.y, width: tab_w, height: 1 }, Action::SelectBuffer(i));
-
-        if buf.closable() {
-            let close = "× ";
-            let cx = x;
-            spans.push(Span::styled(close, Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
-            zones.push(Rect { x: cx, y: area.y, width: 2, height: 1 }, Action::CloseBuffer(i));
-            x += close.chars().count() as u16;
+        // The dot itself takes priority over the whole-tab zone (last pushed
+        // wins hit-testing) and toggles the pin instead of selecting the tab.
+        if buf.path.is_some() {
+            zones.push(Rect { x: dot_x, y: area.y, width: 1, height: 1 }, Action::TogglePin(i));
         }
+
+        // Every buffer reaching this point is already `closable()` (the
+        // Dashboard was filtered out above), so the × is unconditional here.
+        let close = "× ";
+        let cx = x;
+        spans.push(Span::styled(close, Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
+        zones.push(Rect { x: cx, y: area.y, width: 2, height: 1 }, Action::CloseBuffer(i));
+        x += close.chars().count() as u16;
 
         // Divider between tabs.
         spans.push(Span::styled("│", Style::default().fg(theme::border_dim()).bg(theme::bg_dark())));

@@ -13,7 +13,7 @@
 //! resolved once per frame by [`crate::wrap`] into a flat list of screen
 //! rows — this module only has to draw whatever row it's handed.
 
-use ctrlvim_core::{char_index_at, char_width, width_upto, HlSpan, Selection, Suggestion, VisualKind};
+use ctrlvim_core::{char_index_at, HlSpan, Selection, Suggestion, VisualKind};
 use ctrlvim_markdown::{analyze, MdLine};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -34,6 +34,10 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
     let lines = app.editor_lines();
     let (cur_line, cur_col) = app.editor_cursor();
     let selection = app.editor_selection();
+    // `'tabstop'`: every width/column calculation below that touches a *raw*
+    // buffer line (as opposed to already tab-expanded rendered text) needs
+    // this — see `wrap::cell_width`.
+    let tabstop = app.tabstop();
     let gutter_w = lines.len().max(1).to_string().len().max(2) as u16;
     let text_x = area.x + gutter_w + 2; // gutter number + two spaces
     let content_w = (area.x + area.width).saturating_sub(text_x);
@@ -118,13 +122,14 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
         // Selection, search, cursor, and ghost text are all in buffer-column
         // space, so they're positioned from this regardless of markdown
         // concealment.
-        let raw_seg_start = if wrap_on { vr.seg_start } else { char_index_at(raw, vp.left_cells) };
+        let raw_seg_start =
+            if wrap_on { vr.seg_start } else { wrap::char_index_at_tabs(raw, vp.left_cells, tabstop) };
         let raw_seg_end = vp.seg_end(vp.top_row + row, &lines);
-        let raw_base_cells = width_upto(raw, raw_seg_start);
+        let raw_base_cells = wrap::width_upto_tabs(raw, raw_seg_start, tabstop);
 
         let mut full_spans: Vec<Span<'static>> = Vec::new();
         match md.as_ref().map(|mdlines| mdlines.get(i)) {
-            Some(Some(mdline)) => md_spans(mdline, i == cur_line, content_w, &mut full_spans),
+            Some(Some(mdline)) => md_spans(mdline, i == cur_line, content_w, tabstop, &mut full_spans),
             // Markdown is on, but this row has no decoration. That happens on
             // the buffer's phantom trailing line: a `Buffer`'s rope always ends
             // in `\n` (its documented `'eol'` invariant), so `lines()` reports a
@@ -134,10 +139,11 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
             // produces. An empty line has nothing to decorate, so rendering it
             // plain is not a fallback but the right answer; going through
             // `get` also means a renderer can never panic on the mismatch.
-            Some(None) => syntax_spans(raw, &[], &mut full_spans),
+            Some(None) => syntax_spans(raw, &[], tabstop, &mut full_spans),
             None => syntax_spans(
                 raw,
                 hl.get(i - first_line).map(Vec::as_slice).unwrap_or(&[]),
+                tabstop,
                 &mut full_spans,
             ),
         }
@@ -154,9 +160,13 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
             let s = char_index_at(&render_text, vp.left_cells);
             (s, render_text.chars().count())
         } else {
-            let raw_starts = wrap::wrap_starts(raw, content_w as usize);
+            let raw_starts = wrap::wrap_starts(raw, content_w as usize, tabstop);
             let ordinal = raw_starts.iter().position(|&s| s == vr.seg_start).unwrap_or(0);
-            let disp_starts = wrap::wrap_starts(&render_text, content_w as usize);
+            // `render_text` came out of `syntax_spans`/`md_spans` above, which
+            // already expanded any tabs to spaces — a real `tabstop` here
+            // would double-expand nothing, since there's nothing left to
+            // expand, but pass it anyway for the signature's sake.
+            let disp_starts = wrap::wrap_starts(&render_text, content_w as usize, tabstop);
             match disp_starts.get(ordinal) {
                 Some(&s) => (s, disp_starts.get(ordinal + 1).copied().unwrap_or_else(|| render_text.chars().count())),
                 None => (render_text.chars().count(), render_text.chars().count()),
@@ -186,11 +196,16 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
         // Visual-mode selection: paint the selection background over the
         // already-rendered cells so the user can see what they're highlighting.
         // set_style repaints the background without touching the glyphs, so
-        // this works regardless of markdown decoration on the row.
+        // this works regardless of markdown decoration on the row. The
+        // foreground is forced to the theme's primary text color too — a
+        // selection background sits close in tone to muted/dim token colors
+        // (comments especially), and leaving the syntax fg alone let text
+        // dissolve into the highlight instead of standing out from it, the
+        // same problem `hlsearch` below works around with `on_accent()`.
         if let Some(sel) = selection {
             if let Some((lo, hi)) = selection_cols(&sel, i, raw.chars().count()) {
                 if let Some((lo, hi)) = clip_range(lo, hi, raw_seg_start, raw_seg_end) {
-                    paint_range(f, raw, lo, hi, raw_base_cells, text_x, right, y, Style::default().bg(theme::selection()));
+                    paint_range(f, raw, lo, hi, raw_base_cells, text_x, right, y, tabstop, Style::default().fg(theme::fg()).bg(theme::selection()));
                 }
             }
         }
@@ -200,7 +215,7 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
         for (lo, hi) in app.editor_search_matches(i) {
             if let Some((lo, hi)) = clip_range(lo, hi, raw_seg_start, raw_seg_end) {
                 paint_range(
-                    f, raw, lo, hi, raw_base_cells, text_x, right, y,
+                    f, raw, lo, hi, raw_base_cells, text_x, right, y, tabstop,
                     // `on_accent`, not `bg()`: a search match has the same
                     // dissolve-into-the-highlight problem the cursor had.
                     Style::default().fg(theme::on_accent()).bg(theme::search()),
@@ -214,7 +229,7 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
         // selection, and search math untouched.
         if let Some(sug) = ghost {
             if i == sug.anchor.line && raw_seg_start <= sug.anchor.col && sug.anchor.col < raw_seg_end.max(raw_seg_start + 1) {
-                let x = text_x + (width_upto(raw, sug.anchor.col) - raw_base_cells) as u16;
+                let x = text_x + (wrap::width_upto_tabs(raw, sug.anchor.col, tabstop) - raw_base_cells) as u16;
                 // The rest of the real line is redrawn *after* the ghost, so a
                 // suggestion offered mid-line pushes the existing text right
                 // instead of covering it.
@@ -231,8 +246,20 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
 
         // Block cursor on the active line. The cursor line renders raw (markup
         // visible), so source columns line up with the screen 1:1.
-        if i == cur_line && raw_seg_start <= cur_col && cur_col < raw_seg_end.max(raw_seg_start + 1) {
-            let cx = text_x + (width_upto(raw, cur_col) - raw_base_cells) as u16;
+        //
+        // `raw_seg_end` is exclusive, which is right for a mid-line wrap
+        // boundary (the next row owns that column) but wrong at the buffer
+        // line's true end: insert mode lets the cursor sit one column past
+        // the last character (e.g. after `A` or typing at EOL), and that
+        // position needs its own row to render on rather than falling
+        // through every row's check.
+        let at_eol = cur_col == raw_seg_end && raw_seg_end == raw.chars().count();
+        if i == cur_line
+            && raw_seg_start <= cur_col
+            && (cur_col < raw_seg_end.max(raw_seg_start + 1) || at_eol)
+        {
+            let cur_cells = wrap::width_upto_tabs(raw, cur_col, tabstop);
+            let cx = text_x + (cur_cells - raw_base_cells) as u16;
             if cx < right {
                 // With ghost text under the cursor the block shows the model's
                 // first character, not the buffer's: that cell now belongs to
@@ -240,17 +267,25 @@ pub fn screen(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones, owns_curs
                 let ch = ghost_char_at(ghost, cur_line, cur_col)
                     .or_else(|| raw.chars().nth(cur_col))
                     .unwrap_or(' ');
-                // A wide glyph needs a two-cell cursor, or the block sits on
-                // half a character and the other half keeps the normal colors.
-                let w = char_width(ch) as u16;
+                // A wide glyph (or a tab) needs a wider cursor, or the block
+                // sits on part of the cell and the rest keeps the normal colors.
+                let w = wrap::cell_width(ch, cur_cells, tabstop) as u16;
                 let w = w.min((area.x + area.width).saturating_sub(cx)).max(1);
+                // A literal tab has no glyph a terminal can stretch across `w`
+                // cells the way it does a wide CJK character — fill with
+                // spaces instead so the whole span the tab occupies is
+                // actually painted in the cursor color.
+                let glyph = if ch == '\t' { " ".repeat(w as usize) } else { ch.to_string() };
                 f.render_widget(
                     Paragraph::new(Span::styled(
-                        ch.to_string(),
+                        glyph,
                         Style::default().fg(theme::on_accent()).bg(cursor_color),
                     )),
                     Rect { x: cx, y, width: w, height: 1 },
                 );
+                // Anchor for the completion popup, regardless of which
+                // surface owns the terminal's own cursor this frame.
+                app.set_cursor_screen_pos((cx, y));
                 // Put the *real* terminal cursor on the same cell. The painted
                 // block carries the mode color, which a hardware cursor can't;
                 // the hardware cursor carries the `'guicursor'` shape and is
@@ -284,12 +319,23 @@ fn clip_range(lo: usize, hi: usize, seg_start: usize, seg_end: usize) -> Option<
 /// offset of this row's segment, so painting still lines up after a wrap
 /// break or a horizontal scroll.
 #[allow(clippy::too_many_arguments)]
-fn paint_range(f: &mut Frame, raw: &str, lo: usize, hi: usize, base_cells: usize, text_x: u16, right: u16, y: u16, style: Style) {
-    let x0 = text_x + (width_upto(raw, lo).saturating_sub(base_cells)) as u16;
+fn paint_range(
+    f: &mut Frame,
+    raw: &str,
+    lo: usize,
+    hi: usize,
+    base_cells: usize,
+    text_x: u16,
+    right: u16,
+    y: u16,
+    tabstop: usize,
+    style: Style,
+) {
+    let x0 = text_x + (wrap::width_upto_tabs(raw, lo, tabstop).saturating_sub(base_cells)) as u16;
     if x0 >= right {
         return;
     }
-    let x1 = (text_x + (width_upto(raw, hi).saturating_sub(base_cells)) as u16).min(right);
+    let x1 = (text_x + (wrap::width_upto_tabs(raw, hi, tabstop).saturating_sub(base_cells)) as u16).min(right);
     let w = x1.saturating_sub(x0);
     if w > 0 {
         f.buffer_mut().set_style(Rect { x: x0, y, width: w, height: 1 }, style);
@@ -449,10 +495,18 @@ fn selection_cols(sel: &Selection, i: usize, len: usize) -> Option<(usize, usize
 /// Spans arrive in char columns and in order; anything between them — and any
 /// range running past the line, which a stale cache could produce mid-edit —
 /// falls back to the default text color rather than dropping characters.
-fn syntax_spans(raw: &str, hl: &[HlSpan], out: &mut Vec<Span<'static>>) {
+///
+/// Slicing happens on `raw`'s own char indices (unchanged by tabs — a `\t` is
+/// still exactly one character to `h`/`l`, marks, and everything else in this
+/// module); only the *text* of each resulting span has its tabs expanded to
+/// spaces just before it's handed to ratatui, which has no notion of a
+/// terminal tab stop and would otherwise render the raw byte as whatever the
+/// terminal does with it — see `expand_tabs`.
+fn syntax_spans(raw: &str, hl: &[HlSpan], tabstop: usize, out: &mut Vec<Span<'static>>) {
     let plain = Style::default().fg(theme::fg());
+    let mut screen_col = 0usize;
     if hl.is_empty() {
-        out.push(Span::styled(raw.to_string(), plain));
+        out.push(Span::styled(expand_tabs(raw, &mut screen_col, tabstop), plain));
         return;
     }
     let chars: Vec<char> = raw.chars().collect();
@@ -461,43 +515,72 @@ fn syntax_spans(raw: &str, hl: &[HlSpan], out: &mut Vec<Span<'static>>) {
         let start = span.start.clamp(col, chars.len());
         let end = span.end.clamp(start, chars.len());
         if start > col {
-            out.push(Span::styled(chars[col..start].iter().collect::<String>(), plain));
+            let text: String = chars[col..start].iter().collect();
+            out.push(Span::styled(expand_tabs(&text, &mut screen_col, tabstop), plain));
         }
         if end > start {
+            let text: String = chars[start..end].iter().collect();
             out.push(Span::styled(
-                chars[start..end].iter().collect::<String>(),
+                expand_tabs(&text, &mut screen_col, tabstop),
                 theme::syn_style(span.kind),
             ));
         }
         col = end;
     }
     if col < chars.len() {
-        out.push(Span::styled(chars[col..].iter().collect::<String>(), plain));
+        let text: String = chars[col..].iter().collect();
+        out.push(Span::styled(expand_tabs(&text, &mut screen_col, tabstop), plain));
     }
+}
+
+/// Expand `text`'s tabs into the spaces they occupy on screen, continuing the
+/// running column `col` — so a line built one highlighted chunk at a time
+/// still lands each `\t` on the right stop, and later chunks know where on
+/// the row they start. Only the rendered text changes; every char-index-based
+/// calculation elsewhere in this module keeps using the untouched raw line.
+fn expand_tabs(text: &str, col: &mut usize, tabstop: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let w = wrap::cell_width(c, *col, tabstop);
+        if c == '\t' {
+            out.extend(std::iter::repeat_n(' ', w));
+        } else {
+            out.push(c);
+        }
+        *col += w;
+    }
+    out
 }
 
 /// Append a rendered markdown line's spans. `reveal` (the cursor's line) shows
 /// raw source; otherwise markup is concealed/replaced. `content_w` is the width
 /// available after the gutter, used to fill rules and code-block backgrounds.
-fn md_spans(line: &MdLine, reveal: bool, content_w: u16, out: &mut Vec<Span<'static>>) {
+fn md_spans(line: &MdLine, reveal: bool, content_w: u16, tabstop: usize, out: &mut Vec<Span<'static>>) {
     // A horizontal rule spans the full width when concealed.
     if let Some(rule) = line.rule() {
         if reveal {
-            out.push(Span::styled(rule.raw.clone(), theme::md_style(rule.kind)));
+            let mut col = 0usize;
+            out.push(Span::styled(expand_tabs(&rule.raw, &mut col, tabstop), theme::md_style(rule.kind)));
         } else {
             out.push(Span::styled("─".repeat(content_w as usize), theme::md_style(rule.kind)));
         }
         return;
     }
 
+    // Cells shown so far, not chars — `seg.raw` can still hold a `\t` (a
+    // reveal-mode source line hasn't been expanded yet), and the code-block
+    // padding below has to fill out to `content_w` *cells*.
     let mut shown = 0usize;
     for seg in &line.segs {
         let text = if reveal { &seg.raw } else { &seg.display };
         if text.is_empty() {
             continue;
         }
-        shown += text.chars().count();
-        out.push(Span::styled(text.clone(), theme::md_style(seg.kind)));
+        let text = if reveal { expand_tabs(text, &mut shown, tabstop) } else { text.clone() };
+        if !reveal {
+            shown += ctrlvim_core::display_width(&text);
+        }
+        out.push(Span::styled(text, theme::md_style(seg.kind)));
     }
 
     // Extend the code-block background across the rest of the row.

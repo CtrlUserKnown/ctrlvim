@@ -1,8 +1,0 @@
-[package]
-name = "ctrlvim-tools"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Registry + installer for LSP servers, formatters, and linters ctrlvim manages itself"
-
-[dependencies]

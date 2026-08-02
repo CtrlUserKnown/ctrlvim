@@ -7,6 +7,10 @@
 # The bridge is the Ex command: a keymap's `rhs` and an autocmd's `command` are
 # ordinary `:` commands, so a plugin contributes behaviour by registering
 # `:Format` and the config just names it.
+#
+# Language servers and build linkers are declared separately, in
+# lsp.example.lua — see that file. ctrlvim ships with no server or linker
+# baked in; nothing shows up in the Settings tab until you declare it there.
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +200,18 @@ command = "set number"
 
 
 # ---------------------------------------------------------------------------
-# [[plugin]] — a directory holding an `init.lua` or `init.vim`.
+# [[plugin]] — `path` is the plugin's Lua entry point file. Adding a plugin is
+# just dropping a `.lua` file under `~/.config/ctrlvim/plugins/` and adding
+# one entry here — nothing else to wire up.
 #
 # Load order is the order declared here, which is why there is no runtimepath
 # search: what loads, and when, is explicit rather than emergent.
-# Give `event` to defer loading until that event first fires.
+# Give `event` to defer loading until that event first fires. Set
+# `enabled = false` to keep the entry declared but not loaded.
 # ---------------------------------------------------------------------------
 # [[plugin]]
 # name = "example"
-# path = "~/.config/ctrlvim/pack/example"
+# path = "~/.config/ctrlvim/plugins/example.lua"
 # event = "BufWritePre"   # omit to load at startup
 # enabled = true
 

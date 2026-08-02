@@ -35,10 +35,12 @@ fn temp_project(files: &[(&str, &str)]) -> App {
     // these tests act on `recent_files` straight away, so block for it here
     // rather than racing the worker.
     app.wait_for_project();
-    // `App::with_root` loads the *developer's* `~/.config/ctrlvim/config.toml`,
-    // which would make these tests depend on whoever runs them — a machine with
-    // `drawer = true` renders a different screen. Pin the defaults instead.
+    // `App::with_root` loads the *developer's* `~/.config/ctrlvim/config.toml`
+    // and `lsp.lua`, which would make these tests depend on whoever runs them
+    // — a machine with `drawer = true`, or any declared server at all, renders
+    // a different screen. Pin the defaults instead.
     app.config = ctrlvim::config::Config::default();
+    app.set_lsp_decls(Vec::new());
     app
 }
 
@@ -191,15 +193,34 @@ fn empty_project_renders_empty_states() {
 // --- settings / about ------------------------------------------------------
 
 #[test]
-fn settings_tab_lists_servers() {
+fn settings_tab_lists_only_declared_servers() {
+    use ctrlvim::lsp_config::LspServerDecl;
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    app.set_lsp_decls(vec![
+        LspServerDecl {
+            name: "rust_analyzer".into(),
+            filetypes: vec!["rust".into()],
+            cmd: vec!["rust-analyzer".into()],
+            install: None,
+            enabled: true,
+        },
+        // A build linker: presence-only, no filetypes.
+        LspServerDecl { name: "mold".into(), filetypes: vec![], cmd: vec!["mold".into()], install: None, enabled: true },
+    ]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["LANGUAGE SERVERS", "rust_analyzer", "mold", "lsp.lua"]);
+    // The EDITOR options panel exposes the file-drawer and indent-width settings.
+    contains_all(&out, &["EDITOR", "Open file drawer on startup", "Indent width", "config.toml"]);
+    assert!(!out.contains("┤ KEYBINDINGS ├")); // keybindings pane removed
+}
+
+#[test]
+fn settings_tab_shows_nothing_declared_when_lsp_lua_is_empty() {
     let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
     app.dispatch(Action::GotoSection(DashboardSection::Settings));
     let out = render(&app, 130, 44);
-    // Known servers/linkers are always listed; install state varies by machine.
-    contains_all(&out, &["LANGUAGE SERVERS", "rust_analyzer", "ts_ls", "jdtls", "mold", "lsp.toml"]);
-    // The EDITOR options panel exposes the file-drawer setting.
-    contains_all(&out, &["EDITOR", "Open file drawer on startup", "config.toml"]);
-    assert!(!out.contains("┤ KEYBINDINGS ├")); // keybindings pane removed
+    contains_all(&out, &["No servers declared", "lsp.lua"]);
 }
 
 #[test]
@@ -300,25 +321,41 @@ fn plugin_manager_screen() {
     let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
     app.dispatch(Action::OpenPlugins);
     let out = render(&app, 130, 44);
-    contains_all(&out, &["Plugin Manager", "loaded", "updates available"]);
+    contains_all(&out, &["Plugin Manager", "No plugins configured"]);
 }
 
 #[test]
-fn plugin_manager_shows_commands_a_matching_plugin_contributed() {
-    use ctrlvim::model::{Plugin, PluginStatus};
+fn plugin_manager_only_shows_plugins_declared_in_config() {
+    // A plugin absent from `config.toml` must not appear anywhere in the
+    // Plugin Manager — not even scanned off disk.
+    use ctrlvim::app::PluginLoadStatus;
+    use ctrlvim::config::PluginEntry;
     let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
-    // Simulate a pack-directory plugin entry ...
-    app.project.plugins.push(Plugin {
+    app.config.plugins.push(PluginEntry {
         name: "hello".to_string(),
-        repo: "someone/hello".to_string(),
-        category: "start".to_string(),
-        status: PluginStatus::Loaded,
+        path: "/tmp/does-not-matter.lua".to_string(),
+        event: None,
+        enabled: true,
     });
+    app.plugin_status.insert("hello".to_string(), PluginLoadStatus::Loaded);
     // ... whose startup script (file stem "hello") registered a command.
     app.engine.run_lua_as(Some("hello"), "vim.api.ctrlvim_create_user_command('Greet', function() end, {})").unwrap();
     app.dispatch(Action::OpenPlugins);
     let out = render(&app, 130, 44);
     contains_all(&out, &["hello", "commands: Greet"]);
+}
+
+#[test]
+fn a_plugin_absent_from_config_never_appears_in_the_plugin_manager() {
+    // Even a plugin that would be discoverable some other way (e.g. sitting
+    // under a pack directory) must not show up here unless config.toml says
+    // so — absence from config means absence from the editor.
+    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
+    assert!(app.config.plugins.is_empty());
+    app.dispatch(Action::OpenPlugins);
+    let out = render(&app, 130, 44);
+    assert!(!out.contains("pack/"), "no filesystem-scanned plugin path should ever appear:\n{out}");
+    contains_all(&out, &["No plugins configured"]);
 }
 
 // --- overlays --------------------------------------------------------------
@@ -613,6 +650,41 @@ fn palette_surfaces_theme_commands() {
 }
 
 #[test]
+fn palette_toggles_autoindent_without_touching_the_config_file() {
+    let mut app = temp_project(&[("f.rs", "x\n")]);
+    app.open_file(0);
+    let before_cfg = app.config.clone();
+    assert!(app.autoindent_enabled(), "autoindent is on by default");
+
+    key(&mut app, ':');
+    typ(&mut app, "autoindent");
+    let results = app.palette_results();
+    let idx = results
+        .iter()
+        .position(|it| it.label == "Auto-indent: Turn Off")
+        .expect("the quick auto-indent toggle should surface in the palette");
+    assert!(matches!(&results[idx].action, Action::RunEx(cmd) if cmd == "set autoindent!"));
+    app.palette_index = idx;
+    press(&mut app, KeyCode::Enter);
+
+    assert!(!app.autoindent_enabled(), "the session option flipped");
+    assert_eq!(app.config, before_cfg, "the config file was never touched");
+
+    // Toggling again flips the label back and re-enables it — a real quick
+    // on/off, not a one-way switch.
+    key(&mut app, ':');
+    typ(&mut app, "autoindent");
+    let results = app.palette_results();
+    let idx = results
+        .iter()
+        .position(|it| it.label == "Auto-indent: Turn On")
+        .expect("the label should track the flipped state");
+    app.palette_index = idx;
+    press(&mut app, KeyCode::Enter);
+    assert!(app.autoindent_enabled());
+}
+
+#[test]
 fn palette_surfaces_user_defined_commands() {
     let mut app = temp_project(&[("f.rs", "hello\n")]);
     app.open_file(0);
@@ -744,6 +816,51 @@ fn rust_buffers_are_syntax_highlighted_by_the_engine() {
     assert_eq!(fg_of(&buf, "\"hi\"", 0), ctrlvim::theme::green(), "string");
     // The status line reports the filetype the highlighter actually used.
     assert!(render(&app, 100, 24).contains("rust"));
+}
+
+#[test]
+fn a_tab_indented_line_renders_at_the_tab_stop_not_one_cell_over() {
+    // A raw tab, the way `noexpandtab` (Vim's default) inserts one for `<Tab>`
+    // in insert mode — not four spaces.
+    let src = "fn f() {\n\tlet x = 1;\n}\n";
+    let mut app = temp_project(&[("main.rs", src)]);
+    app.open_file(0);
+    let buf = render_cells(&app, 100, 24);
+
+    // Row 0 is the content area's top padding (see `ui::body`'s inset); row 1
+    // is buffer line 0 ("fn f() {"), row 2 is the tab-indented line.
+    let row: String = (0..buf.area.width).map(|x| buf[(x, 2)].symbol()).collect();
+    let text_x = 2 /* body padding */ + 2 /* gutter width */ + 2;
+    let let_at = row.find("let").expect("the tab-indented line rendered") as u16;
+    assert_eq!(
+        let_at - text_x,
+        4,
+        "default 'tabstop' is 4, so \"let\" starts at content column 4, not 1: {row:?}"
+    );
+    // Every cell the tab itself occupies is blank, not left over from a
+    // previous frame or the literal tab byte misrendering.
+    for col in text_x..let_at {
+        assert_eq!(buf[(col, 2)].symbol(), " ", "cell {col} under the tab should be blank");
+    }
+}
+
+#[test]
+fn moving_past_a_tab_lands_the_cursor_at_the_next_tab_stop() {
+    // The cursor block itself must line up with the same tab-stop math as the
+    // text — this is what a wrong `char_width` for '\t' desyncs.
+    let mut app = temp_project(&[("main.rs", "\tx\n")]);
+    app.open_file(0);
+    // Move right past the tab onto 'x' (one buffer column: 'l' or Right).
+    press(&mut app, KeyCode::Right);
+    let (line, col) = app.editor_cursor();
+    assert_eq!((line, col), (0, 1), "one character past the tab");
+    let buf = render_cells(&app, 100, 24);
+    let text_x: u16 = 2 /* body padding */ + 2 /* gutter width */ + 2;
+    // Row 1: row 0 is the content area's top padding (see `ui::body`'s inset).
+    let x_at = (0..buf.area.width)
+        .find(|&x| buf[(x, 1)].symbol() == "x")
+        .expect("the x rendered");
+    assert_eq!(x_at - text_x, 4, "'x' sits at cell 4, after the tab's full width");
 }
 
 #[test]
@@ -1034,40 +1151,6 @@ fn vimgrep_with_no_matches_reports_instead_of_opening() {
     assert!(app.engine.session.quickfix().is_empty());
     assert!(!app.quickfix_open, "an empty result must not open an empty pane");
     assert!(app.message.contains("no matches"), "got {:?}", app.message);
-}
-
-// --- `:Lint` -----------------------------------------------------------------
-
-#[test]
-fn lint_runs_a_real_shellcheck_and_fills_the_quickfix_list() {
-    if std::process::Command::new("shellcheck").arg("--version").output().is_err() {
-        eprintln!("skipping: shellcheck not installed");
-        return;
-    }
-    // Unquoted `$1` is a classic shellcheck SC2086 finding.
-    let mut app = temp_project(&[("check.sh", "#!/bin/sh\necho $1\n")]);
-    app.open_file(0);
-    typ(&mut app, ":Lint");
-    press(&mut app, KeyCode::Enter);
-
-    let deadline = Instant::now() + std::time::Duration::from_secs(10);
-    while app.engine.session.quickfix().is_empty() && Instant::now() < deadline {
-        app.poll_jobs();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-
-    let qf = app.engine.session.quickfix();
-    assert!(!qf.is_empty(), "shellcheck should report the unquoted $1 (message: {:?})", app.message);
-    assert!(qf.items().iter().any(|item| item.text.to_lowercase().contains("quote")), "got {:?}", qf.items());
-}
-
-#[test]
-fn lint_reports_when_no_linter_is_configured_for_the_filetype() {
-    let mut app = temp_project(&[("main.rs", "fn main() {}\n")]);
-    app.open_file(0);
-    typ(&mut app, ":Lint");
-    press(&mut app, KeyCode::Enter);
-    assert!(app.message.contains("no linter configured"), "got {:?}", app.message);
 }
 
 // --- `:!{cmd}` shell overlay -------------------------------------------------
@@ -1582,18 +1665,55 @@ fn scrolling_a_folded_buffer_moves_by_screen_rows() {
 }
 
 #[test]
+fn keyboard_scrolling_stays_put_when_the_cursor_moves_back_within_view() {
+    // Regression: `view_top` used to change only via the mouse wheel, so once
+    // keyboard movement scrolled the window (`G` on a long file) nothing ever
+    // recorded where the view actually landed. Moving the cursor back up
+    // while it was still comfortably inside that window re-derived `top_row`
+    // from the stale (usually 0) `view_top`, snapping the view down again —
+    // the cursor would appear stuck on its old screen row while the text
+    // scrolled under it, then jump once the stale anchor came back in range.
+    let mut app = long_file();
+    render(&app, 100, 20);
+    typ(&mut app, "G"); // jump to the last line, forcing a keyboard scroll
+    let before = render(&app, 100, 20);
+    let top_line_before = before.lines().find(|l| l.contains("line ")).unwrap().to_string();
+
+    typ(&mut app, "kkk"); // move up a few lines, still well inside the window
+    let after = render(&app, 100, 20);
+    let top_line_after = after.lines().find(|l| l.contains("line ")).unwrap().to_string();
+
+    assert_eq!(
+        top_line_before, top_line_after,
+        "the view should not have moved:\nbefore:\n{before}\nafter:\n{after}"
+    );
+}
+
+#[test]
 fn settings_navigation_spans_options_and_lsp() {
+    use ctrlvim::lsp_config::LspServerDecl;
     let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.set_lsp_decls(vec![LspServerDecl {
+        name: "rust_analyzer".into(),
+        filetypes: vec!["rust".into()],
+        cmd: vec!["rust-analyzer".into()],
+        install: None,
+        enabled: true,
+    }]);
     app.dispatch(Action::GotoSection(DashboardSection::Settings));
     assert_eq!(app.settings_index, 0); // drawer option
     app.move_settings(1);
-    assert_eq!(app.settings_index, 1); // mouse option
+    assert_eq!(app.settings_index, 1); // tab-bar option
     app.move_settings(1);
-    assert_eq!(app.settings_index, 2); // file-icons option
+    assert_eq!(app.settings_index, 2); // mouse option
     app.move_settings(1);
-    assert_eq!(app.settings_index, 3); // inline AI suggestions
+    assert_eq!(app.settings_index, 3); // file-icons option
     app.move_settings(1);
-    assert_eq!(app.settings_index, 4, "j continues into the LSP list");
+    assert_eq!(app.settings_index, 4); // indent-width option
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 5); // inline AI suggestions
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 6, "j continues into the LSP list");
     // Toggling the focused LSP flips its enabled state (no disk write). The
     // option rows above deliberately aren't toggled here: they persist to the
     // *real* `~/.config/ctrlvim/config.toml`, which a test must never touch.
@@ -1608,17 +1728,76 @@ fn settings_navigation_spans_options_and_lsp() {
 }
 
 #[test]
-fn installing_an_unsupported_tool_reports_a_message_without_spawning_a_job() {
+fn settings_search_filters_by_key_or_label_without_touching_navigation_semantics() {
     let mut app = temp_project(&[("main.rs", "x\n")]);
-    // lua_ls has no scripted install method — whether or not it happens to be
-    // installed on the machine running this test, no job should ever spawn.
-    let i = app.project.lsp.iter().position(|l| l.name == "lua_ls").expect("lua_ls in the registry");
-    app.install_tool(i);
-    assert!(
-        app.message.contains("already installed") || app.message.contains("no install method available"),
-        "unexpected message: {}",
-        app.message
-    );
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    app.settings_start_search();
+    assert!(app.settings_search);
+    for c in "indent".chars() {
+        app.settings_search_type(c);
+    }
+    assert_eq!(app.settings_matches(), vec![4], "only the Indent width row matches \"indent\"");
+    assert_eq!(app.settings_index, 4, "the selection follows the sole match");
+
+    // Navigation while searching only visits matches, never the rows the
+    // query filtered out — even though `settings_index` stays a real index.
+    app.move_settings(1);
+    assert_eq!(app.settings_index, 4, "wraps within the single-item match set");
+
+    let out = render(&app, 130, 44);
+    assert!(out.contains("Indent width"), "the matching row still renders:\n{out}");
+    assert!(!out.contains("Mouse support"), "a filtered-out row must not render:\n{out}");
+
+    // Escape restores the full row list and closes the search field.
+    app.settings_search_clear();
+    assert!(!app.settings_search);
+    assert_eq!(app.settings_matches().len(), App::SETTINGS_EDITOR_OPTIONS);
+}
+
+#[test]
+fn settings_search_backspace_to_empty_shows_the_full_list_again() {
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    app.settings_start_search();
+    app.settings_search_type('a');
+    app.settings_search_type('i');
+    let filtered = app.settings_matches();
+    assert!(filtered.len() < App::SETTINGS_EDITOR_OPTIONS, "\"ai\" narrows the list");
+
+    app.settings_search_backspace();
+    app.settings_search_backspace();
+    assert!(app.settings_search, "backspace alone does not close search");
+    assert_eq!(app.settings_matches().len(), App::SETTINGS_EDITOR_OPTIONS, "an empty query matches everything");
+}
+
+#[test]
+fn a_setting_absent_from_the_search_query_is_never_rendered() {
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.dispatch(Action::GotoSection(DashboardSection::Settings));
+    app.settings_start_search();
+    for c in "mouse".chars() {
+        app.settings_search_type(c);
+    }
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["Mouse support"]);
+    for absent in ["Open file drawer", "Show tabs", "File icons", "Indent width", "Inline AI"] {
+        assert!(!out.contains(absent), "{absent:?} should be filtered out:\n{out}");
+    }
+}
+
+#[test]
+fn installing_a_server_with_no_declared_install_command_reports_a_message_without_spawning_a_job() {
+    use ctrlvim::lsp_config::LspServerDecl;
+    let mut app = temp_project(&[("main.rs", "x\n")]);
+    app.set_lsp_decls(vec![LspServerDecl {
+        name: "lua_ls".into(),
+        filetypes: vec!["lua".into()],
+        cmd: vec!["ctrlvim-definitely-not-a-real-binary".into()],
+        install: None,
+        enabled: true,
+    }]);
+    app.install_tool(0);
+    assert!(app.message.contains("no install command declared"), "unexpected message: {}", app.message);
     assert!(!app.shell_open, "no install job should have been spawned");
 }
 
@@ -1648,18 +1827,79 @@ fn ctrl_tab_cycles_buffers() {
 }
 
 #[test]
+fn clicking_the_tab_dot_toggles_the_pin() {
+    let mut app = temp_project(&[("a.rs", "a\n")]);
+    app.open_file(0); // buffers[1] = a.rs
+    let idx = app.active;
+    assert!(app.engine.session.pins.slot_of("a.rs").is_none());
+    app.dispatch(Action::TogglePin(idx));
+    assert!(app.engine.session.pins.slot_of("a.rs").is_some(), "the dot pins the file");
+    app.dispatch(Action::TogglePin(idx));
+    assert!(app.engine.session.pins.slot_of("a.rs").is_none(), "clicking it again unpins");
+}
+
+#[test]
+fn leader_h_opens_a_pin_popup_listing_pinned_files() {
+    let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n")]);
+    app.open_file(0);
+    run_cmd(&mut app, "Pin");
+    app.open_file(1);
+    run_cmd(&mut app, "Pin");
+    assert!(!app.pin_menu_open);
+
+    run_cmd(&mut app, "PinList");
+    assert!(app.pin_menu_open, "`:PinList` opens the popup instead of just a message");
+    let out = render(&app, 130, 44);
+    contains_all(&out, &["Pinned Files", "a.rs", "b.rs"]);
+
+    // `j`/`k` move the selection; `d` unpins without closing the menu.
+    app.pin_menu_move(1);
+    let cursor = app.pin_menu_cursor;
+    app.pin_menu_unpin();
+    assert_eq!(app.engine.session.pins.len(), 1, "one pin left after unpinning the selected row");
+    assert!(app.pin_menu_open, "the menu stays open with pins remaining");
+    let _ = cursor;
+
+    input::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!app.pin_menu_open, "Esc closes the popup");
+}
+
+#[test]
+fn ctrl_o_returns_to_the_previous_file_with_unsaved_edits_intact() {
+    let mut app = temp_project(&[("a.rs", "one\n"), ("b.rs", "two\n")]);
+    app.open_file(0); // a.rs
+    key(&mut app, 'A'); // append at end of line
+    typ(&mut app, "wip");
+    press(&mut app, KeyCode::Esc);
+    assert!(app.active_modified(), "a.rs has an unsaved edit");
+    let a_idx = app.active;
+
+    app.open_file(1); // b.rs, the way a finder pick / tag jump would open it
+    assert_ne!(app.active, a_idx);
+
+    ctrl(&mut app, 'o');
+    assert_eq!(app.active, a_idx, "Ctrl-O returns to the previously open file");
+    assert!(app.active_modified(), "the unsaved edit survived the round trip");
+    assert!(app.editor_lines().join("\n").contains("wip"));
+
+    ctrl(&mut app, 'i');
+    assert_ne!(app.active, a_idx, "Ctrl-I goes forward again");
+}
+
+#[test]
 fn leader_number_jumps_to_tab() {
     // Leader (Space) mappings run in the engine, so this works while a file tab
-    // is focused. Tabs are 1-based: 1 = Dashboard, 2 = a.rs, 3 = b.rs, 4 = c.rs.
+    // is focused. The Dashboard is never numbered — tabs are 1 = a.rs,
+    // 2 = b.rs, 3 = c.rs — even though it still sits at `buffers[0]`.
     let mut app = temp_project(&[("a.rs", "a\n"), ("b.rs", "b\n"), ("c.rs", "c\n")]);
     app.open_file(0);
     app.open_file(1);
-    app.open_file(2); // active = c.rs (tab 4)
-    typ(&mut app, " 2"); // <leader>2 → a.rs
+    app.open_file(2); // active = c.rs (tab 3)
+    typ(&mut app, " 2"); // <leader>2 → b.rs
+    assert_eq!(app.active, 2);
+    typ(&mut app, " 1"); // <leader>1 → a.rs (not the Dashboard)
     assert_eq!(app.active, 1);
-    typ(&mut app, " 1"); // <leader>1 → Dashboard (tab 1)
-    assert_eq!(app.active, 0);
-    typ(&mut app, " 4"); // works from the dashboard too → c.rs
+    typ(&mut app, " 3"); // → c.rs
     assert_eq!(app.active, 3);
 }
 
@@ -1671,13 +1911,13 @@ fn ex_buffer_navigation() {
     app.open_file(2); // + c.rs  (active)
     let last = app.active;
     run_cmd(&mut app, "bfirst");
-    assert_eq!(app.active, 0, ":bfirst → first buffer");
+    assert_eq!(app.active, 1, ":bfirst → first *file* tab, not the Dashboard");
     run_cmd(&mut app, "bnext");
-    assert_eq!(app.active, 1, ":bnext advances");
+    assert_eq!(app.active, 2, ":bnext advances");
     run_cmd(&mut app, "blast");
     assert_eq!(app.active, last, ":blast → last buffer");
-    run_cmd(&mut app, "b 2"); // 1-based
-    assert_eq!(app.active, 1);
+    run_cmd(&mut app, "b 2"); // 1-based, counting files only → b.rs
+    assert_eq!(app.active, 2);
     let before = app.buffers.len();
     run_cmd(&mut app, "bdelete");
     assert_eq!(app.buffers.len(), before - 1, ":bdelete closes a buffer");
@@ -2181,9 +2421,12 @@ fn the_panel_floats_over_the_screen_rather_than_replacing_it() {
         .filter(|l| l.contains("\u{256d}") || l.contains("\u{2570}"))
         .count();
     assert!(framed > 0, "expected rounded popup borders:\n{out}");
-    // Top and bottom rows belong to the shell, not the panel.
+    // Top and bottom rows belong to the shell, not the panel. Tabs are off by
+    // default, so there's no tab bar to check here — the dashboard's own
+    // header (logo + workspace/settings/about) is what should still be above
+    // the popup.
     let lines: Vec<&str> = out.lines().collect();
-    assert!(lines[0].contains("Dashboard"), "tab bar survives: {:?}", lines[0]);
+    assert!(lines[1].contains("ctrlvim"), "dashboard header survives: {:?}", lines[1]);
     assert!(
         lines.iter().rev().take(2).any(|l| l.contains("NORMAL")),
         "status line survives:\n{out}"
@@ -2634,4 +2877,96 @@ fn the_cursor_block_stays_readable_whatever_the_theme() {
         "the cursor glyph must not be drawn in Color::Reset"
     );
     assert_eq!(cursor.style().fg, Some(ctrlvim::theme::on_accent()));
+}
+
+// --- code completion --------------------------------------------------
+
+#[test]
+fn typing_a_prefix_pops_up_a_word_match_from_elsewhere_in_the_buffer() {
+    let mut app = temp_project(&[("a.rs", "let alpha_value = 1;\nlet a\n")]);
+    app.open_file(0);
+    typ(&mut app, "j$a"); // end of "let a", insert mode
+    typ(&mut app, "l"); // "let al", prefix "al"
+    let menu = app.completion.as_ref().expect("a buffer-word match should have popped up");
+    assert!(
+        menu.items.iter().any(|i| i.label == "alpha_value"),
+        "expected alpha_value among {:?}",
+        menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_word_in_progress_does_not_complete_against_itself() {
+    // Regression: masking only the *typed* prefix, not the whole line, used
+    // to let "XYhello" complete "XY" against its own not-yet-finished self.
+    let mut app = temp_project(&[("a.rs", "hello\n")]);
+    app.open_file(0);
+    key(&mut app, 'i');
+    typ(&mut app, "XY");
+    assert!(app.completion.is_none(), "must not suggest the word it's still typing");
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.editor_mode(), "n", "Esc must still leave Insert mode with no popup involved");
+}
+
+#[test]
+fn tab_accepts_the_selected_completion_and_replaces_the_prefix() {
+    let mut app = temp_project(&[("a.rs", "let alpha_value = 1;\nlet a\n")]);
+    app.open_file(0);
+    typ(&mut app, "j$a");
+    typ(&mut app, "l");
+    assert!(app.completion.is_some());
+    press(&mut app, KeyCode::Tab);
+    assert!(app.completion.is_none(), "accepting closes the popup");
+    assert_eq!(app.editor_lines()[1], "let alpha_value");
+    assert_eq!(app.editor_cursor(), (1, "let alpha_value".len()));
+}
+
+#[test]
+fn a_non_identifier_key_closes_the_popup_without_a_second_esc() {
+    let mut app = temp_project(&[("a.rs", "let alpha_value = 1;\nlet a\n")]);
+    app.open_file(0);
+    typ(&mut app, "j$a");
+    typ(&mut app, "l");
+    assert!(app.completion.is_some());
+    typ(&mut app, " "); // space: not part of an identifier
+    assert!(app.completion.is_none());
+    assert_eq!(app.editor_lines()[1], "let al ", "the space itself still got typed");
+}
+
+#[test]
+fn esc_always_leaves_insert_mode_even_with_the_popup_open() {
+    let mut app = temp_project(&[("a.rs", "let alpha_value = 1;\nlet a\n")]);
+    app.open_file(0);
+    typ(&mut app, "j$a");
+    typ(&mut app, "l");
+    assert!(app.completion.is_some());
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.editor_mode(), "n", "one Esc always exits Insert mode, popup or not");
+    assert!(app.completion.is_none());
+}
+
+#[test]
+fn down_and_up_move_the_completion_selection() {
+    let mut app = temp_project(&[("a.rs", "let alpha_first = 1;\nlet alpha_second = 2;\nlet a\n")]);
+    app.open_file(0);
+    typ(&mut app, "jj$a");
+    typ(&mut app, "l");
+    let menu = app.completion.as_ref().expect("two candidates should have matched");
+    assert_eq!(menu.items.len(), 2);
+    let first = app.completion.as_ref().unwrap().selected;
+    press(&mut app, KeyCode::Down);
+    assert_ne!(app.completion.as_ref().unwrap().selected, first);
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.completion.as_ref().unwrap().selected, first);
+}
+
+#[test]
+fn the_completion_popup_renders_near_the_cursor() {
+    let mut app = temp_project(&[("a.rs", "let alpha_value = 1;\nlet a\n")]);
+    app.open_file(0);
+    typ(&mut app, "j$a");
+    typ(&mut app, "l");
+    assert!(app.completion.is_some());
+    let out = render(&app, 100, 24);
+    assert!(out.contains("alpha_value"), "the popup should list the match:\n{out}");
 }

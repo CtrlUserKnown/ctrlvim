@@ -23,14 +23,15 @@ use std::time::Instant;
 use ctrlvim_ai::{Completer, Request as AiRequest, Status as AiStatus};
 use ctrlvim_core::syntax::{self, Filetype};
 use ctrlvim_core::{
-    char_index_at, grep_text, width_upto, AiCmd, BufferCmd, ContextWindow, Ctrlvim, Event,
+    grep_text, AiCmd, BufferCmd, ContextWindow, Ctrlvim, Event,
     EventLoop, ExEffect, HlSpan, Jobs, Key, LineBuffer, MapMode, Matcher, OutputParser, PinCmd,
     QfItem, QfKind, QuickfixCmd, Selection, Suggestion, TagAddress, TagCmd, TimerService,
 };
 
-use crate::config::{expand_tilde, Config, PluginEntry};
+use crate::config::{expand_tilde, Config, PluginEntry, SettingValue};
 use crate::data::{list_dir, FinderEntry};
 use crate::data::Project;
+use crate::model::LspServer;
 use crate::replace::{by_file, Field, ReplacePanel, MAX_HITS};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,14 @@ pub enum DashboardSection {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PanelId {
     Git,
+}
+
+/// What happened the one time a `[[plugin]]` entry was actually loaded — see
+/// `App::plugin_status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginLoadStatus {
+    Loaded,
+    Error(String),
 }
 
 /// What kind of screen a buffer/tab shows.
@@ -85,6 +94,24 @@ impl Buffer {
     pub fn is_markdown(&self) -> bool {
         matches!(self.kind, BufferKind::File) && is_markdown_name(&self.label)
     }
+}
+
+/// The code-completion popup: language-server results (client-side refiltered
+/// as you type, refreshed for real once a debounced request comes back) with
+/// buffer-word matches appended after them.
+pub struct CompletionMenu {
+    /// What's actually shown — already filtered to the current prefix and
+    /// merged with word matches. Recomputed on every keystroke that keeps
+    /// the menu open (see `App::refresh_completion_display`).
+    pub items: Vec<ctrlvim_lsp::CompletionItem>,
+    pub selected: usize,
+    /// Raw, unfiltered results from the language server's last reply, kept
+    /// around so `items` can be recomputed locally (instant) as the prefix
+    /// changes, without waiting on a fresh round trip.
+    lsp_cache: Vec<ctrlvim_lsp::CompletionItem>,
+    /// `(line, col)` where the word being completed starts — replaced with
+    /// the accepted item's `insert_text` up to the current cursor column.
+    pub replace_from: (usize, usize),
 }
 
 /// The full-screen fuzzy file browser (telescope `file_browser` style): browse
@@ -206,6 +233,47 @@ fn is_markdown_name(name: &str) -> bool {
     lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdown")
 }
 
+// --- code completion --------------------------------------------------
+
+/// How long to let typing settle before actually asking the language server
+/// for completions — mirrors `[ai] debounce_ms`'s reasoning: asking on every
+/// keystroke would cancel each request with the next one and finish none.
+const COMPLETION_DEBOUNCE_MS: u64 = 150;
+
+/// A completion popup this size is already a lot to scan; buffer-word
+/// matches are capped here rather than left to grow with the file.
+const COMPLETION_MAX_WORD_MATCHES: usize = 50;
+
+/// Non-identifier characters that still count as "keep completing" —
+/// `.`/`::`/`->` are the common member-access triggers across the
+/// languages ctrlvim ships grammars for.
+const COMPLETION_TRIGGER_CHARS: [char; 3] = ['.', ':', '>'];
+
+/// LSP positions count columns in UTF-16 code units, not the bytes
+/// `ctrlvim_editor` uses internally — identical for ASCII, which is why this
+/// divergence is easy to miss, but a non-ASCII character earlier on the line
+/// would otherwise send the server the wrong column.
+fn utf16_col(line: &str, byte_col: usize) -> usize {
+    line[..byte_col.min(line.len())].chars().map(char::len_utf16).sum()
+}
+
+/// Every maximal run of identifier characters in `text`, in order.
+fn identifiers(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 /// Every discrete action the UI can perform, shared by keyboard and mouse.
 #[derive(Clone)]
 pub enum Action {
@@ -234,10 +302,13 @@ pub enum Action {
     OpenPlugins,
     OpenDashboard,
     ToggleLsp(usize),
-    /// Install the tool at this row in `project.lsp` (see `App::install_tool`).
+    /// Install the tool at this row in `lsp` (see `App::install_tool`).
     InstallTool(usize),
     ToggleMouse,
     CycleIconMode,
+    /// Cycle 'tabstop'/'shiftwidth' (kept equal) through 2 → 4 → 8 from the
+    /// Settings tab, applying it live and persisting the choice.
+    CycleIndentWidth,
     /// Flip inline AI suggestions from the Settings tab, persisting the choice.
     ToggleAi,
     /// Select (and jump to) a quickfix entry by list index.
@@ -260,6 +331,11 @@ pub enum Action {
     CloseSidebar,
     ToggleHelp,
     CloseHelp,
+    ClosePinMenu,
+    /// Click a row in the pin menu — opens that pinned file and closes the menu.
+    PinMenuSelect(usize),
+    /// Click a row in the completion popup — accepts that item.
+    CompletionSelect(usize),
     ToggleMarkdown,
     /// Run an Ex command through the engine (e.g. `"w"`, `"q!"`). Carries the
     /// command text without the leading colon.
@@ -273,6 +349,10 @@ pub enum Action {
     NewFile,
     /// Flip the "open file drawer on startup" config setting (Settings tab).
     ToggleStartupDrawer,
+    /// Flip the "show the tab bar" config setting (Settings tab).
+    ToggleTabs,
+    /// Pin/unpin a buffer by index — the tab bar's dot.
+    TogglePin(usize),
     /// Dismiss the save-as prompt without saving.
     CloseSavePrompt,
     /// Dismiss the `:!{cmd}` output overlay.
@@ -292,6 +372,16 @@ pub struct App {
 
     pub buffers: Vec<Buffer>,
     pub active: usize,
+
+    /// Cross-file `Ctrl-O`/`Ctrl-I` history: the engine's own jumplist only
+    /// ever sees one file's text at a time (see `load_active_into_engine`),
+    /// so file-to-file jumps are tracked here instead. Back is popped by
+    /// `jump_file_back`, pushed by `record_file_jump`; forward mirrors it.
+    file_jumps_back: Vec<(PathBuf, (usize, usize))>,
+    file_jumps_fwd: Vec<(PathBuf, (usize, usize))>,
+    /// Set for the duration of `jump_file_back`/`_forward`'s own internal
+    /// buffer switch, so walking the history doesn't also record a new entry.
+    suppress_jump_record: bool,
 
     pub section: DashboardSection,
 
@@ -321,14 +411,46 @@ pub struct App {
 
     pub expand_git: bool,
 
+    /// Every server/linker declared in `lsp.lua`, loaded once at startup —
+    /// the sole source of truth for what `ensure_lsp_client` may spawn. See
+    /// `crate::lsp_config`.
+    lsp_decls: Vec<crate::lsp_config::LspServerDecl>,
+    /// Display rows derived from `lsp_decls`, in the same order/indices —
+    /// what the Settings tab's LSP table and `lsp_active_count` read. Kept in
+    /// its own field (rather than recomputed at render time) only so
+    /// `install_tool` has somewhere to write back a fresh `installed` bit
+    /// after a job finishes; it is never a *different* list than `lsp_decls`.
+    pub lsp: Vec<LspServer>,
     pub lsp_enabled: Vec<bool>,
     /// Selection index across the Settings tab (editor options + LSP list).
+    /// Always a real index into `Config::to_setting_items()` (0..
+    /// `SETTINGS_EDITOR_OPTIONS`) or, beyond that, `lsp` — a `/`
+    /// search only narrows which of those real indices `move_settings` can
+    /// land on, it never renumbers them.
     pub settings_index: usize,
+    /// `/` search over the Settings tab's EDITOR panel (see `settings_matches`).
+    pub settings_search: bool,
+    pub settings_query: String,
 
     pub help_open: bool,
 
+    /// The harpoon-style pinned-files popup (`:PinList`/`<leader>h`): a
+    /// floating list of `engine.session.pins.files()`, with
+    /// `pin_menu_cursor` as the keyboard-navigable selection.
+    pub pin_menu_open: bool,
+    pub pin_menu_cursor: usize,
+
     /// User configuration loaded from `~/.config/ctrlvim/config.toml`.
     pub config: Config,
+
+    /// Outcome of the last load attempt for each `[[plugin]]` entry, keyed by
+    /// name. The Plugin Manager screen (`ui/plugins.rs`) is the only reader:
+    /// it renders `config.plugins` and looks a status up here, rather than
+    /// probing the filesystem itself, so a plugin's on-screen state always
+    /// matches what actually happened at load time. An entry with no key here
+    /// yet has either never been attempted (disabled, or lazy and still
+    /// waiting on its event) or hasn't been reached by the startup loader.
+    pub plugin_status: std::collections::HashMap<String, PluginLoadStatus>,
 
     /// Tree-sitter highlights for the active buffer, recomputed when its text
     /// changes. Rendering takes `&App`, so this is behind a `RefCell`.
@@ -347,11 +469,9 @@ pub struct App {
     job: Option<RunningJob>,
     /// The `:!{cmd}` job currently filling [`App::shell_output`], if any.
     shell_job: Option<RunningShell>,
-    /// The `:Lint` job currently in flight, if any.
-    lint_job: Option<RunningLint>,
     /// The tool install currently running through `shell_job`, if any: its
-    /// name, its row index in `project.lsp`, and the job id — so completion
-    /// is attributed to the right job even if a `:!{cmd}` interleaves.
+    /// name, its row index in `lsp`, and the job id — so completion is
+    /// attributed to the right job even if a `:!{cmd}` interleaves.
     installing_tool: Option<(String, usize, u64)>,
     /// Whether the `:!{cmd}` output overlay is showing.
     pub shell_open: bool,
@@ -376,15 +496,22 @@ pub struct App {
     /// regenerated one is picked up without a reload command.
     tags_loaded_at: Option<std::time::SystemTime>,
     /// Top of the editor viewport in screen rows — what the mouse wheel moves.
-    /// The renderer clamps it so the cursor is always visible, so it doesn't
-    /// need updating when the cursor moves by keyboard.
-    view_top: usize,
+    /// The renderer clamps it so the cursor is always visible, and writes the
+    /// clamped result back here every frame (a `Cell` since rendering only
+    /// borrows `&App`) — otherwise keyboard-driven scrolling, which never
+    /// goes through `scroll_editor`, would leave this at its last
+    /// mouse-set value. A later clamp would then anchor to that stale spot
+    /// instead of the row actually on screen, letting the cursor's screen
+    /// row stick in place while the text scrolls under it, then snap the
+    /// view back once the stale anchor re-entered the valid range.
+    view_top: std::cell::Cell<usize>,
     /// Editor viewport height, recorded by the renderer for scroll clamping.
     viewport_rows: std::cell::Cell<usize>,
     /// Left edge of the editor viewport in screen cells — what the horizontal
     /// mouse wheel moves. Only meaningful under `'nowrap'`; the render-time
-    /// clamp against the cursor works exactly like `view_top` above.
-    view_left: usize,
+    /// clamp against the cursor works exactly like `view_top` above, and is
+    /// written back the same way.
+    view_left: std::cell::Cell<usize>,
     /// Editor viewport content width, recorded by the renderer for scroll
     /// clamping and for translating a click's column back to a buffer column.
     viewport_cols: std::cell::Cell<usize>,
@@ -397,6 +524,26 @@ pub struct App {
     /// requested once this is `debounce_ms` old: asking on every keystroke
     /// would cancel each request with the next one and never finish any.
     ai_idle_since: Option<Instant>,
+
+    /// One running language server per filetype, spawned lazily the first
+    /// time a buffer of that type loads (see `ensure_lsp_client`) and kept
+    /// for the app's lifetime. Keyed by `Filetype::name()`.
+    lsp_clients: std::collections::HashMap<&'static str, ctrlvim_lsp::LspClient>,
+    /// The code-completion popup, when one is showing.
+    pub completion: Option<CompletionMenu>,
+    /// Mirrors `ai_idle_since` for `textDocument/completion`: set on a
+    /// trigger-worthy keystroke, cleared once the debounced request actually
+    /// goes out. Buffer-word candidates don't wait on this — only the LSP
+    /// round trip does.
+    completion_idle_since: Option<Instant>,
+    /// The `seq` of the most recently *sent* completion request. A reply
+    /// carrying any other value is stale (a faster keystroke already asked
+    /// again) and is dropped — mirrors `ctrlvim_ai::Reply`'s staleness token.
+    completion_seq: u64,
+    /// Where the renderer drew the block cursor this frame, so the
+    /// completion popup can anchor under it — mirrors `viewport_rows`/
+    /// `viewport_cols`.
+    cursor_screen_pos: std::cell::Cell<Option<(u16, u16)>>,
 
     pub should_quit: bool,
     /// When the open-buffer list was last flushed to disk for crash/session
@@ -423,18 +570,6 @@ struct RunningShell {
     command: String,
     lines: LineBuffer,
     output: Vec<String>,
-}
-
-/// A `:Lint` in flight — unlike `:make`/`:grep`, the linter's output isn't
-/// line-oriented (it's one JSON blob at exit), and it needs a writable
-/// stdin (the buffer content), so it runs through `Jobs::spawn_persistent`
-/// with separate stdout/stderr streams rather than `RunningJob`'s merged,
-/// line-buffered path.
-struct RunningLint {
-    id: u64,
-    def: &'static ctrlvim_tools::lint::LintDef,
-    path: PathBuf,
-    stdout: Vec<u8>,
 }
 
 /// Cached highlight spans plus the buffer state they were computed from.
@@ -469,7 +604,13 @@ impl App {
     /// Build an app rooted at `root`, measuring startup from `start`.
     pub fn with_root(root: PathBuf, start: Instant) -> Self {
         let project = Project::load(root.clone(), start);
-        let lsp_enabled = project.lsp.iter().map(|s| s.installed).collect();
+        // `lsp.lua` is a handful of small tables and a `PATH` probe per
+        // declared entry — cheap enough to load synchronously, same as
+        // `Config::load()` below, rather than joining the background
+        // git/file-scan worker `Project` runs.
+        let (lsp_decls, lsp_error) = crate::lsp_config::load();
+        let lsp = crate::lsp_config::to_display(&lsp_decls);
+        let lsp_enabled = lsp.iter().map(|s| s.installed).collect();
         // Restore the theme chosen in a previous session (defaults to Terminal,
         // which follows the host terminal's own palette).
         if let Some(name) = crate::data::saved_theme() {
@@ -486,10 +627,11 @@ impl App {
         for dir in crate::data::pack_start_dirs() {
             let _ = engine.add_runtime_path(dir);
         }
-        // `[[plugin]]` entries also go on the search path — `path` may be a
-        // directory (per its documented shape) or, for the legacy single-file
-        // startup convention below, a `.lua` file whose parent directory is
-        // what should actually be searched.
+        // `[[plugin]]` entries also go on the search path. `path` is a `.lua`
+        // file (see `PluginEntry::path`), so it's the parent directory that
+        // actually gets searched; a bare directory is still honored too, in
+        // case a `require()`-only, never-sourced dependency is pointed at one
+        // directly.
         for p in &config.plugins {
             let expanded = expand_tilde(&p.path);
             let root = if expanded.is_dir() {
@@ -499,12 +641,20 @@ impl App {
             };
             let _ = engine.add_runtime_path(root);
         }
-        let startup_message = load_startup_plugins(&mut engine, &config.plugins);
+        let (mut startup_message, plugin_status) = load_startup_plugins(&mut engine, &config.plugins);
+        if startup_message.is_empty() {
+            if let Some(e) = lsp_error {
+                startup_message = e;
+            }
+        }
         App {
             engine,
             project,
             root,
             buffers: vec![Buffer::dashboard()],
+            file_jumps_back: Vec::new(),
+            file_jumps_fwd: Vec::new(),
+            suppress_jump_record: false,
             active: 0,
             section: DashboardSection::Workspace,
             // The drawer opens on startup when the config asks for it.
@@ -519,10 +669,17 @@ impl App {
             palette_index: 0,
             save_prompt: None,
             message: startup_message,
+            plugin_status,
             expand_git: false,
+            lsp_decls,
+            lsp,
             lsp_enabled,
             settings_index: 0,
+            settings_search: false,
+            settings_query: String::new(),
             help_open: false,
+            pin_menu_open: false,
+            pin_menu_cursor: 0,
             config,
             syntax: RefCell::new(None),
             quickfix_open: false,
@@ -532,7 +689,6 @@ impl App {
             timers: None,
             job: None,
             shell_job: None,
-            lint_job: None,
             installing_tool: None,
             shell_open: false,
             keymap_pending_since: None,
@@ -542,12 +698,17 @@ impl App {
             shell_output: Vec::new(),
             shell_scroll: 0,
             tags_loaded_at: None,
-            view_top: 0,
+            view_top: std::cell::Cell::new(0),
             viewport_rows: std::cell::Cell::new(24),
-            view_left: 0,
+            view_left: std::cell::Cell::new(0),
             viewport_cols: std::cell::Cell::new(80),
             ai: None,
             ai_idle_since: None,
+            lsp_clients: std::collections::HashMap::new(),
+            completion: None,
+            completion_idle_since: None,
+            completion_seq: 0,
+            cursor_screen_pos: std::cell::Cell::new(None),
             should_quit: false,
             session_snapshot_at: None,
         }
@@ -556,7 +717,7 @@ impl App {
     /// Toggle the "open file drawer on startup" setting, persist it to the
     /// config file, and apply it live so the drawer reflects the change now.
     pub fn toggle_startup_drawer(&mut self) {
-        self.config.drawer = !self.config.drawer;
+        self.config.apply_setting_change("drawer", SettingValue::Bool(!self.config.drawer));
         self.config.save();
         self.sidebar_visible = self.config.drawer;
         self.drawer_search = false;
@@ -565,6 +726,31 @@ impl App {
             "file drawer on startup: {}",
             if self.config.drawer { "on" } else { "off" }
         );
+    }
+
+    /// Toggle whether open files are shown as a tab bar, persisting it to the
+    /// config file.
+    pub fn toggle_tabs(&mut self) {
+        self.config.apply_setting_change("tabs", SettingValue::Bool(!self.config.tabs));
+        self.config.save();
+        self.message = format!("tab bar: {}", if self.config.tabs { "on" } else { "off" });
+    }
+
+    /// Pin/unpin buffer `i` (the tab bar's dot) by its label, the same
+    /// identity `:Pin`/`:PinRemove` use for the buffer they're run from.
+    pub fn toggle_pin_buffer(&mut self, i: usize) {
+        let Some(buf) = self.buffers.get(i) else { return };
+        if !matches!(buf.kind, BufferKind::File) {
+            return;
+        }
+        let name = buf.label.clone();
+        if self.engine.session.pins.remove(&name) {
+            self.message = format!("unpinned {name}");
+        } else {
+            let slot = self.engine.session.pins.add(&name);
+            self.message = format!("pinned {name} as {slot}");
+        }
+        crate::data::save_pins(&self.root, self.engine.session.pins.files());
     }
 
     // --- queries -----------------------------------------------------------
@@ -633,6 +819,7 @@ impl App {
             Action::InstallTool(i) => self.install_tool(i),
             Action::ToggleMouse => self.toggle_mouse(),
             Action::CycleIconMode => self.cycle_icon_mode(),
+            Action::CycleIndentWidth => self.cycle_indent_width(),
             Action::ToggleAi => self.toggle_ai(),
             Action::QuickfixSelect(i) => self.quickfix_select(i),
             Action::SetSettingsIndex(i) => {
@@ -691,6 +878,11 @@ impl App {
             Action::SetTheme(i) => self.set_theme(i),
             Action::NewFile => self.new_untitled(),
             Action::ToggleStartupDrawer => self.toggle_startup_drawer(),
+            Action::ToggleTabs => self.toggle_tabs(),
+            Action::TogglePin(i) => self.toggle_pin_buffer(i),
+            Action::ClosePinMenu => self.pin_menu_open = false,
+            Action::PinMenuSelect(i) => self.pin_menu_select(i),
+            Action::CompletionSelect(i) => self.select_and_accept_completion(i),
             Action::CloseSavePrompt => self.close_save_prompt(),
             Action::CloseShellOutput => self.shell_open = false,
             // Handled directly in the event loop, which has the raw mouse
@@ -863,13 +1055,8 @@ impl App {
             }
         }
 
-        // `[[plugin]]` → source the plugin's entry point now, unless it asked to
-        // be loaded lazily on an event.
-        for p in self.config.plugins.clone() {
-            if p.enabled && p.event.is_none() {
-                self.load_plugin(&p);
-            }
-        }
+        // `[[plugin]]` eager loading already happened in `with_root` (before
+        // the first frame), so there is nothing left to do for it here.
 
         // Config autocmds and plugins alike need the Lua host to exist before
         // any event can reach a callback.
@@ -884,22 +1071,6 @@ impl App {
         }
 
         self.fire_autocmd("VimEnter");
-    }
-
-    /// Load a plugin: source its `init.lua` if present, else its `init.vim`.
-    ///
-    /// Plugins are ordinary script files; the config decides *which* ones load
-    /// and in what order, which is why there is no `runtimepath` search here.
-    fn load_plugin(&mut self, p: &crate::config::PluginEntry) {
-        let dir = expand_tilde(&p.path);
-        for entry in ["init.lua", "init.vim"] {
-            let candidate = dir.join(entry);
-            if candidate.exists() {
-                self.run_ex_command(&format!("source {}", candidate.display()));
-                return;
-            }
-        }
-        self.message = format!("plugin '{}': no init.lua or init.vim in {}", p.name, dir.display());
     }
 
     /// Fire an autocommand event: run every matching `[[autocmd]]` from the
@@ -933,7 +1104,15 @@ impl App {
             .cloned()
             .collect();
         for p in pending {
-            self.load_plugin(&p);
+            match run_plugin_file(&mut self.engine, &p) {
+                Ok(()) => {
+                    self.plugin_status.insert(p.name.clone(), PluginLoadStatus::Loaded);
+                }
+                Err(e) => {
+                    self.plugin_status.insert(p.name.clone(), PluginLoadStatus::Error(e.clone()));
+                    self.message = e;
+                }
+            }
             if let Some(slot) = self.config.plugins.iter_mut().find(|q| q.name == p.name) {
                 slot.event = None;
                 slot.enabled = false;
@@ -978,10 +1157,21 @@ impl App {
         self.section = order[(((i + dir) % n + n) % n) as usize];
     }
 
+    /// Indices into `self.buffers` that count as a numbered tab — everything
+    /// `:b N`/`<leader>N`/`gt`/the tab bar address by number. Excludes the
+    /// background Dashboard buffer, which isn't a tab (see `Buffer::closable`).
+    fn tab_indices(&self) -> Vec<usize> {
+        self.buffers.iter().enumerate().filter(|(_, b)| b.closable()).map(|(i, _)| i).collect()
+    }
+
     pub fn cycle_buffer(&mut self, dir: i32) {
-        let n = self.buffers.len() as i32;
-        let i = self.active as i32;
-        self.set_active((((i + dir) % n + n) % n) as usize);
+        let tabs = self.tab_indices();
+        if tabs.is_empty() {
+            return;
+        }
+        let pos = tabs.iter().position(|&i| i == self.active).unwrap_or(0) as i32;
+        let n = tabs.len() as i32;
+        self.set_active(tabs[(((pos + dir) % n + n) % n) as usize]);
     }
 
     fn toggle_panel(&mut self, p: PanelId) {
@@ -1042,15 +1232,30 @@ impl App {
     }
 
     /// Number of Settings rows: the editor options plus each LSP server.
-    pub const SETTINGS_EDITOR_OPTIONS: usize = 4; // drawer, mouse, icons, AI
+    pub const SETTINGS_EDITOR_OPTIONS: usize = 6; // drawer, tabs, mouse, icons, indent width, AI
 
     pub fn settings_count(&self) -> usize {
-        Self::SETTINGS_EDITOR_OPTIONS + self.project.lsp.len()
+        Self::SETTINGS_EDITOR_OPTIONS + self.lsp.len()
     }
 
     /// Move the Settings selection, wrapping across the EDITOR options and the
     /// LSP list as one continuous list.
+    ///
+    /// While a `/` search is narrowing the EDITOR panel, this instead wraps
+    /// across just the matching real indices — `settings_index` stays a real
+    /// index either way, only which ones are reachable changes.
     pub fn move_settings(&mut self, dir: i32) {
+        if self.settings_search {
+            let matches = self.settings_matches();
+            if matches.is_empty() {
+                return;
+            }
+            let n = matches.len() as i32;
+            let cur = matches.iter().position(|&i| i == self.settings_index).unwrap_or(0) as i32;
+            let next = (((cur + dir) % n + n) % n) as usize;
+            self.settings_index = matches[next];
+            return;
+        }
         let n = self.settings_count() as i32;
         if n == 0 {
             return;
@@ -1059,13 +1264,60 @@ impl App {
         self.settings_index = (((i + dir) % n + n) % n) as usize;
     }
 
+    /// Real `Config::to_setting_items` indices matching the Settings tab's
+    /// `/` search (all `SETTINGS_EDITOR_OPTIONS` of them when the query is
+    /// empty) — a filter layer over the same items, not a separate list.
+    pub fn settings_matches(&self) -> Vec<usize> {
+        self.config
+            .to_setting_items()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| fuzzy_match(&self.settings_query, item.key) || fuzzy_match(&self.settings_query, item.label))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn settings_start_search(&mut self) {
+        self.settings_search = true;
+        self.settings_query.clear();
+    }
+
+    pub fn settings_search_type(&mut self, c: char) {
+        self.settings_query.push(c);
+        self.clamp_settings_index_to_search();
+    }
+
+    pub fn settings_search_backspace(&mut self) {
+        self.settings_query.pop();
+        self.clamp_settings_index_to_search();
+    }
+
+    /// Keep `settings_index` on whatever it was pointing at if the search
+    /// still matches it, otherwise fall back to the first match — the same
+    /// rule the file drawer's own `/` search uses.
+    fn clamp_settings_index_to_search(&mut self) {
+        let matches = self.settings_matches();
+        if !matches.contains(&self.settings_index) {
+            self.settings_index = matches.first().copied().unwrap_or(0);
+        }
+    }
+
+    /// Close the `/` search (`Esc`), returning the EDITOR panel to its full
+    /// row list.
+    pub fn settings_search_clear(&mut self) {
+        self.settings_search = false;
+        self.settings_query.clear();
+    }
+
     /// Toggle whatever Settings row is selected.
     pub fn settings_toggle(&mut self) {
         match self.settings_index {
             0 => self.toggle_startup_drawer(),
-            1 => self.toggle_mouse(),
-            2 => self.cycle_icon_mode(),
-            3 => self.toggle_ai(),
+            1 => self.toggle_tabs(),
+            2 => self.toggle_mouse(),
+            3 => self.cycle_icon_mode(),
+            4 => self.cycle_indent_width(),
+            5 => self.toggle_ai(),
             i => self.toggle_lsp(i - Self::SETTINGS_EDITOR_OPTIONS),
         }
     }
@@ -1077,6 +1329,16 @@ impl App {
         }
     }
 
+    /// Replace the declared server/linker list wholesale, rebuilding the
+    /// display rows and enabled toggles the same way `with_root` does at
+    /// startup. Exposed so tests can pin a known set instead of depending on
+    /// whichever `lsp.lua` happens to exist on the machine running them.
+    pub fn set_lsp_decls(&mut self, decls: Vec<crate::lsp_config::LspServerDecl>) {
+        self.lsp = crate::lsp_config::to_display(&decls);
+        self.lsp_enabled = self.lsp.iter().map(|s| s.installed).collect();
+        self.lsp_decls = decls;
+    }
+
     /// Install whichever Settings row is focused (`I`), if it's a tool row
     /// with a known install method.
     pub fn install_focused_tool(&mut self) {
@@ -1085,12 +1347,13 @@ impl App {
         }
     }
 
-    /// Install the tool at row `i` of `project.lsp` by shelling out to its
-    /// registry install command (`cargo install`, `npm install`, …), reusing
-    /// the same `:!{cmd}` job machinery as [`App::host_run_shell`] — the
-    /// output overlay doubles as the install log.
+    /// Install the tool at row `i` of `lsp` by shelling out to whatever
+    /// install command its `lsp.lua` declaration gave it, reusing the same
+    /// `:!{cmd}` job machinery as [`App::host_run_shell`] — the output
+    /// overlay doubles as the install log. The editor never inspects the
+    /// command itself; it's exactly what the user wrote.
     pub fn install_tool(&mut self, i: usize) {
-        let Some(lsp) = self.project.lsp.get(i) else { return };
+        let Some(lsp) = self.lsp.get(i) else { return };
         if lsp.installed {
             self.message = format!("{}: already installed", lsp.name);
             return;
@@ -1099,21 +1362,11 @@ impl App {
             self.message = "an install is already running".into();
             return;
         }
-        let Some(tool) = ctrlvim_tools::REGISTRY.iter().find(|t| t.name == lsp.name) else {
-            self.message = format!("{}: no install method available", lsp.name);
+        let Some(command) = lsp.install.clone() else {
+            self.message = format!("{}: no install command declared in lsp.lua", lsp.name);
             return;
         };
-        let Some(command) = ctrlvim_tools::install_command(tool) else {
-            self.message = format!("{}: no install method available", lsp.name);
-            return;
-        };
-        if let Some(dir) = ctrlvim_tools::install_dir(tool.name) {
-            if let Err(e) = std::fs::create_dir_all(&dir) {
-                self.message = format!("{}: could not create {}: {e}", lsp.name, dir.display());
-                return;
-            }
-        }
-        let name = tool.name.to_string();
+        let name = lsp.name.clone();
         self.host_run_shell(command);
         let Some(id) = self.shell_job.as_ref().map(|j| j.id) else { return };
         self.installing_tool = Some((name.clone(), i, id));
@@ -1122,7 +1375,7 @@ impl App {
 
     /// Toggle mouse support, persisting it to the config.
     pub fn toggle_mouse(&mut self) {
-        self.config.mouse = !self.config.mouse;
+        self.config.apply_setting_change("mouse", SettingValue::Bool(!self.config.mouse));
         self.config.save();
         self.message = format!("mouse: {}", if self.config.mouse { "on" } else { "off" });
     }
@@ -1130,9 +1383,30 @@ impl App {
     /// Cycle file icons through auto → nerd → text, applying it live and
     /// persisting it to the config.
     pub fn cycle_icon_mode(&mut self) {
-        self.config.icons = self.config.icons.next();
+        let next = self.config.icons.next();
+        self.config.apply_setting_change(
+            "icons",
+            SettingValue::Choice { current: next.as_str().to_string(), options: &["auto", "nerd", "text"] },
+        );
         self.config.save();
         self.message = format!("file icons: {}", self.config.icons.label());
+    }
+
+    /// Cycle 'tabstop'/'shiftwidth' through 2 → 4 → 8 (kept equal — the two
+    /// diverging is more confusion than the flexibility is worth for a
+    /// checkbox-style row), applying it live and persisting it to the config.
+    /// `:set tabstop=N shiftwidth=N` is the session-scoped counterpart, the
+    /// same way `:AI`/`:set mouse` are to their Settings-tab checkboxes.
+    pub fn cycle_indent_width(&mut self) {
+        let next = match self.tabstop() {
+            0..=2 => 4,
+            3..=6 => 8,
+            _ => 2,
+        };
+        self.run_ex_command(&format!("set tabstop={next} shiftwidth={next}"));
+        self.config.apply_setting_change("indent_width", SettingValue::Int(next as i64));
+        self.config.save();
+        self.message = format!("indent width: {next}");
     }
 
     /// Open (or focus) one of the dashboard's recent files by list index.
@@ -1203,11 +1477,80 @@ impl App {
         if idx == self.active || idx >= self.buffers.len() {
             return;
         }
+        self.record_file_jump();
         self.fire_autocmd("BufLeave");
         self.snapshot_active();
         self.active = idx;
         self.load_active_into_engine();
         self.fire_autocmd("BufEnter");
+    }
+
+    /// Record the outgoing file + cursor as a `Ctrl-O` target, unless this
+    /// switch *is* a `Ctrl-O`/`Ctrl-I` traversal (`jump_file_back`/`_forward`
+    /// suppress this so walking the history doesn't also grow it). Cleared
+    /// forward history matches a fresh navigation discarding "redo".
+    fn record_file_jump(&mut self) {
+        if !self.suppress_jump_record {
+            if let (BufferKind::File, Some(path)) =
+                (&self.active_buffer().kind, self.active_buffer().path.clone())
+            {
+                self.file_jumps_back.push((path, self.editor_cursor()));
+                if self.file_jumps_back.len() > 100 {
+                    self.file_jumps_back.remove(0);
+                }
+            }
+            self.file_jumps_fwd.clear();
+        }
+    }
+
+    /// `Ctrl-O` when the engine's own in-file jumplist is exhausted: step back
+    /// to the previous file in `file_jumps_back`, restoring its cursor.
+    pub fn jump_file_back(&mut self) {
+        let Some((path, pos)) = self.file_jumps_back.pop() else { return };
+        if let Some(here) = self.current_file_jump() {
+            self.file_jumps_fwd.push(here);
+        }
+        self.goto_file_jump(path, pos);
+    }
+
+    /// `Ctrl-I` mirror of [`jump_file_back`](Self::jump_file_back).
+    pub fn jump_file_forward(&mut self) {
+        let Some((path, pos)) = self.file_jumps_fwd.pop() else { return };
+        if let Some(here) = self.current_file_jump() {
+            self.file_jumps_back.push(here);
+        }
+        self.goto_file_jump(path, pos);
+    }
+
+    /// The active file's identity, for stashing onto the other stack when
+    /// `jump_file_back`/`_forward` moves away from it.
+    fn current_file_jump(&self) -> Option<(PathBuf, (usize, usize))> {
+        match &self.active_buffer().kind {
+            BufferKind::File => self.active_buffer().path.clone().map(|p| (p, self.editor_cursor())),
+            _ => None,
+        }
+    }
+
+    /// Switch to `path` (reopening it from disk if it's not already a buffer)
+    /// and land on `pos`, without recording another jump for the move itself.
+    /// A no-op if the file is already the active one or has since disappeared.
+    fn goto_file_jump(&mut self, path: PathBuf, pos: (usize, usize)) {
+        match self.buffers.iter().position(|b| b.path.as_deref() == Some(path.as_path())) {
+            Some(i) if i == self.active => {}
+            Some(i) => {
+                self.suppress_jump_record = true;
+                self.set_active(i);
+                self.suppress_jump_record = false;
+            }
+            None if path.is_file() => {
+                self.suppress_jump_record = true;
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.open_path(path, name);
+                self.suppress_jump_record = false;
+            }
+            None => return,
+        }
+        self.engine.session.set_cursor_clamped(pos.0, pos.1);
     }
 
     /// Save the engine's current text (and dirty state) back into the active
@@ -1231,6 +1574,17 @@ impl App {
             self.engine.set_modified(self.buffers[self.active].modified);
             let (line, col) = self.buffers[self.active].cursor;
             self.engine.session.set_cursor_clamped(line, col);
+            // A different file's text just replaced the engine's single
+            // working buffer; any in-file jumplist entries were recorded
+            // against the *previous* file's line numbers and would move the
+            // cursor to a bogus spot here. Cross-file history lives in
+            // `file_jumps_back`/`file_jumps_fwd` instead — see `set_active`.
+            self.engine.session.reset_jumps();
+            // A different buffer is loaded now; a popup computed against the
+            // old one's cursor position is meaningless here.
+            self.completion = None;
+            self.completion_idle_since = None;
+            self.sync_lsp_open();
         }
     }
 
@@ -1255,22 +1609,23 @@ impl App {
         let rows = self.viewport_rows.get().max(1);
         let cols = self.viewport_cols.get().max(1);
         let wrap = self.wrap_enabled();
-        let vis = crate::wrap::visual_rows(&text, self.folds(), cols, wrap, line_count);
+        let vis = crate::wrap::visual_rows(&text, self.folds(), cols, wrap, line_count, self.tabstop());
         let max_top = vis.len().saturating_sub(1);
         let (cur_line, cur_col) = self.editor_cursor();
         let cur_row = crate::wrap::row_of(&vis, cur_line, cur_col);
 
-        // Start from the row actually on screen, which may differ from the
-        // stored offset after the cursor was moved by the keyboard.
-        let effective = self.view_top.clamp(cur_row.saturating_sub(rows - 1), cur_row);
-        self.view_top = if lines >= 0 {
+        // The row actually on screen, kept in sync every frame by
+        // `editor_viewport` — see the field doc for why that matters.
+        let effective = self.view_top.get().clamp(cur_row.saturating_sub(rows - 1), cur_row);
+        let view_top = if lines >= 0 {
             (effective + lines as usize).min(max_top)
         } else {
             effective.saturating_sub(lines.unsigned_abs() as usize)
         };
+        self.view_top.set(view_top);
 
         // Vim drags the cursor along only when the view would leave it behind.
-        let (first, last) = (self.view_top, self.view_top + rows - 1);
+        let (first, last) = (view_top, view_top + rows - 1);
         if cur_row < first || cur_row > last {
             let row = cur_row.clamp(first, last);
             if let Some(vr) = vis.get(row) {
@@ -1290,20 +1645,22 @@ impl App {
         let text = self.editor_lines();
         let (cur_line, cur_col) = self.editor_cursor();
         let raw = text.get(cur_line).map(String::as_str).unwrap_or("");
-        let cur_cells = width_upto(raw, cur_col);
+        let tabstop = self.tabstop();
+        let cur_cells = crate::wrap::width_upto_tabs(raw, cur_col, tabstop);
         let content_w = self.viewport_cols.get().max(1);
 
-        let effective = self.view_left.clamp(cur_cells.saturating_sub(content_w - 1), cur_cells);
-        self.view_left = if cols >= 0 {
+        let effective = self.view_left.get().clamp(cur_cells.saturating_sub(content_w - 1), cur_cells);
+        let view_left = if cols >= 0 {
             effective + cols as usize
         } else {
             effective.saturating_sub(cols.unsigned_abs() as usize)
         };
+        self.view_left.set(view_left);
 
         // Drag the cursor along only when the view would leave it behind.
-        let (first, last) = (self.view_left, self.view_left + content_w - 1);
+        let (first, last) = (view_left, view_left + content_w - 1);
         if cur_cells < first || cur_cells > last {
-            let col = char_index_at(raw, cur_cells.clamp(first, last));
+            let col = crate::wrap::char_index_at_tabs(raw, cur_cells.clamp(first, last), tabstop);
             self.engine.session.set_cursor_clamped(cur_line, col);
         }
     }
@@ -1317,6 +1674,20 @@ impl App {
     /// `'cursorline'` — whether to tint the line the cursor is on.
     pub fn cursorline_enabled(&self) -> bool {
         self.engine.session.editor.options().cursorline()
+    }
+
+    /// `'autoindent'` — whether `<CR>` in Insert mode carries the previous
+    /// line's indentation forward. Read by the command palette's quick
+    /// toggle; see `palette_results`.
+    pub fn autoindent_enabled(&self) -> bool {
+        self.engine.session.editor.options().autoindent()
+    }
+
+    /// `'tabstop'` — how many cells a `\t` fills to. Every place that measures
+    /// or slices a *raw* buffer line (as opposed to already-rendered, tab-free
+    /// text) needs this — see `crate::wrap::cell_width`.
+    pub fn tabstop(&self) -> usize {
+        self.engine.session.editor.options().tabstop().max(1) as usize
     }
 
     /// The cursor shape `'guicursor'` asks for in the current mode. Drives the
@@ -1339,10 +1710,15 @@ impl App {
     /// This frame's resolved viewport: which buffer rows are on screen and,
     /// under `'nowrap'`, how far scrolled sideways. `content_w`/`height` come
     /// from the renderer, which is the only place that knows them.
+    ///
+    /// Writes the clamped `top_row`/`left_cells` back into `view_top`/
+    /// `view_left` before returning — keyboard movement never calls
+    /// `scroll_editor`, so this is the only place that keeps those fields
+    /// in sync with what's actually on screen. See the `view_top` field doc.
     pub fn editor_viewport(&self, content_w: usize, height: usize) -> crate::wrap::Viewport {
         let lines = self.editor_lines();
         let (cur_line, cur_col) = self.editor_cursor();
-        crate::wrap::compute(
+        let vp = crate::wrap::compute(
             &lines,
             self.folds(),
             self.wrap_enabled(),
@@ -1350,10 +1726,14 @@ impl App {
             height,
             cur_line,
             cur_col,
-            self.view_top,
-            self.view_left,
+            self.view_top.get(),
+            self.view_left.get(),
             self.scrolloff(),
-        )
+            self.tabstop(),
+        );
+        self.view_top.set(vp.top_row);
+        self.view_left.set(vp.left_cells);
+        vp
     }
 
     /// Move the cursor to the buffer position under a click at `(col, row)`,
@@ -1379,14 +1759,16 @@ impl App {
             return;
         }
         let raw = lines.get(vr.line).map(String::as_str).unwrap_or("");
-        let base_cells = if self.wrap_enabled() { width_upto(raw, vr.seg_start) } else { vp.left_cells };
-        let char_col = char_index_at(raw, base_cells + col as usize);
+        let tabstop = self.tabstop();
+        let base_cells =
+            if self.wrap_enabled() { crate::wrap::width_upto_tabs(raw, vr.seg_start, tabstop) } else { vp.left_cells };
+        let char_col = crate::wrap::char_index_at_tabs(raw, base_cells + col as usize, tabstop);
         self.engine.session.set_cursor_clamped(vr.line, char_col);
     }
 
     /// The stored viewport offset, in screen rows.
     pub fn view_top(&self) -> usize {
-        self.view_top
+        self.view_top.get()
     }
 
     /// Record how many rows the editor viewport has. Called from the renderer,
@@ -1402,6 +1784,18 @@ impl App {
         self.viewport_cols.set(cols);
     }
 
+    /// Record where the renderer drew the block cursor this frame, so the
+    /// completion popup can anchor under it. `None` when the cursor's row
+    /// isn't currently on screen. Mirrors `set_viewport_rows`/`_cols`.
+    pub fn set_cursor_screen_pos(&self, pos: (u16, u16)) {
+        self.cursor_screen_pos.set(Some(pos));
+    }
+
+    /// Where the block cursor was drawn this frame, if it was.
+    pub fn cursor_screen_pos(&self) -> Option<(u16, u16)> {
+        self.cursor_screen_pos.get()
+    }
+
     /// Feed one key to the engine's editing session, then perform any host
     /// effects the engine requested (`:w`/`:q`/…).
     pub fn feed_engine(&mut self, key: Key) {
@@ -1409,6 +1803,9 @@ impl App {
         // Every keystroke restarts the inline-suggestion idle countdown, so a
         // completion is only ever asked for once typing has paused.
         self.touch_ai();
+        // ...and the code-completion popup: open/refine/close it based on
+        // whether this keystroke still looks like part of an identifier.
+        self.handle_completion_keystroke(key);
         self.apply_effects();
         // ...and the `'timeoutlen'` clock, so a half-typed chord resolves on
         // its own and the which-key popup tracks what can still follow.
@@ -1463,7 +1860,6 @@ impl App {
                 ExEffect::Ai(cmd) => self.host_ai(cmd),
                 ExEffect::HostAction(name) => self.host_action(&name),
                 ExEffect::Pin(cmd) => self.host_pin(cmd),
-                ExEffect::Lint => self.host_lint(),
             }
         }
     }
@@ -1482,17 +1878,47 @@ impl App {
                 self.message = msg;
             }
             PinCmd::Menu(files) => {
-                self.message = if files.is_empty() {
-                    "no pinned files".to_string()
-                } else {
-                    files
-                        .iter()
-                        .enumerate()
-                        .map(|(i, f)| format!("{}: {f}", i + 1))
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                };
+                if files.is_empty() {
+                    self.message = "no pinned files".to_string();
+                    return;
+                }
+                self.pin_menu_cursor = self.engine.session.pins.current().min(files.len() - 1);
+                self.pin_menu_open = true;
             }
+        }
+    }
+
+    /// Move the pin menu's selection, wrapping.
+    pub fn pin_menu_move(&mut self, dir: i32) {
+        let n = self.engine.session.pins.len() as i32;
+        if n == 0 {
+            return;
+        }
+        let i = self.pin_menu_cursor as i32;
+        self.pin_menu_cursor = (((i + dir) % n + n) % n) as usize;
+    }
+
+    /// Open the selected pin (same path `PinCmd::Open` uses) and close the menu.
+    pub fn pin_menu_select(&mut self, idx: usize) {
+        if let Some(path) = self.engine.session.pins.files().get(idx).cloned() {
+            self.engine.session.pins.go(idx + 1);
+            self.new_file(&path.to_string_lossy());
+        }
+        self.pin_menu_open = false;
+    }
+
+    /// Unpin the file under the cursor without leaving the menu.
+    pub fn pin_menu_unpin(&mut self) {
+        let Some(path) = self.engine.session.pins.files().get(self.pin_menu_cursor).cloned() else {
+            return;
+        };
+        self.engine.session.pins.remove(&path);
+        crate::data::save_pins(&self.root, self.engine.session.pins.files());
+        let len = self.engine.session.pins.len();
+        if len == 0 {
+            self.pin_menu_open = false;
+        } else {
+            self.pin_menu_cursor = self.pin_menu_cursor.min(len - 1);
         }
     }
 
@@ -1648,7 +2074,7 @@ impl App {
     /// same way `:set mouse` is to the mouse checkbox.
     pub fn toggle_ai(&mut self) {
         let on = !self.ai_enabled();
-        self.config.ai.enabled = on;
+        self.config.apply_setting_change("ai_enabled", SettingValue::Bool(on));
         self.config.save();
         self.set_ai_enabled(on);
         self.message = format!(
@@ -1772,6 +2198,314 @@ impl App {
             }
         }
         changed
+    }
+
+    // --- code completion ----------------------------------------------
+
+    /// Spawn `ft`'s language server if it isn't already running, the mapped
+    /// tool is installed, and its Settings row is enabled. Idempotent and
+    /// silent otherwise — this is called on every file open of a matching
+    /// type, not just the first.
+    fn ensure_lsp_client(&mut self, ft: Filetype) {
+        if self.lsp_clients.contains_key(ft.name()) {
+            return;
+        }
+        // Which declared server (if any) attaches to this filetype — purely
+        // from `lsp.lua`; the engine has no built-in notion of which server
+        // speaks for which language.
+        let Some(i) = self.lsp_decls.iter().position(|d| d.enabled && d.filetypes.iter().any(|f| f == ft.name()))
+        else {
+            return;
+        };
+        if !self.lsp_enabled.get(i).copied().unwrap_or(false) {
+            return;
+        }
+        if !self.lsp.get(i).is_some_and(|s| s.installed) {
+            return;
+        }
+        let Some((program, args)) = self.lsp_decls[i].cmd.split_first() else { return };
+        // `installed` above already confirmed `locate` finds this binary
+        // somewhere; resolve it to an absolute path when that "somewhere"
+        // is ctrlvim's own tools dir rather than `$PATH` — `Command::new`
+        // only searches the latter, so a `fetch-release`-installed server
+        // would otherwise report "installed" and then fail to spawn.
+        let name = self.lsp_decls[i].name.clone();
+        let program = crate::data::locate(&name, program).map(|p| p.display().to_string()).unwrap_or_else(|| program.clone());
+        let args = args.to_vec();
+        let root = self.root.clone();
+        let Some(jobs) = self.jobs_mut() else { return };
+        let client = ctrlvim_lsp::LspClient::spawn(jobs, &program, &args, &root);
+        self.lsp_clients.insert(ft.name(), client);
+    }
+
+    /// Tell the active buffer's language server it's open, spawning the
+    /// server first if this is the first buffer of its filetype. Called from
+    /// [`load_active_into_engine`](Self::load_active_into_engine).
+    fn sync_lsp_open(&mut self) {
+        let Some(ft) = self.editor_filetype() else { return };
+        self.ensure_lsp_client(ft);
+        let Some(path) = self.active_buffer().path.clone() else { return };
+        let uri = ctrlvim_lsp::uri_from_path(&path);
+        let text = self.editor_lines().join("\n");
+        if let Some(client) = self.lsp_clients.get_mut(ft.name()) {
+            client.did_open(&uri, ft.name(), &text);
+        }
+    }
+
+    /// `(line, col_start, prefix)` of the identifier run ending at the
+    /// cursor — `col_start == cursor` and `prefix == ""` when the cursor
+    /// isn't right after any identifier character (e.g. it just typed `.`).
+    fn current_word_prefix(&self) -> (usize, usize, String) {
+        let (line_no, col) = self.editor_cursor();
+        let line = self.editor_lines().get(line_no).cloned().unwrap_or_default();
+        let col = col.min(line.len());
+        let mut start = col;
+        for (i, c) in line[..col].char_indices().rev() {
+            if c.is_alphanumeric() || c == '_' {
+                start = i;
+            } else {
+                break;
+            }
+        }
+        (line_no, start, line[start..col].to_string())
+    }
+
+    /// Identifiers matching `prefix` (case-insensitive, strictly longer than
+    /// it) drawn from every open file buffer, nearest-to-cursor first —
+    /// Vim's own `<C-n>` ordering. Empty for an empty prefix: with nothing
+    /// typed yet, "every identifier in every open file" is noise, not help.
+    fn word_match_candidates(&self, prefix: &str) -> Vec<ctrlvim_lsp::CompletionItem> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        let lower = prefix.to_lowercase();
+        let (cur_line, cur_start, _) = self.current_word_prefix();
+        let (_, cur_col) = self.editor_cursor();
+        let mut seen = std::collections::HashSet::new();
+        let mut scored: Vec<(usize, String)> = Vec::new();
+        let mut add = |line_no: usize, text: &str, base: usize| {
+            for word in identifiers(text) {
+                if word.len() <= prefix.len() || !word.to_lowercase().starts_with(&lower) {
+                    continue;
+                }
+                if seen.insert(word.clone()) {
+                    scored.push((base + line_no.abs_diff(cur_line), word));
+                }
+            }
+        };
+        for (i, line) in self.editor_lines().iter().enumerate() {
+            if i == cur_line {
+                // Mask out the identifier being typed right now, so it can
+                // never "complete" against its own unfinished self (e.g.
+                // typing into "XY|hello" must not offer "XYhello").
+                let end = cur_col.min(line.len());
+                let mut masked = line.clone();
+                if cur_start < end {
+                    masked.replace_range(cur_start..end, &" ".repeat(end - cur_start));
+                }
+                add(i, &masked, 0);
+            } else {
+                add(i, line, 0);
+            }
+        }
+        let active_path = self.active_buffer().path.clone();
+        for buf in &self.buffers {
+            if matches!(buf.kind, BufferKind::File) && buf.path != active_path {
+                for line in &buf.text {
+                    // Other buffers sort after every match in the active one.
+                    add(0, line, usize::MAX / 2);
+                }
+            }
+        }
+        scored.sort_by_key(|(dist, _)| *dist);
+        scored
+            .into_iter()
+            .take(COMPLETION_MAX_WORD_MATCHES)
+            .map(|(_, label)| ctrlvim_lsp::CompletionItem {
+                label: label.clone(),
+                insert_text: label,
+                kind: None,
+                detail: None,
+            })
+            .collect()
+    }
+
+    /// Rebuild the popup from the current cursor prefix: refilter whatever
+    /// the language server last returned, merge in fresh buffer-word
+    /// matches, close the popup entirely if that leaves nothing to show.
+    /// Cheap and synchronous — called on every keystroke that keeps the
+    /// popup relevant, not just when a network reply arrives.
+    fn refresh_completion_display(&mut self) {
+        let (line, start, prefix) = self.current_word_prefix();
+        let lower = prefix.to_lowercase();
+        let lsp_cache = self.completion.as_ref().map(|m| m.lsp_cache.clone()).unwrap_or_default();
+        let mut items: Vec<_> =
+            lsp_cache.iter().filter(|it| it.label.to_lowercase().starts_with(&lower)).cloned().collect();
+        let mut words = self.word_match_candidates(&prefix);
+        words.retain(|w| !items.iter().any(|it| it.insert_text == w.insert_text));
+        items.extend(words);
+
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let selected = self.completion.as_ref().map_or(0, |m| m.selected.min(items.len() - 1));
+        self.completion = Some(CompletionMenu { items, selected, lsp_cache, replace_from: (line, start) });
+    }
+
+    /// Keep the completion popup in sync with what was just typed: a
+    /// keystroke that still looks like part of an identifier (or a trigger
+    /// character like `.`) refreshes it and restarts the debounce; anything
+    /// else — a space, punctuation, leaving Insert mode — closes it, the
+    /// same "narrows as you type, vanishes the moment you don't" feel as
+    /// IntelliSense.
+    fn handle_completion_keystroke(&mut self, key: Key) {
+        if !self.editor_focus() || self.editor_mode() != "i" {
+            self.completion = None;
+            self.completion_idle_since = None;
+            return;
+        }
+        let extends = match key {
+            Key::Char(c) => c.is_alphanumeric() || c == '_' || COMPLETION_TRIGGER_CHARS.contains(&c),
+            Key::Backspace => true,
+            _ => false,
+        };
+        if !extends {
+            self.completion = None;
+            self.completion_idle_since = None;
+            return;
+        }
+        self.refresh_completion_display();
+        self.completion_idle_since = Some(Instant::now());
+    }
+
+    /// Send the actual `textDocument/completion` request: syncs the
+    /// document first (full text — see `ctrlvim_lsp`'s module docs), then
+    /// asks at the cursor, tagging the request with a fresh `seq` so a
+    /// reply that arrives after a faster keystroke already moved on gets
+    /// dropped rather than clobbering something newer.
+    fn fire_completion_request(&mut self) {
+        let Some(ft) = self.editor_filetype() else { return };
+        self.ensure_lsp_client(ft);
+        let Some(path) = self.active_buffer().path.clone() else { return };
+        let uri = ctrlvim_lsp::uri_from_path(&path);
+        let text = self.editor_lines().join("\n");
+        let (line, byte_col) = self.editor_cursor();
+        let cur_line_text = self.editor_lines().get(line).cloned().unwrap_or_default();
+        let character = utf16_col(&cur_line_text, byte_col);
+        self.completion_seq += 1;
+        let seq = self.completion_seq;
+        if let Some(client) = self.lsp_clients.get_mut(ft.name()) {
+            client.did_change(&uri, ft.name(), &text);
+            client.request_completion(&uri, line, character, seq);
+        }
+    }
+
+    /// `<C-Space>`: ask for completions right now, bypassing both the
+    /// identifier check and the debounce — the explicit "I'm asking for it"
+    /// path IntelliSense's manual trigger is.
+    pub fn trigger_completion(&mut self) {
+        if !self.editor_focus() {
+            return;
+        }
+        self.completion_idle_since = None;
+        self.fire_completion_request();
+        self.refresh_completion_display();
+    }
+
+    /// Drive the completion request once typing has paused. Called once per
+    /// main-loop turn, next to [`poll_ai`](Self::poll_ai). Returns whether
+    /// anything changed, so the caller knows to redraw.
+    pub fn poll_completion(&mut self) -> bool {
+        let due = self
+            .completion_idle_since
+            .is_some_and(|since| since.elapsed() >= std::time::Duration::from_millis(COMPLETION_DEBOUNCE_MS));
+        if !due {
+            return false;
+        }
+        self.completion_idle_since = None;
+        self.fire_completion_request();
+        true
+    }
+
+    /// A completion reply (or the client dying) arrived — see `poll_jobs`'s
+    /// dispatch loop, which is the only caller.
+    fn handle_lsp_event(&mut self, ft_key: &'static str, event: ctrlvim_lsp::LspEvent) {
+        match event {
+            // The client's own queued `didOpen`/`didChange` already went out
+            // (see `LspClient`'s handshake-ordering note); nothing for the
+            // host to do here.
+            ctrlvim_lsp::LspEvent::Ready => {}
+            ctrlvim_lsp::LspEvent::Completion { seq, items } => {
+                if seq != self.completion_seq {
+                    return; // a faster keystroke already asked again
+                }
+                let selected = self.completion.as_ref().map_or(0, |m| m.selected);
+                self.completion =
+                    Some(CompletionMenu { items: Vec::new(), selected, lsp_cache: items, replace_from: (0, 0) });
+                self.refresh_completion_display();
+            }
+            ctrlvim_lsp::LspEvent::Failed(reason) => {
+                self.lsp_clients.remove(ft_key);
+                self.message = format!("{ft_key}: {reason}");
+            }
+        }
+    }
+
+    /// Move the completion popup's selection, wrapping.
+    pub fn move_completion(&mut self, dir: i32) {
+        let Some(menu) = self.completion.as_mut() else { return };
+        let n = menu.items.len() as i32;
+        if n == 0 {
+            return;
+        }
+        menu.selected = (((menu.selected as i32 + dir) % n + n) % n) as usize;
+    }
+
+    /// Click a row in the popup: select it, then accept it.
+    pub fn select_and_accept_completion(&mut self, i: usize) {
+        if let Some(menu) = self.completion.as_mut() {
+            if i < menu.items.len() {
+                menu.selected = i;
+            }
+        }
+        self.accept_completion();
+    }
+
+    /// Accept the selected item: replace `[replace_from, cursor)` with its
+    /// `insert_text` and close the popup.
+    pub fn accept_completion(&mut self) {
+        let Some(menu) = self.completion.take() else { return };
+        let Some(item) = menu.items.get(menu.selected) else { return };
+        let (line, start) = menu.replace_from;
+        let (cur_line, cur_col) = self.editor_cursor();
+        if cur_line != line {
+            return; // the cursor moved to another line since; nothing sane to replace
+        }
+        self.engine.session.editor.cur_buffer_mut().text.delete_range((line, start), (line, cur_col));
+        let (_, col) = self.engine.session.editor.cur_buffer_mut().text.insert(line, start, &item.insert_text);
+        // Not `Editor::set_cursor` — this is still an Insert-mode position
+        // (one past the last character is valid there), and that method
+        // applies `clamp_normal`, which would pull it back one column, the
+        // same reason `feed_insert`'s own char-insertion arm sets the
+        // window's cursor directly instead of going through it.
+        self.engine.session.editor.cur_window_mut().cursor = ctrlvim_core::Position::new(line, col);
+        self.completion_idle_since = None;
+    }
+
+    /// Dismiss the popup without inserting anything (`<Esc>`).
+    pub fn close_completion(&mut self) {
+        self.completion = None;
+        self.completion_idle_since = None;
+    }
+
+    /// Send `shutdown`/`exit` to every running language server — best
+    /// effort, not waited on. Called once at quit so a well-behaved server
+    /// doesn't outlive the editor that spawned it.
+    pub fn shutdown_lsp_clients(&mut self) {
+        for client in self.lsp_clients.values_mut() {
+            client.shutdown();
+        }
     }
 
     /// How long the main loop may block waiting for a key.
@@ -2063,58 +2797,6 @@ impl App {
         });
     }
 
-    /// `:Lint` — run the linter `ctrlvim_tools::lint` names for the active
-    /// buffer's filetype, feeding it the buffer's *live* content over stdin
-    /// (not what's on disk) and collecting its output for [`App::poll_jobs`]
-    /// to parse into quickfix once the process exits.
-    fn host_lint(&mut self) {
-        let Some(ft) = self.editor_filetype() else {
-            self.message = ":Lint: no filetype for this buffer".into();
-            return;
-        };
-        let Some(def) = ctrlvim_tools::lint::for_filetype(ft.name()) else {
-            self.message = format!(":Lint: no linter configured for {}", ft.name());
-            return;
-        };
-        let tool = ctrlvim_tools::REGISTRY.iter().find(|t| t.name == def.name);
-        let installed = tool.is_some_and(|t| ctrlvim_tools::locate(t).is_some());
-        if !installed {
-            self.message = format!(":Lint: {} not found (install it from the Settings tab)", def.binary);
-            return;
-        }
-
-        let path = crate::lint::qf_path(self.active_buffer().path.as_ref(), &self.active_buffer().label);
-        let content = self.editor_lines().join("\n");
-        let (program, args) = crate::lint::build_command(def, &path.to_string_lossy());
-
-        let root = self.root.clone();
-        let jobs = match self.jobs_mut() {
-            Some(jobs) => jobs,
-            None => {
-                self.message = "E902: could not start the job runtime".into();
-                return;
-            }
-        };
-        let (id, stdin) = jobs.spawn_persistent(program, &args, &root);
-        stdin.write(content.into_bytes());
-        stdin.close();
-
-        self.message = format!(":Lint {}: running…", def.name);
-        self.lint_job = Some(RunningLint { id, def, path, stdout: Vec::new() });
-    }
-
-    /// Install a finished `:Lint` job's parsed output into the quickfix list.
-    fn finish_lint(&mut self, job: RunningLint, code: i64) {
-        // Both ported linters (`shellcheck`, `ruff`) use `ignore_exitcode =
-        // true` in their real `nvim-lint` definitions — a nonzero exit is
-        // how they report "diagnostics found", not "the linter itself
-        // failed" — so `code` only makes it into the title, never gates
-        // whether output gets parsed.
-        let items = crate::lint::parse_output(job.def, &job.stdout, &job.path);
-        let title = format!(":Lint {} (exit {code})", job.def.name);
-        self.finish_quickfix(items, title);
-    }
-
     /// `:!{cmd}` — run a raw command line through the configured shell
     /// ([`Config::shell`]) and collect its output for the overlay (see
     /// [`App::poll_jobs`]).
@@ -2158,11 +2840,10 @@ impl App {
                 return;
             }
             self.shell_title = format!("install {name} (exit {code})");
-            if let Some(lsp) = self.project.lsp.get_mut(index).filter(|l| l.name == name) {
-                if let Some(tool) = ctrlvim_tools::REGISTRY.iter().find(|t| t.name == name) {
-                    let (installed, managed) = ctrlvim_tools::installed_and_managed(tool);
+            if let Some(decl) = self.lsp_decls.get(index).filter(|d| d.name == name) {
+                let installed = decl.cmd.first().is_some_and(|bin| crate::data::locate(&decl.name, bin).is_some());
+                if let Some(lsp) = self.lsp.get_mut(index) {
                     lsp.installed = installed;
-                    lsp.managed = managed;
                 }
             }
             self.message = if code == 0 {
@@ -2194,11 +2875,7 @@ impl App {
     /// dashboard's panels fill themselves in a moment after startup instead of
     /// holding up the first frame. See [`crate::data::Project::load`].
     pub fn poll_project(&mut self) -> bool {
-        if !self.project.poll() {
-            return false;
-        }
-        self.after_project_loaded();
-        true
+        self.project.poll()
     }
 
     /// Record how long startup actually took, called once the app is built and
@@ -2216,16 +2893,6 @@ impl App {
     /// Block until the project data is in. See [`crate::data::Project::wait`].
     pub fn wait_for_project(&mut self) {
         self.project.wait();
-        self.after_project_loaded();
-    }
-
-    /// Re-derive the state that shadows `project`'s own fields.
-    fn after_project_loaded(&mut self) {
-        // `lsp_enabled` is indexed in lockstep with `project.lsp` (the settings
-        // rows read `lsp_enabled[i]` while iterating it), so the two have to be
-        // resized together or that indexing panics the moment the real list
-        // arrives over the empty placeholder.
-        self.lsp_enabled = self.project.lsp.iter().map(|s| s.installed).collect();
     }
 
     /// Drain background job output. Called from the main loop's poll tick so a
@@ -2239,7 +2906,10 @@ impl App {
         }
         let mut finished = None;
         let mut shell_finished = None;
-        let mut lint_finished = None;
+        // Language-server replies, collected here (borrowing `lsp_clients`
+        // mutably) and applied after the loop — the same reason `finished`/
+        // `shell_finished` are collected rather than acted on inline.
+        let mut lsp_events: Vec<(&'static str, ctrlvim_lsp::LspEvent)> = Vec::new();
         for event in events {
             match event {
                 Event::ProcessOutput { id, data } => {
@@ -2256,17 +2926,20 @@ impl App {
                         job.output.extend(lines);
                     }
                 }
-                // `:Lint` runs through `spawn_persistent` (separate stdout/
-                // stderr, no merging) since its output is one JSON blob at
-                // exit, not line-oriented — stderr is drained but discarded
-                // (a linter's stderr is its own diagnostics/warnings about
-                // itself, not something quickfix should show).
+                // Every LSP client runs through `spawn_persistent` (separate
+                // stdout/stderr, no merging), since a server's own stderr
+                // logging must never be able to corrupt the protocol framed
+                // on stdout — see `LspClient::feed_stderr`.
                 Event::ProcessStdout { id, data } => {
-                    if let Some(job) = self.lint_job.as_mut().filter(|j| j.id == id) {
-                        job.stdout.extend_from_slice(&data);
+                    if let Some((&key, client)) = self.lsp_clients.iter_mut().find(|(_, c)| c.job_id == id) {
+                        lsp_events.extend(client.feed_stdout(&data).into_iter().map(|e| (key, e)));
                     }
                 }
-                Event::ProcessStderr { .. } => {}
+                Event::ProcessStderr { id, data } => {
+                    if let Some((_, client)) = self.lsp_clients.iter_mut().find(|(_, c)| c.job_id == id) {
+                        client.feed_stderr(&data);
+                    }
+                }
                 Event::ProcessExit { id, code } => {
                     if let Some(job) = self.job.as_mut().filter(|j| j.id == id) {
                         if let Some(last) = job.lines.flush() {
@@ -2284,8 +2957,8 @@ impl App {
                         shell_finished = self.shell_job.take().map(|j| (j, code));
                         continue;
                     }
-                    if self.lint_job.as_ref().is_some_and(|j| j.id == id) {
-                        lint_finished = self.lint_job.take().map(|j| (j, code));
+                    if let Some((&key, client)) = self.lsp_clients.iter_mut().find(|(_, c)| c.job_id == id) {
+                        lsp_events.push((key, client.handle_exit(code)));
                     }
                 }
                 // Timers/RPC are not wired into the frontend yet.
@@ -2299,8 +2972,8 @@ impl App {
         if let Some((job, code)) = shell_finished {
             self.finish_shell(job, code);
         }
-        if let Some((job, code)) = lint_finished {
-            self.finish_lint(job, code);
+        for (key, event) in lsp_events {
+            self.handle_lsp_event(key, event);
         }
         true
     }
@@ -2568,21 +3241,40 @@ impl App {
     }
 
     /// Buffer/tab list navigation (`:bnext`, `:b N`, `:bd`, `:only`, `:ls`).
+    ///
+    /// `N` always addresses the numbering in `tab_indices` (the Dashboard is
+    /// never slot 1), which is what keeps this in sync with what the tab bar
+    /// actually shows.
     fn host_buffer_cmd(&mut self, cmd: BufferCmd) {
+        let tabs = self.tab_indices();
         match cmd {
             BufferCmd::Next => self.cycle_buffer(1),
             BufferCmd::Prev => self.cycle_buffer(-1),
-            BufferCmd::First => self.set_active(0),
-            BufferCmd::Last => self.set_active(self.buffers.len().saturating_sub(1)),
-            BufferCmd::Goto(n) => {
-                if n >= 1 && n <= self.buffers.len() {
-                    self.set_active(n - 1);
-                } else {
-                    self.message = format!("E86: Buffer {n} does not exist");
+            BufferCmd::First => {
+                if let Some(&i) = tabs.first() {
+                    self.set_active(i);
                 }
             }
+            BufferCmd::Last => {
+                if let Some(&i) = tabs.last() {
+                    self.set_active(i);
+                }
+            }
+            BufferCmd::Goto(n) => match n.checked_sub(1).and_then(|i| tabs.get(i)) {
+                Some(&i) => self.set_active(i),
+                None => self.message = format!("E86: Buffer {n} does not exist"),
+            },
             BufferCmd::Delete(which) => {
-                let idx = which.map(|n| n.saturating_sub(1)).unwrap_or(self.active);
+                let idx = match which {
+                    Some(n) => match n.checked_sub(1).and_then(|i| tabs.get(i)) {
+                        Some(&i) => i,
+                        None => {
+                            self.message = format!("E86: Buffer {n} does not exist");
+                            return;
+                        }
+                    },
+                    None => self.active,
+                };
                 self.close_buffer(idx);
             }
             BufferCmd::Only => {
@@ -2600,13 +3292,12 @@ impl App {
                 self.load_active_into_engine();
             }
             BufferCmd::List => {
-                let list: Vec<String> = self
-                    .buffers
+                let list: Vec<String> = tabs
                     .iter()
                     .enumerate()
-                    .map(|(i, b)| {
+                    .map(|(n, &i)| {
                         let mark = if i == self.active { "%" } else { " " };
-                        format!("{}{mark} {}", i + 1, b.label)
+                        format!("{}{mark} {}", n + 1, self.buffers[i].label)
                     })
                     .collect();
                 self.message = list.join("  ");
@@ -2882,6 +3573,25 @@ impl App {
                 ("Markdown: Live Render".to_string(), 'M')
             };
             items.push(PaletteItem { label, hint: "toggle markdown render".to_string(), icon_color: crate::theme::purple(), icon_letter: letter, action: Action::ToggleMarkdown });
+        }
+        // A quick, session-only flip of `'autoindent'` — the palette
+        // counterpart to the `:set autoindent!` it runs under the hood, the
+        // same way `:AI`/`:set mouse` are the session-scoped counterparts to
+        // their persisted Settings-tab checkboxes. Deliberately *not* a
+        // Settings-tab row: this never touches config.toml.
+        if self.is_file() {
+            let (label, letter) = if self.autoindent_enabled() {
+                ("Auto-indent: Turn Off".to_string(), 'I')
+            } else {
+                ("Auto-indent: Turn On".to_string(), 'I')
+            };
+            items.push(PaletteItem {
+                label,
+                hint: "this session only — not saved to config.toml".to_string(),
+                icon_color: crate::theme::cyan(),
+                icon_letter: letter,
+                action: Action::RunEx("set autoindent!".to_string()),
+            });
         }
         items.push(PaletteItem { label: "Find File".into(), hint: "fuzzy file browser".to_string(), icon_color: crate::theme::blue(), icon_letter: 'F', action: Action::OpenFinder });
         items.push(PaletteItem { label: "Plugin Manager".into(), hint: "manage plugins".to_string(), icon_color: crate::theme::orange(), icon_letter: 'P', action: Action::OpenPlugins });
@@ -3629,27 +4339,50 @@ fn pattern_matches(pattern: &str, file: &str) -> bool {
     pattern == file
 }
 
-/// Run each `config.toml`-declared plugin once at startup, in order, over the
-/// same Lua path as `:luafile` (see `host_source`). A broken script doesn't
-/// stop the rest from loading; the first failure becomes the startup status
-/// message (empty if everything loaded cleanly).
-fn load_startup_plugins(engine: &mut Ctrlvim, plugins: &[PluginEntry]) -> String {
+/// Source a single plugin's entry point — `path` is the Lua file itself, run
+/// under the same Lua path as `:luafile` (see `host_source`), named after its
+/// file stem so errors point at the plugin.
+fn run_plugin_file(engine: &mut Ctrlvim, p: &PluginEntry) -> Result<(), String> {
+    let path = expand_tilde(&p.path);
+    let source = path.file_stem().and_then(|s| s.to_str());
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("E484: Can't open file {}: {e}", path.display()))?;
+    engine
+        .run_lua_as(source, &contents)
+        .map_err(|e| format!("E5108: {} ({})", first_line(&e), path.display()))
+}
+
+/// Run every `config.toml`-declared plugin that isn't lazy or disabled, once
+/// at startup, in order. A broken script doesn't stop the rest from loading;
+/// the first failure becomes the startup status message (empty if everything
+/// loaded cleanly). Lazy (`event = ...`) plugins load later, from
+/// `App::fire_autocmd`, when their event first fires.
+///
+/// Also returns each attempted plugin's outcome by name, for the Plugin
+/// Manager screen to display — see `App::plugin_status`.
+fn load_startup_plugins(
+    engine: &mut Ctrlvim,
+    plugins: &[PluginEntry],
+) -> (String, std::collections::HashMap<String, PluginLoadStatus>) {
     let mut message = String::new();
+    let mut status = std::collections::HashMap::new();
     for p in plugins {
-        let path = PathBuf::from(expand_tilde(&p.path));
-        let source = path.file_stem().and_then(|s| s.to_str());
-        let result = std::fs::read_to_string(&path)
-            .map_err(|e| format!("E484: Can't open file {}: {e}", path.display()))
-            .and_then(|contents| {
-                engine.run_lua_as(source, &contents).map_err(|e| format!("E5108: {} ({})", first_line(&e), path.display()))
-            });
-        if let Err(e) = result {
-            if message.is_empty() {
-                message = e;
+        if !p.enabled || p.event.is_some() {
+            continue;
+        }
+        match run_plugin_file(engine, p) {
+            Ok(()) => {
+                status.insert(p.name.clone(), PluginLoadStatus::Loaded);
+            }
+            Err(e) => {
+                status.insert(p.name.clone(), PluginLoadStatus::Error(e.clone()));
+                if message.is_empty() {
+                    message = e;
+                }
             }
         }
     }
-    message
+    (message, status)
 }
 
 /// Case-insensitive subsequence match: every char of `query` appears in
@@ -3749,8 +4482,9 @@ mod startup_plugin_tests {
         assert!(path.is_file(), "missing example plugin at {}", path.display());
 
         let entry = PluginEntry { name: "hello".into(), path: path.to_string_lossy().into(), event: None, enabled: true };
-        let message = load_startup_plugins(&mut engine, &[entry]);
+        let (message, status) = load_startup_plugins(&mut engine, &[entry]);
         assert!(message.is_empty(), "unexpected startup error: {message}");
+        assert!(status.get("hello") == Some(&PluginLoadStatus::Loaded));
 
         // The plugin's global should now be callable, proving the file actually ran.
         engine.open("first line", Some("scratch"));
@@ -3765,12 +4499,69 @@ mod startup_plugin_tests {
         let good_path = example_plugin_path();
         let good = PluginEntry { name: "hello".into(), path: good_path.to_string_lossy().into(), event: None, enabled: true };
 
-        let message = load_startup_plugins(&mut engine, &[missing, good]);
+        let (message, status) = load_startup_plugins(&mut engine, &[missing, good]);
         assert!(message.starts_with("E484"), "message: {message}");
+        assert!(matches!(status.get("missing"), Some(PluginLoadStatus::Error(_))));
+        assert_eq!(status.get("hello"), Some(&PluginLoadStatus::Loaded));
 
         // The second, valid plugin still loaded despite the first one failing.
         engine.open("x", Some("scratch"));
         engine.run_lua("Hello.greet()").unwrap();
         assert_eq!(engine.lines(), vec!["Hello from ctrlvim!"]);
+    }
+
+    #[test]
+    fn a_disabled_plugin_does_not_load_at_startup() {
+        let mut engine = Ctrlvim::new();
+        let good_path = example_plugin_path();
+        let off = PluginEntry { name: "hello".into(), path: good_path.to_string_lossy().into(), event: None, enabled: false };
+
+        let (message, status) = load_startup_plugins(&mut engine, &[off]);
+        assert!(message.is_empty(), "unexpected startup error: {message}");
+        assert!(status.is_empty(), "a disabled plugin should never even be attempted");
+
+        engine.open("x", Some("scratch"));
+        assert!(engine.run_lua("Hello.greet()").is_err(), "a disabled plugin must not have run");
+    }
+
+    #[test]
+    fn a_lazy_plugin_does_not_load_at_startup() {
+        let mut engine = Ctrlvim::new();
+        let good_path = example_plugin_path();
+        let lazy = PluginEntry {
+            name: "hello".into(),
+            path: good_path.to_string_lossy().into(),
+            event: Some("BufWritePre".into()),
+            enabled: true,
+        };
+
+        let (message, status) = load_startup_plugins(&mut engine, &[lazy]);
+        assert!(message.is_empty(), "unexpected startup error: {message}");
+        assert!(status.is_empty(), "a lazy plugin should not be attempted until its event fires");
+
+        engine.open("x", Some("scratch"));
+        assert!(engine.run_lua("Hello.greet()").is_err(), "a lazy plugin must not run before its event fires");
+    }
+
+    #[test]
+    fn a_startup_plugin_does_not_load_twice() {
+        // Regression: `App::with_root` used to eagerly source every
+        // `[[plugin]]` via `load_startup_plugins`, and `App::apply_config`
+        // (always called right after, from `main.rs`) used to *also* try to
+        // load it — via a directory/`init.lua` convention that never matched
+        // a file path, clobbering the real startup message with a bogus
+        // "no init.lua or init.vim" error. Both loading now happens exactly
+        // once, only in `load_startup_plugins`.
+        let good_path = example_plugin_path();
+        let mut app = App::with_root(std::env::temp_dir(), std::time::Instant::now());
+        app.config.plugins =
+            vec![PluginEntry { name: "hello".into(), path: good_path.to_string_lossy().into(), event: None, enabled: true }];
+        // `with_root` already ran startup plugin loading before `config` was
+        // overwritten above, so re-run it exactly as `with_root` would, then
+        // apply the rest of config the same way `main` does.
+        (app.message, app.plugin_status) = load_startup_plugins(&mut app.engine, &app.config.plugins.clone());
+        app.apply_config();
+
+        assert!(app.message.is_empty(), "apply_config must not re-report plugin loading: {}", app.message);
     }
 }

@@ -68,6 +68,7 @@ fn contains(r: Rect, x: u16, y: u16) -> bool {
 fn editor_owns_cursor(app: &App) -> bool {
     !app.palette_open
         && !app.help_open
+        && !app.pin_menu_open
         && !app.shell_open
         && !app.drawer_search
         && app.save_prompt.is_none()
@@ -86,13 +87,15 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // tab bar
-            Constraint::Min(0),    // body
-            Constraint::Length(1), // status line
+            Constraint::Length(if app.config.tabs { 1 } else { 0 }), // tab bar, opt-in
+            Constraint::Min(0),                                     // body
+            Constraint::Length(1),                                  // status line
         ])
         .split(area);
 
-    shell::tab_bar(f, app, rows[0], &mut zones);
+    if app.config.tabs {
+        shell::tab_bar(f, app, rows[0], &mut zones);
+    }
     body(f, app, rows[1], &mut zones, editor_owns_cursor(app));
     shell::status_line(f, app, rows[2]);
 
@@ -109,6 +112,9 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     if app.help_open {
         overlays::help(f, app, area, &mut zones);
     }
+    if app.pin_menu_open {
+        overlays::pin_menu(f, app, area, &mut zones);
+    }
     if app.palette_open {
         overlays::palette(f, app, area, &mut zones);
     }
@@ -118,6 +124,9 @@ pub fn draw(f: &mut Frame, app: &App) -> Zones {
     if app.shell_open {
         overlays::shell_output(f, app, area, &mut zones);
     }
+    // Non-modal — drawn whenever it has something to show, no gating flag —
+    // and after everything above so it sits on top if one happens to overlap.
+    overlays::completion_menu(f, app, area, &mut zones);
     // Last of all: the which-key popup is transient and must sit on top of
     // whatever is already showing. It registers no zones — it's a hint, not a
     // menu, and clicking through it should hit what's underneath.

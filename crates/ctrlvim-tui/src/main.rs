@@ -53,6 +53,14 @@ Press `?` inside the editor for the keymap.
 
 fn main() -> io::Result<()> {
     let start = Instant::now();
+    // `cvi tool <subcommand>` is a utility primitive meant to be called from
+    // an `lsp.lua` `install` line (see `ctrlvim::tool_fetch`), not the
+    // editor — dispatched before anything else touches the terminal, same as
+    // `--help`/`--version` below.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("tool") {
+        std::process::exit(ctrlvim::tool_fetch::run_cli(args));
+    }
     // Arguments are handled before the terminal is touched: `--version` has to
     // print to stdout, not into an alternate screen that is then torn down.
     let launch = match parse_args(std::env::args().skip(1), |p| p.is_dir()) {
@@ -160,6 +168,12 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
     // resurrect an unrelated stale window.
     if launch.files.is_empty() {
         app.restore_session();
+        // A brand-new project — nothing to restore, no file named on the
+        // command line — opens straight into the file picker rather than
+        // parking on the Dashboard (which no longer even shows as a tab).
+        if app.buffers.len() == 1 {
+            app.open_finder();
+        }
     }
     // Files open after the config so options, mappings and the Lua host are all
     // in place before `BufEnter` fires for them.
@@ -201,6 +215,7 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
             app.poll_jobs();
             app.poll_lua();
             app.poll_ai();
+            app.poll_completion();
             app.tick_keymap_timeout();
             app.tick_session_snapshot();
             continue;
@@ -209,6 +224,7 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
         app.poll_jobs();
         app.poll_lua();
         app.poll_ai();
+        app.poll_completion();
         app.tick_keymap_timeout();
         app.tick_session_snapshot();
         match event::read()? {
@@ -251,6 +267,8 @@ fn run(terminal: &mut Term, start: Instant, launch: Launch) -> io::Result<()> {
     // Ctrl+C) with one flush, so quitting is never worse for recovery than
     // the periodic snapshot already taken during the session.
     app.save_session();
+    // So a language server this session spawned doesn't outlive it.
+    app.shutdown_lsp_clients();
     Ok(())
 }
 

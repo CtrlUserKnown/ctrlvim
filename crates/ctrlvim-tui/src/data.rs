@@ -2,11 +2,14 @@
 //!
 //! Everything here reflects the actual project the editor is launched in (the
 //! current working directory): recent files come from the filesystem, git
-//! status from the `git` CLI, LOC from counting source lines, language
-//! servers/formatters/linters from `ctrlvim_tools::REGISTRY` (PATH probing
-//! plus ctrlvim's own managed tools directory), and plugins from the
-//! conventional pack directory. Sources that don't exist yield truthful empty
-//! state rather than mock data.
+//! status from the `git` CLI, LOC from counting source lines. Sources that
+//! don't exist yield truthful empty state rather than mock data.
+//!
+//! Plugins and language servers/linkers are *not* gathered here: unlike
+//! everything else on this page, the Plugin Manager reflects `config.toml`'s
+//! `[[plugin]]` array directly (see `crate::ui::plugins`) and the Settings
+//! tab's LSP table reflects `lsp.lua` directly (see `crate::lsp_config`) —
+//! neither is scanned off disk the way recent files or git status are.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -15,10 +18,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
-use crate::model::{
-    icon_for, FileEntry, FileIcon, GitChange, GitStatus, LspServer, Plugin, PluginStatus,
-    SessionEntry, Stats,
-};
+use crate::model::{icon_for, FileEntry, FileIcon, GitChange, GitStatus, SessionEntry, Stats};
 
 /// A gathered snapshot of the project.
 pub struct Project {
@@ -26,8 +26,6 @@ pub struct Project {
     pub recent_files: Vec<FileEntry>,
     pub git: Option<GitStatus>,
     pub sessions: Vec<SessionEntry>,
-    pub plugins: Vec<Plugin>,
-    pub lsp: Vec<LspServer>,
     pub stats: Stats,
     /// Delivers the gathered project exactly once, then is dropped. `None`
     /// means the data has already arrived (or the worker died) and there is
@@ -40,8 +38,6 @@ struct Gathered {
     recent_files: Vec<FileEntry>,
     git: Option<GitStatus>,
     sessions: Vec<SessionEntry>,
-    plugins: Vec<Plugin>,
-    lsp: Vec<LspServer>,
     loc: usize,
 }
 
@@ -58,8 +54,6 @@ fn gather(root: &Path) -> Gathered {
         loc: count_loc(root, &scanned),
         git,
         sessions,
-        plugins: load_plugins(),
-        lsp: detect_lsp(),
     }
 }
 
@@ -92,14 +86,7 @@ impl Project {
             recent_files: Vec::new(),
             git: None,
             sessions: Vec::new(),
-            plugins: Vec::new(),
-            lsp: Vec::new(),
-            stats: Stats {
-                startup_ms: start.elapsed().as_millis(),
-                plugins_loaded: 0,
-                plugins_total: 0,
-                loc: None,
-            },
+            stats: Stats { startup_ms: start.elapsed().as_millis(), loc: None },
             rx: Some(rx),
         }
     }
@@ -141,15 +128,10 @@ impl Project {
     }
 
     fn apply(&mut self, g: Gathered) {
-        self.stats.plugins_loaded =
-            g.plugins.iter().filter(|p| p.status == PluginStatus::Loaded).count();
-        self.stats.plugins_total = g.plugins.len();
         self.stats.loc = Some(group_thousands(g.loc));
         self.recent_files = g.recent_files;
         self.git = g.git;
         self.sessions = g.sessions;
-        self.plugins = g.plugins;
-        self.lsp = g.lsp;
         self.rx = None;
     }
 }
@@ -576,43 +558,7 @@ fn load_git(root: &Path) -> Option<GitStatus> {
     })
 }
 
-// --- lsp / plugins / sessions ---------------------------------------------
-
-fn detect_lsp() -> Vec<LspServer> {
-    // Language servers, formatters, and linters come from ctrlvim's own tool
-    // registry (see `ctrlvim_tools`), which also knows how to install the
-    // ones it can. Build linkers aren't part of that registry — they're
-    // system packages, not per-project dev tools — so they stay a handful of
-    // pure PATH-detection rows, same as before.
-    let mut tools: Vec<LspServer> = ctrlvim_tools::REGISTRY.iter().map(lsp_server_from_tool).collect();
-
-    let linkers: &[(&str, &[&str])] = &[
-        ("mold", &["mold", "ld.mold"]),
-        ("lld", &["ld.lld", "lld"]),
-        ("wild", &["wild"]),
-        ("gold", &["ld.gold", "gold"]),
-        ("ld.bfd", &["ld.bfd", "ld"]),
-    ];
-    tools.extend(linkers.iter().map(|(name, bins)| LspServer {
-        name: name.to_string(),
-        filetypes: "linker".to_string(),
-        installed: bins.iter().any(|b| on_path(b)),
-        managed: false,
-        installable: false,
-    }));
-    tools
-}
-
-pub(crate) fn lsp_server_from_tool(tool: &ctrlvim_tools::Tool) -> LspServer {
-    let (installed, managed) = ctrlvim_tools::installed_and_managed(tool);
-    LspServer {
-        name: tool.name.to_string(),
-        filetypes: tool.filetypes.to_string(),
-        installed,
-        managed,
-        installable: tool.method.is_supported(),
-    }
-}
+// --- plugins / sessions -----------------------------------------------------
 
 /// Every `<config>/ctrlvim/pack/*/start/*` directory — the plugins Neovim's
 /// own native package loading puts on `'runtimepath'` automatically, with no
@@ -636,31 +582,6 @@ pub(crate) fn pack_start_dirs() -> Vec<PathBuf> {
         }
     }
     dirs
-}
-
-/// Scan the conventional pack directory for installed plugins.
-/// `<config>/ctrlvim/pack/*/start/*` are loaded, `.../opt/*` are lazy.
-fn load_plugins() -> Vec<Plugin> {
-    let Some(pack) = config_dir().map(|c| c.join("ctrlvim").join("pack")) else {
-        return Vec::new();
-    };
-    let mut plugins = Vec::new();
-    let Ok(groups) = fs::read_dir(&pack) else { return plugins };
-    for group in groups.flatten() {
-        for (sub, status) in [("start", PluginStatus::Loaded), ("opt", PluginStatus::Lazy)] {
-            let dir = group.path().join(sub);
-            let Ok(entries) = fs::read_dir(&dir) else { continue };
-            for e in entries.flatten() {
-                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let repo = git_remote(&e.path()).unwrap_or_default();
-                    plugins.push(Plugin { name, repo, category: sub.to_string(), status });
-                }
-            }
-        }
-    }
-    plugins.sort_by(|a, b| a.name.cmp(&b.name));
-    plugins
 }
 
 fn load_sessions(root: &Path, git: Option<&GitStatus>, file_count: usize) -> Vec<SessionEntry> {
@@ -702,33 +623,35 @@ fn load_sessions(root: &Path, git: Option<&GitStatus>, file_count: usize) -> Vec
 
 // --- small helpers ---------------------------------------------------------
 
-fn on_path(bin: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else { return false };
-    std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file())
+fn path_lookup(bin: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).map(|dir| dir.join(bin)).find(|p| p.is_file())
 }
 
-fn git_remote(dir: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C"])
-        .arg(dir)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    // Trim to `owner/repo` for display.
-    let short = url
-        .trim_end_matches(".git")
-        .rsplit(['/', ':'])
-        .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("/");
-    (!short.is_empty()).then_some(short)
+fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| home().map(|h| h.join(".local").join("share")))
+}
+
+/// Where `cvi tool fetch-release` extracts a declared tool named `name` —
+/// `~/.local/share/ctrlvim/tools/<name>/`. Not scanned or created by
+/// anything but that installer; [`locate`] only ever reads from it.
+pub(crate) fn tools_root(name: &str) -> Option<PathBuf> {
+    data_dir().map(|d| d.join("ctrlvim").join("tools").join(name))
+}
+
+/// Resolve `bin` (an `lsp.lua` entry's `cmd[0]`) to an absolute path: `PATH`
+/// first, then ctrlvim's own `tools_root(name)/bin/` — where a
+/// `fetch-release`-installed binary lands — so a tool ctrlvim downloaded
+/// itself is found without the user ever touching `$PATH`. `None` means
+/// neither has it.
+pub(crate) fn locate(name: &str, bin: &str) -> Option<PathBuf> {
+    path_lookup(bin).or_else(|| {
+        let candidate = tools_root(name)?.join("bin").join(bin);
+        candidate.is_file().then_some(candidate)
+    })
 }
 
 pub(crate) fn config_dir() -> Option<PathBuf> {

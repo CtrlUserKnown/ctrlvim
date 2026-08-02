@@ -27,39 +27,6 @@ pub struct SessionEntry {
     pub last: String,
 }
 
-/// Plugin lifecycle status; carries its own display color + label.
-#[derive(Clone, Copy, PartialEq)]
-pub enum PluginStatus {
-    Loaded,
-    Update,
-    Lazy,
-}
-
-impl PluginStatus {
-    pub fn color(self) -> Color {
-        match self {
-            PluginStatus::Loaded => theme::green(),
-            PluginStatus::Update => theme::orange(),
-            PluginStatus::Lazy => theme::fg_dim(),
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            PluginStatus::Loaded => "loaded",
-            PluginStatus::Update => "update",
-            PluginStatus::Lazy => "lazy",
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Plugin {
-    pub name: String,
-    pub repo: String,
-    pub category: String,
-    pub status: PluginStatus,
-}
-
 /// A tool row in the Settings tab — a language server, formatter, linter, or
 /// build linker. `installed` reflects whether a binary was found at all
 /// (either on `PATH` or in ctrlvim's own tools directory, see `managed`); the
@@ -67,13 +34,16 @@ pub struct Plugin {
 #[derive(Clone)]
 pub struct LspServer {
     pub name: String,
+    /// Comma-joined for display; empty for a presence-only (e.g. build
+    /// linker) declaration — see `crate::lsp_config::LspServerDecl::filetypes`.
     pub filetypes: String,
+    /// Whether `cmd[0]` was found on `PATH`. There is no "ctrlvim-managed"
+    /// install location anymore — every declared server is either on `PATH`
+    /// or it isn't, exactly what a shell would see.
     pub installed: bool,
-    /// `installed` was found in ctrlvim's own tools directory rather than on
-    /// `PATH` — i.e. ctrlvim installed it itself.
-    pub managed: bool,
-    /// ctrlvim knows how to install this one (see `ctrlvim_tools::REGISTRY`).
-    pub installable: bool,
+    /// The install command the user's `lsp.lua` declared for this entry, if
+    /// any — run verbatim by the Settings tab's `I` action.
+    pub install: Option<String>,
 }
 
 /// One path git reports as not matching HEAD, with how it differs.
@@ -122,8 +92,6 @@ pub struct GitStatus {
 #[derive(Clone)]
 pub struct Stats {
     pub startup_ms: u128,
-    pub plugins_loaded: usize,
-    pub plugins_total: usize,
     /// Lines of code, already thousands-grouped for display. `None` until the
     /// background count finishes — counting means reading every source file in
     /// the project, which is far too slow to block the first frame on.

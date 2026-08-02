@@ -20,12 +20,17 @@ ai-metal = ["ai", "ctrlvim-ai/metal"]
 ctrlvim-core.workspace = true
 ctrlvim-ai.workspace = true
 ctrlvim-markdown.workspace = true
-ctrlvim-tools.workspace = true
+ctrlvim-lsp.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
+mlua.workspace = true
+ureq = { version = "2", features = ["tls", "json"] }
+flate2 = "1"
+tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "cvi"

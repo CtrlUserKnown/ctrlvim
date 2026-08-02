@@ -55,6 +55,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         handle_shell_output(app, key);
         return;
     }
+    if app.pin_menu_open {
+        handle_pin_menu(app, key);
+        return;
+    }
 
     // Ctrl+Tab / Ctrl+Shift+Tab cycle through open tabs from anywhere (editor
     // or dashboard), like a browser.
@@ -89,6 +93,15 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         match key.code {
             KeyCode::Left if ctrl => return app.cycle_buffer(-1),
             KeyCode::Right if ctrl => return app.cycle_buffer(1),
+            // `Ctrl-O`/`Ctrl-I` walk the jumplist within a file (handled by
+            // the engine, below) until it's exhausted, then fall back to the
+            // App's own cross-file history — see `App::jump_file_back`.
+            KeyCode::Char('o') if ctrl && !app.engine.session.jump_back_available() => {
+                return app.jump_file_back();
+            }
+            KeyCode::Char('i') if ctrl && !app.engine.session.jump_forward_available() => {
+                return app.jump_file_forward();
+            }
             _ => {}
         }
         // `:` opens the unified command palette (the command line's new UI)
@@ -101,6 +114,28 @@ fn handle_editor(app: &mut App, key: KeyEvent) {
         // be hardcoded here too. They are default mappings now
         // (`session::DEFAULT_KEYMAPS`), so they reach the engine like any other
         // key — which is what makes them listable in `?` and rebindable.
+    } else if app.completion.is_some() {
+        // The completion popup owns navigation/accept; everything else
+        // (including `<Esc>`, and plain typing) falls through to the engine
+        // below. `<Esc>` deliberately isn't caught here — it must always
+        // leave Insert mode in one keystroke, same as it does with no popup
+        // open; `App::handle_completion_keystroke` notices the mode changed
+        // and closes the popup as a side effect, the same way it closes on
+        // any other key that isn't part of completing a word.
+        match key.code {
+            KeyCode::Down => return app.move_completion(1),
+            KeyCode::Up => return app.move_completion(-1),
+            KeyCode::Char('n') if ctrl => return app.move_completion(1),
+            KeyCode::Char('p') if ctrl => return app.move_completion(-1),
+            KeyCode::Tab | KeyCode::Enter => return app.accept_completion(),
+            _ => {}
+        }
+    }
+
+    // `<C-Space>`: IntelliSense's manual trigger, insert mode only — ask for
+    // completions right now regardless of what was just typed.
+    if !normal && ctrl && key.code == KeyCode::Char(' ') {
+        return app.trigger_completion();
     }
 
     if let Some(k) = to_engine_key(&key) {
@@ -162,6 +197,20 @@ fn to_engine_key(key: &KeyEvent) -> Option<Key> {
         KeyCode::Insert => special(SpecialKey::Insert),
         KeyCode::F(n) if (1..=12).contains(&n) => special(SpecialKey::F(n)),
         _ => None,
+    }
+}
+
+// --- pinned-files (harpoon) popup -------------------------------------------
+
+fn handle_pin_menu(app: &mut App, key: KeyEvent) {
+    match (key.code, char_of(&key)) {
+        (KeyCode::Esc, _) => app.dispatch(Action::ClosePinMenu),
+        (KeyCode::Down, _) | (_, Some('j')) => app.pin_menu_move(1),
+        (KeyCode::Up, _) | (_, Some('k')) => app.pin_menu_move(-1),
+        (KeyCode::Enter, _) => app.pin_menu_select(app.pin_menu_cursor),
+        (_, Some('d')) | (_, Some('x')) => app.pin_menu_unpin(),
+        (_, Some('q')) => app.dispatch(Action::ClosePinMenu),
+        _ => {}
     }
 }
 
@@ -399,10 +448,23 @@ fn handle_shell(app: &mut App, key: KeyEvent) {
 
     // Settings: j/k scroll continuously through the EDITOR options and the
     // tools list; Enter/Space toggles the focused row. `d`/`m` jump-toggle
-    // directly, `I` installs the focused tool (rust_analyzer, stylua, …).
+    // directly, `I` installs the focused tool (rust_analyzer, stylua, …), `/`
+    // filters the EDITOR panel's rows live by key or label.
     if on_dashboard && app.section == DashboardSection::Settings {
+        if app.settings_search {
+            match key.code {
+                KeyCode::Esc => { app.settings_search_clear(); return; }
+                KeyCode::Enter => { app.settings_toggle(); return; }
+                KeyCode::Down => { app.move_settings(1); return; }
+                KeyCode::Up => { app.move_settings(-1); return; }
+                KeyCode::Backspace => { app.settings_search_backspace(); return; }
+                KeyCode::Char(c) => { app.settings_search_type(c); return; }
+                _ => return,
+            }
+        }
         match (key.code, c) {
             (KeyCode::Char('I'), _) => { app.install_focused_tool(); return; }
+            (KeyCode::Char('/'), _) => { app.settings_start_search(); return; }
             (_, Some('d')) => { app.dispatch(Action::ToggleStartupDrawer); return; }
             (_, Some('m')) => { app.dispatch(Action::ToggleMouse); return; }
             (_, Some('i')) => { app.dispatch(Action::CycleIconMode); return; }

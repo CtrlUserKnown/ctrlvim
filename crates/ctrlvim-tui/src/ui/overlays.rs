@@ -347,6 +347,137 @@ pub fn help(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     }
 }
 
+/// Centered harpoon-style pinned-files popup (`:PinList`/`<leader>h`).
+pub fn pin_menu(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
+    zones.push(area, Action::ClosePinMenu);
+
+    let pins = app.engine.session.pins.files();
+    let name_w = pins
+        .iter()
+        .map(|p| p.to_string_lossy().chars().count())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let title = " Pinned Files ";
+    let w = (name_w as u16 + 6).max(title.len() as u16 + 4).min(area.width.saturating_sub(4));
+    // +2 for the border, +1 for the hint line under the list.
+    let h = (pins.len() as u16 + 3).min(area.height.saturating_sub(2));
+    let panel = centered(area, w, h);
+    f.render_widget(Clear, panel);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::border()))
+        .style(Style::default().bg(theme::bg_dark()))
+        .title(Line::from(Span::styled(title, Style::default().fg(theme::fg()).add_modifier(Modifier::BOLD))));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+
+    let close_rect = Rect { x: panel.x + panel.width.saturating_sub(3), y: panel.y, width: 1, height: 1 };
+    f.render_widget(Paragraph::new(Span::styled("×", Style::default().fg(theme::fg_dim()))), close_rect);
+    zones.push(close_rect, Action::ClosePinMenu);
+
+    let current_path = app.active_buffer().path.clone();
+    for (i, path) in pins.iter().enumerate() {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        let selected = i == app.pin_menu_cursor;
+        let is_open = current_path.as_deref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy())
+            == Some(path.to_string_lossy());
+        f.render_widget(Block::default().style(row_style(selected)), row);
+        let line = Line::from(vec![
+            selection_bar(selected, theme::blue()),
+            Span::styled(format!("{}: ", i + 1), Style::default().fg(theme::cyan())),
+            Span::styled(
+                path.to_string_lossy().into_owned(),
+                Style::default().fg(if is_open { theme::green() } else { theme::fg() }),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line).style(row_style(selected)), row);
+        zones.push(row, Action::PinMenuSelect(i));
+    }
+
+    let hint_y = inner.y + inner.height.saturating_sub(1);
+    if hint_y >= inner.y + pins.len() as u16 && hint_y < inner.y + inner.height {
+        let hint = Line::from(Span::styled(
+            "j/k move  enter open  d unpin  esc close",
+            Style::default().fg(theme::fg_dim()),
+        ));
+        f.render_widget(Paragraph::new(hint), Rect { x: inner.x, y: hint_y, width: inner.width, height: 1 });
+    }
+}
+
+/// Code-completion popup, anchored just under the cursor (IntelliSense-style,
+/// as opposed to the centered modals above) — it has to sit where you're
+/// typing, not fight for the screen's middle. Registers no scrim/close zone:
+/// unlike the others this isn't modal, it just goes away on its own the
+/// moment a keystroke stops matching (see `App::handle_completion_keystroke`).
+pub fn completion_menu(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
+    let Some(menu) = app.completion.as_ref() else { return };
+    if menu.items.is_empty() {
+        return;
+    }
+    let Some((cx, cy)) = app.cursor_screen_pos() else { return };
+
+    let label_w = menu.items.iter().map(|i| i.label.chars().count()).max().unwrap_or(8).max(8);
+    let kind_w = menu.items.iter().filter_map(|i| i.kind).map(str::len).max().unwrap_or(0);
+    let extra = if kind_w > 0 { kind_w as u16 + 1 } else { 0 };
+    let w = (label_w as u16 + extra + 4).clamp(12, area.width.saturating_sub(2).max(12));
+
+    const MAX_ROWS: usize = 10;
+    let visible = menu.items.len().min(MAX_ROWS);
+    let h = (visible as u16 + 2).min(area.height.saturating_sub(2).max(3));
+
+    // Below the cursor line by default; flip above it if there's no room
+    // below (typing on the last line of the window, say).
+    let below = cy + 1;
+    let y = if below + h <= area.y + area.height { below } else { cy.saturating_sub(h) };
+    let x = cx.min((area.x + area.width).saturating_sub(w));
+    let panel = Rect { x, y, width: w, height: h };
+
+    f.render_widget(Clear, panel);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::border()))
+        .style(Style::default().bg(theme::bg_dark()));
+    let inner = block.inner(panel);
+    f.render_widget(block, panel);
+
+    for (i, item) in menu.items.iter().enumerate().take(inner.height as usize) {
+        let y = inner.y + i as u16;
+        let selected = i == menu.selected;
+        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+        f.render_widget(Block::default().style(row_style(selected)), row);
+        let mut spans = vec![
+            selection_bar(selected, theme::blue()),
+            Span::styled(
+                completion_truncate(&item.label, inner.width.saturating_sub(2) as usize),
+                Style::default().fg(theme::fg()),
+            ),
+        ];
+        if let Some(kind) = item.kind {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(kind, Style::default().fg(theme::fg_dim())));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
+        zones.push(row, Action::CompletionSelect(i));
+    }
+}
+
+/// `s` clipped to `max` characters, marked with `…` when it was.
+fn completion_truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max || max == 0 {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Bottom-anchored which-key popup: what can still follow the chord in progress.
 ///
 /// Shown once `'timeoutlen'` elapses on a half-typed mapping, so it never

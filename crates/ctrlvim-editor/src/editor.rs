@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn options_resolve_through_editor() {
         let mut ed = Editor::new();
-        assert_eq!(ed.options().tabstop(), 8);
+        assert_eq!(ed.options().tabstop(), 4);
         ed.cur_buffer_mut().options.tabstop = Some(2);
         assert_eq!(ed.options().tabstop(), 2);
     }

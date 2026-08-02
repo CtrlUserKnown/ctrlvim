@@ -144,9 +144,17 @@ fn columns_layout(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
             Span::styled(v, Style::default().fg(c)),
         ])
     };
+    // Plugin counts come straight from `config.plugins`, not the project
+    // scan — see `crate::ui::plugins`.
+    let plugins_loaded = app
+        .config
+        .plugins
+        .iter()
+        .filter(|p| app.plugin_status.get(&p.name) == Some(&crate::app::PluginLoadStatus::Loaded))
+        .count();
     let stats = vec![
         stat("startup", format!("{}ms", stats_data.startup_ms), theme::green()),
-        stat("plugins", format!("{}/{}", stats_data.plugins_loaded, stats_data.plugins_total), theme::cyan()),
+        stat("plugins", format!("{}/{}", plugins_loaded, app.config.plugins.len()), theme::cyan()),
         // `…` while the background count is still running — a real number
         // needs every source file read, which does not block startup.
         stat(
@@ -497,30 +505,90 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     if area.width < 10 || area.height < 4 {
         return;
     }
-    // EDITOR options panel: live-toggleable settings backed by config.toml.
-    let opt_h = 7u16.min(area.height);
+    // EDITOR options panel: live-toggleable settings backed by config.toml,
+    // one row per `Config::to_setting_items()` entry. A `/` search narrows
+    // `visible` to the matching real indices without renumbering them — see
+    // `App::settings_matches`.
+    let visible: Vec<usize> =
+        if app.settings_search { app.settings_matches() } else { (0..App::SETTINGS_EDITOR_OPTIONS).collect() };
+    let opt_h = 9u16.min(area.height);
     let opt_rect = Rect { height: opt_h, ..area };
     let cfg_hint = Line::from(Span::styled("┤ ~/.config/ctrlvim/config.toml ├", Style::default().fg(theme::fg_dim()).bg(theme::bg_dark())));
     let opt_inner = super::titled_panel_with_right(f, opt_rect, "EDITOR", theme::cyan(), Some(cfg_hint));
     let sel = app.settings_index;
+
+    // `/` search field: dim hint when idle, live query + cursor when typing.
     if opt_inner.height >= 1 {
         let r = Rect { x: opt_inner.x, y: opt_inner.y, width: opt_inner.width, height: 1 };
-        option_row(f, r, "Open file drawer on startup", app.config.drawer, sel == 0, zones, Action::ToggleStartupDrawer);
+        let line = if app.settings_search {
+            Line::from(vec![
+                Span::styled("/", Style::default().fg(theme::blue())),
+                Span::styled(app.settings_query.clone(), Style::default().fg(theme::fg())),
+                Span::styled("▏", Style::default().fg(theme::fg())),
+            ])
+        } else {
+            Line::from(Span::styled("/ to search settings", Style::default().fg(theme::fg_dim())))
+        };
+        f.render_widget(Paragraph::new(line), r);
+        if app.settings_search {
+            let right = r.x + r.width.saturating_sub(1);
+            f.set_cursor_position((
+                (r.x + 1 + ctrlvim_core::display_width(&app.settings_query) as u16).min(right),
+                r.y,
+            ));
+        }
     }
-    if opt_inner.height >= 2 {
+
+    let items = app.config.to_setting_items();
+    for (row_i, &item_i) in visible.iter().enumerate() {
+        let y = opt_inner.y + 1 + row_i as u16;
+        if y >= opt_inner.y + opt_inner.height {
+            break;
+        }
+        let r = Rect { x: opt_inner.x, y, width: opt_inner.width, height: 1 };
+        let selected = sel == item_i;
+        let Some(item) = items.get(item_i) else { continue };
+        match item_i {
+            4 => {
+                // The *live* 'tabstop' (which tracks 'shiftwidth' too — see
+                // `App::cycle_indent_width`), same reasoning as the AI row
+                // below: `:set tabstop=8` from the command line shouldn't
+                // leave this row showing a number the editor no longer
+                // agrees with.
+                choice_row(f, r, item.label, &app.tabstop().to_string(), selected, zones, Action::CycleIndentWidth);
+            }
+            5 => {
+                // The *live* state, not `config.ai.enabled`: `:AI on` changes
+                // one and not the other, and a checkbox that disagrees with
+                // the editor is worse than no checkbox. Toggling here writes
+                // the config as well.
+                option_row(f, r, item.label, app.ai_enabled(), selected, zones, Action::ToggleAi);
+            }
+            _ => match &item.value {
+                crate::config::SettingValue::Bool(on) => {
+                    let action = match item.key {
+                        "drawer" => Action::ToggleStartupDrawer,
+                        "tabs" => Action::ToggleTabs,
+                        "mouse" => Action::ToggleMouse,
+                        _ => continue,
+                    };
+                    option_row(f, r, item.label, *on, selected, zones, action);
+                }
+                crate::config::SettingValue::Choice { current, .. } => {
+                    choice_row(f, r, item.label, current, selected, zones, Action::CycleIconMode);
+                }
+                _ => {}
+            },
+        }
+    }
+    if visible.is_empty() {
         let r = Rect { x: opt_inner.x, y: opt_inner.y + 1, width: opt_inner.width, height: 1 };
-        option_row(f, r, "Mouse support (scroll the editor)", app.config.mouse, sel == 1, zones, Action::ToggleMouse);
-    }
-    if opt_inner.height >= 3 {
-        let r = Rect { x: opt_inner.x, y: opt_inner.y + 2, width: opt_inner.width, height: 1 };
-        choice_row(f, r, "File icons (Nerd Font)", &app.config.icons.label(), sel == 2, zones, Action::CycleIconMode);
-    }
-    if opt_inner.height >= 4 {
-        let r = Rect { x: opt_inner.x, y: opt_inner.y + 3, width: opt_inner.width, height: 1 };
-        // The *live* state, not `config.ai.enabled`: `:AI on` changes one and
-        // not the other, and a checkbox that disagrees with the editor is worse
-        // than no checkbox. Toggling here writes the config as well.
-        option_row(f, r, "Inline AI suggestions (CodeGemma)", app.ai_enabled(), sel == 3, zones, Action::ToggleAi);
+        if r.y < opt_inner.y + opt_inner.height {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled("no settings match", Style::default().fg(theme::fg_dim())))),
+                r,
+            );
+        }
     }
 
     // Header row for the LSP table.
@@ -541,91 +609,96 @@ fn settings(f: &mut Frame, app: &App, area: Rect, zones: &mut Zones) {
     // sits cleanly beneath it rather than on the bottom border.
     let table_y = hdr_y + 2;
     let avail = (area.y + area.height).saturating_sub(table_y);
-    let table_h = (app.project.lsp.len() as u16 + 3).min(avail);
+    let table_h = (app.lsp.len() as u16 + 3).min(avail);
     let table = Rect { y: table_y, height: table_h, ..area };
     let inner = super::titled_panel(f, table, "LSP", theme::orange());
 
-    // Column header.
-    let ch = Line::from(vec![
-        Span::styled(format!("{:<18}", "SERVER"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:<20}", "FILETYPES"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("{:<12}", "STATUS"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
-    ]);
-    if inner.height > 0 {
-        f.render_widget(Paragraph::new(ch).style(Style::default().bg(theme::bg_dark())), Rect { height: 1, ..inner });
-    }
-
-    for (i, lsp) in app.project.lsp.iter().enumerate() {
-        let y = inner.y + 1 + i as u16;
-        if y >= inner.y + inner.height {
-            break;
+    if app.lsp.is_empty() {
+        if inner.height > 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "No servers declared. Add an entry to lsp.lua to see it here.",
+                    Style::default().fg(theme::fg_dim()),
+                )))
+                .style(Style::default().bg(theme::bg_dark())),
+                Rect { height: 1, ..inner },
+            );
         }
-        let on = app.lsp_enabled[i];
-        // The Settings selection spans the EDITOR options first, then the LSPs.
-        let selected = app.settings_index == i + App::SETTINGS_EDITOR_OPTIONS;
-        let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
-        f.render_widget(Block::default().style(row_style(selected)), row);
+    } else {
+        // Column header.
+        let ch = Line::from(vec![
+            Span::styled(format!("{:<18}", "SERVER"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:<20}", "FILETYPES"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:<12}", "STATUS"), Style::default().fg(theme::fg_dim()).add_modifier(Modifier::BOLD)),
+        ]);
+        if inner.height > 0 {
+            f.render_widget(Paragraph::new(ch).style(Style::default().bg(theme::bg_dark())), Rect { height: 1, ..inner });
+        }
 
-        // Status reflects PATH/tools-dir detection + the on/off toggle. A
-        // known-installable tool that's missing is orange (actionable via
-        // `I`); one ctrlvim doesn't know how to install is red.
-        let (status_label, status_color) = if !lsp.installed {
-            ("not found", if lsp.installable { theme::orange() } else { theme::red() })
-        } else if on {
-            (if lsp.managed { "running*" } else { "running" }, theme::green())
-        } else {
-            ("disabled", theme::fg_dim())
-        };
-        let toggle = if on { "●on " } else { "○off" };
-        let toggle_color = if on { theme::green() } else { theme::fg_dim() };
-        let spans = vec![
-            selection_bar(selected, theme::blue()),
-            // Truncate one character short of the column width so a clipped
-            // entry still leaves at least one space before the next column.
-            Span::styled(format!("{:<18}", truncate(&lsp.name, 17)), Style::default().fg(theme::fg())),
-            Span::styled(format!("{:<20}", truncate(&lsp.filetypes, 19)), Style::default().fg(theme::fg_dim())),
-            Span::styled(format!("{:<12}", status_label), Style::default().fg(status_color)),
-            Span::styled(toggle, Style::default().fg(toggle_color)),
-        ];
-        f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
-        zones.push(row, Action::SetSettingsIndex(i + App::SETTINGS_EDITOR_OPTIONS));
-        // The toggle glyph itself flips the server.
-        let toggle_w = 4u16;
-        let tx = row.x + row.width.saturating_sub(toggle_w);
-        zones.push(Rect { x: tx, y, width: toggle_w, height: 1 }, Action::ToggleLsp(i));
+        for (i, lsp) in app.lsp.iter().enumerate() {
+            let y = inner.y + 1 + i as u16;
+            if y >= inner.y + inner.height {
+                break;
+            }
+            let on = app.lsp_enabled[i];
+            // The Settings selection spans the EDITOR options first, then the LSPs.
+            let selected = app.settings_index == i + App::SETTINGS_EDITOR_OPTIONS;
+            let row = Rect { x: inner.x, y, width: inner.width, height: 1 };
+            f.render_widget(Block::default().style(row_style(selected)), row);
+
+            // Status reflects a live `PATH` check + the on/off toggle. A
+            // missing server with a declared `install` command is orange
+            // (actionable via `I`); one with none is red.
+            let (status_label, status_color) = if !lsp.installed {
+                ("not found", if lsp.install.is_some() { theme::orange() } else { theme::red() })
+            } else if on {
+                ("running", theme::green())
+            } else {
+                ("disabled", theme::fg_dim())
+            };
+            let toggle = if on { "●on " } else { "○off" };
+            let toggle_color = if on { theme::green() } else { theme::fg_dim() };
+            let filetypes = if lsp.filetypes.is_empty() { "—" } else { &lsp.filetypes };
+            let spans = vec![
+                selection_bar(selected, theme::blue()),
+                // Truncate one character short of the column width so a clipped
+                // entry still leaves at least one space before the next column.
+                Span::styled(format!("{:<18}", truncate(&lsp.name, 17)), Style::default().fg(theme::fg())),
+                Span::styled(format!("{:<20}", truncate(filetypes, 19)), Style::default().fg(theme::fg_dim())),
+                Span::styled(format!("{:<12}", status_label), Style::default().fg(status_color)),
+                Span::styled(toggle, Style::default().fg(toggle_color)),
+            ];
+            f.render_widget(Paragraph::new(Line::from(spans)).style(row_style(selected)), row);
+            zones.push(row, Action::SetSettingsIndex(i + App::SETTINGS_EDITOR_OPTIONS));
+            // The toggle glyph itself flips the server.
+            let toggle_w = 4u16;
+            let tx = row.x + row.width.saturating_sub(toggle_w);
+            zones.push(Rect { x: tx, y, width: toggle_w, height: 1 }, Action::ToggleLsp(i));
+        }
     }
 
-    // Footer: a per-row install hint when the focused row can use one,
-    // otherwise the config path plus the `*` legend (managed installs).
+    // Footer: a per-row install hint (the declared command itself) when the
+    // focused row has one, otherwise the config file this whole table is a
+    // view of.
     let foot_y = table.y + table_h + 1;
     if foot_y < area.y + area.height {
-        let focused = app.settings_index.checked_sub(App::SETTINGS_EDITOR_OPTIONS).and_then(|i| app.project.lsp.get(i));
+        let focused = app.settings_index.checked_sub(App::SETTINGS_EDITOR_OPTIONS).and_then(|i| app.lsp.get(i));
         let footer = match focused {
-            Some(lsp) if !lsp.installed && lsp.installable => Line::from(vec![Span::styled(
-                format!("Press I to install {} ({})", lsp.name, ctrlvim_tools_command_hint(&lsp.name)),
+            Some(lsp) if !lsp.installed && lsp.install.is_some() => Line::from(vec![Span::styled(
+                format!("Press I to install {}: {}", lsp.name, truncate(lsp.install.as_deref().unwrap_or(""), 70)),
                 Style::default().fg(theme::orange()),
             )]),
-            _ => Line::from(vec![
-                Span::styled("Config file: ", Style::default().fg(theme::fg_dim())),
-                Span::styled("~/.config/ctrlvim/lsp.toml", Style::default().fg(theme::cyan())),
-                Span::styled("   * = installed by ctrlvim", Style::default().fg(theme::fg_dim())),
-            ]),
+            _ => {
+                let path = crate::lsp_config::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~/.config/ctrlvim/lsp.lua".to_string());
+                Line::from(vec![
+                    Span::styled("Config file: ", Style::default().fg(theme::fg_dim())),
+                    Span::styled(path, Style::default().fg(theme::cyan())),
+                ])
+            }
         };
         f.render_widget(Paragraph::new(footer), Rect { x: area.x, y: foot_y, width: area.width, height: 1 });
-    }
-}
-
-/// A short description of what pressing `I` would run, for the Settings
-/// footer hint — e.g. "cargo install" rather than the full command line.
-fn ctrlvim_tools_command_hint(name: &str) -> &'static str {
-    use ctrlvim_tools::InstallMethod;
-    match ctrlvim_tools::REGISTRY.iter().find(|t| t.name == name).map(|t| t.method) {
-        Some(InstallMethod::Cargo(_)) => "cargo install",
-        Some(InstallMethod::Npm(_)) => "npm install",
-        Some(InstallMethod::Pip(_)) => "pip install",
-        Some(InstallMethod::GoInstall(_)) => "go install",
-        Some(InstallMethod::Rustup(_)) => "rustup component add",
-        _ => "unknown",
     }
 }
 

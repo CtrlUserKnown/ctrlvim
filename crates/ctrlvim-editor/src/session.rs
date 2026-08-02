@@ -939,6 +939,27 @@ impl Session {
         self.pending.clear();
     }
 
+    /// Whether `<C-o>` still has an in-file position to step back to. The host
+    /// uses this to know when to fall back to its own cross-file history —
+    /// see the module-level note on [`jump_history`](Self::jump_history).
+    pub fn jump_back_available(&self) -> bool {
+        self.editor.cur_window().jumps.current_index() != 0
+    }
+
+    /// Whether `<C-i>` still has an in-file position to step forward to.
+    pub fn jump_forward_available(&self) -> bool {
+        let jumps = &self.editor.cur_window().jumps;
+        jumps.current_index() + 1 < jumps.entries().len()
+    }
+
+    /// Clear the in-file jumplist. Called by the host whenever it swaps in a
+    /// different file's text: old positions were recorded against that other
+    /// file's line numbers and mean nothing against this one — replaying them
+    /// would move the cursor to a bogus spot.
+    pub fn reset_jumps(&mut self) {
+        self.editor.cur_window_mut().jumps = crate::jumps::Jumplist::default();
+    }
+
     /// Look up a named mark in the current buffer.
     fn mark_position(&self, c: char) -> Option<Position> {
         // `'<`/`'>` come from the last visual selection rather than the store.
@@ -1247,14 +1268,46 @@ impl Session {
                 self.editor.set_cursor(back);
             }
             Key::Char(c) => {
-                let cur = self.editor.cursor();
-                let (l, col) = self.editor.cur_buffer_mut().text.insert(cur.line, cur.col, &c.to_string());
-                self.editor.cur_window_mut().cursor = Position::new(l, col);
+                let mut cur = self.editor.cursor();
+                if self.editor.options().autoindent() {
+                    self.dedent_before_closer(c, &mut cur);
+                }
+                let pos = self.insert_with_auto_pair(c, cur);
+                self.editor.cur_window_mut().cursor = pos;
             }
             Key::Enter => {
                 let cur = self.editor.cursor();
-                let (l, col) = self.editor.cur_buffer_mut().text.insert(cur.line, cur.col, "\n");
-                self.editor.cur_window_mut().cursor = Position::new(l, col);
+                let autoindent = self.editor.options().autoindent();
+                let pos = if autoindent && self.cursor_splits_empty_brackets(cur) {
+                    // `<CR>` between an empty pair (`{|}`) doesn't just carry
+                    // the indent onto one continuation line — it opens a third,
+                    // dedented line for the closer and leaves the cursor on a
+                    // blank line indented one level deeper, same as VS Code and
+                    // friends: `if x {}` becomes `if x {\n    \n}`.
+                    //
+                    // The line hasn't been split yet, so `prefix` (not the
+                    // full line, which still has the closer attached) is what
+                    // `autoindent_for` needs to see the trailing `{`.
+                    let full = self.editor.cur_buffer().text.line(cur.line).unwrap_or_default();
+                    let prefix = &full[..cur.col.min(full.len())];
+                    let body = self.autoindent_for(prefix);
+                    let base = self.line_indent(cur.line);
+                    self.editor.cur_buffer_mut().text.insert(cur.line, cur.col, &format!("\n{body}\n{base}"));
+                    Position::new(cur.line + 1, body.len())
+                } else {
+                    let (l, col) = self.editor.cur_buffer_mut().text.insert(cur.line, cur.col, "\n");
+                    let mut pos = Position::new(l, col);
+                    if autoindent {
+                        let prefix = self.editor.cur_buffer().text.line(cur.line).unwrap_or_default();
+                        let indent = self.autoindent_for(&prefix);
+                        if !indent.is_empty() {
+                            let (l, col) = self.editor.cur_buffer_mut().text.insert(pos.line, pos.col, &indent);
+                            pos = Position::new(l, col);
+                        }
+                    }
+                    pos
+                };
+                self.editor.cur_window_mut().cursor = pos;
             }
             Key::Tab => {
                 let cur = self.editor.cursor();
@@ -1264,8 +1317,16 @@ impl Session {
             Key::Backspace => {
                 let cur = self.editor.cursor();
                 if cur.col > 0 {
-                    let prev = prev_char_boundary(&self.editor.cur_buffer().text.line(cur.line).unwrap_or_default(), cur.col);
-                    self.editor.cur_buffer_mut().text.delete_range((cur.line, prev), (cur.line, cur.col));
+                    let line = self.editor.cur_buffer().text.line(cur.line).unwrap_or_default();
+                    let prev = prev_char_boundary(&line, cur.col);
+                    // Backspacing between an auto-inserted pair with nothing
+                    // typed in between (`(|)`, `"|"`) removes both sides, not
+                    // just the open half — otherwise every auto-close leaves
+                    // an orphaned closer one keystroke later.
+                    let before = line[prev..cur.col].chars().next();
+                    let after = line[cur.col.min(line.len())..].chars().next();
+                    let end = if is_empty_auto_pair(before, after) { cur.col + 1 } else { cur.col };
+                    self.editor.cur_buffer_mut().text.delete_range((cur.line, prev), (cur.line, end));
                     self.editor.cur_window_mut().cursor = Position::new(cur.line, prev);
                 } else if cur.line > 0 {
                     // Join with previous line.
@@ -1291,6 +1352,118 @@ impl Session {
         } else {
             self.suggest.disarm();
         }
+    }
+
+    /// Insert a typed character in Insert mode, auto-closing brackets and
+    /// quotes the way most editors do. Angle brackets are deliberately left
+    /// out: comparisons and generics make `<`/`>` too ambiguous to pair on a
+    /// bare keystroke.
+    ///
+    /// Three rules, checked in order:
+    /// - Typing a closer (or a quote) that's already sitting under the cursor
+    ///   just steps over it instead of inserting a duplicate — otherwise
+    ///   closing an auto-inserted pair yourself leaves an extra `)` behind.
+    /// - An opening bracket always inserts its close too, cursor landing
+    ///   in between.
+    /// - A quote does the same, *unless* the cursor sits right after a word
+    ///   character — `don't` must stay `don't`, not become `don''t`.
+    fn insert_with_auto_pair(&mut self, c: char, cur: Position) -> Position {
+        let line = self.editor.cur_buffer().text.line(cur.line).unwrap_or_default();
+        let before = line[..cur.col.min(line.len())].chars().next_back();
+        let after = line[cur.col.min(line.len())..].chars().next();
+
+        let closes = AUTO_PAIR_OPENERS.iter().any(|&(_, close)| close == c);
+        let is_quote = AUTO_PAIR_QUOTES.contains(&c);
+
+        if (closes || is_quote) && after == Some(c) {
+            return Position::new(cur.line, cur.col + c.len_utf8());
+        }
+
+        let pair_close = AUTO_PAIR_OPENERS
+            .iter()
+            .find(|&&(open, _)| open == c)
+            .map(|&(_, close)| close)
+            .or_else(|| is_quote.then_some(c));
+        let mid_word = before.is_some_and(|b| b.is_alphanumeric() || b == '_');
+
+        match pair_close {
+            Some(close) if !(is_quote && mid_word) => {
+                let (l, col) = self
+                    .editor
+                    .cur_buffer_mut()
+                    .text
+                    .insert(cur.line, cur.col, &format!("{c}{close}"));
+                Position::new(l, col - close.len_utf8())
+            }
+            _ => {
+                let (l, col) = self.editor.cur_buffer_mut().text.insert(cur.line, cur.col, &c.to_string());
+                Position::new(l, col)
+            }
+        }
+    }
+
+    /// One indent level, in spaces — `'shiftwidth'`, falling back to
+    /// `'tabstop'` the same way `:>`/`:<` already do (`ex_shift`).
+    fn indent_unit(&self) -> usize {
+        let sw = self.editor.options().shiftwidth().max(0) as usize;
+        if sw == 0 { self.editor.options().tabstop().max(1) as usize } else { sw }
+    }
+
+    /// `line`'s leading whitespace, verbatim.
+    fn line_indent(&self, line: usize) -> String {
+        let text = self.editor.cur_buffer().text.line(line).unwrap_or_default();
+        let indent_len = text.find(|c: char| c != ' ' && c != '\t').unwrap_or(text.len());
+        text[..indent_len].to_string()
+    }
+
+    /// Indentation for the line `<CR>` opens below `prefix` — the text that's
+    /// staying above the cursor once the split happens (the caller must slice
+    /// this itself when the split hasn't happened in the buffer yet, e.g. the
+    /// empty-bracket case below, where the closer is still attached). Copies
+    /// `prefix`'s leading whitespace, plus one extra `shiftwidth` if it ends
+    /// with an opening bracket/brace/paren — so the block below `if (x) {`
+    /// starts a level deeper without the user having to indent it.
+    fn autoindent_for(&self, prefix: &str) -> String {
+        let indent_len = prefix.find(|c: char| c != ' ' && c != '\t').unwrap_or(prefix.len());
+        let mut indent = prefix[..indent_len].to_string();
+        if prefix.trim_end().ends_with(['{', '(', '[']) {
+            indent.push_str(&" ".repeat(self.indent_unit()));
+        }
+        indent
+    }
+
+    /// Whether `cur` sits directly between a bracket and its matching closer
+    /// with nothing typed in between — `<CR>` there splits the pair across
+    /// three lines instead of just carrying the indent onto one.
+    fn cursor_splits_empty_brackets(&self, cur: Position) -> bool {
+        let line = self.editor.cur_buffer().text.line(cur.line).unwrap_or_default();
+        let before = line[..cur.col.min(line.len())].chars().next_back();
+        let after = line[cur.col.min(line.len())..].chars().next();
+        matches!((before, after), (Some(b), Some(a)) if AUTO_PAIR_OPENERS.contains(&(b, a)))
+    }
+
+    /// Before inserting a closing bracket that lands as the first non-blank
+    /// character on its line, pull the line back one indent level so the
+    /// closer lines up with whatever opened the block — typing `}` on an
+    /// over-indented blank line (left behind by `<CR>` after `{`) dedents it
+    /// to match, the way `'cindent'`/`'smartindent'` do in Vim. `cur` is
+    /// updated in place if a dedent happens, since the column it names shifts
+    /// left along with the text.
+    fn dedent_before_closer(&mut self, c: char, cur: &mut Position) {
+        if !AUTO_PAIR_OPENERS.iter().any(|&(_, close)| close == c) {
+            return;
+        }
+        let line = self.editor.cur_buffer().text.line(cur.line).unwrap_or_default();
+        let before = &line[..cur.col.min(line.len())];
+        if before.is_empty() || !before.chars().all(|ch| ch == ' ' || ch == '\t') {
+            return;
+        }
+        let remove = before.len().min(self.indent_unit());
+        if remove == 0 {
+            return;
+        }
+        self.editor.cur_buffer_mut().text.delete_range((cur.line, 0), (cur.line, remove));
+        cur.col -= remove;
     }
 
     /// Insert part of the visible suggestion at the cursor, as if the user had
@@ -1823,7 +1996,6 @@ impl Session {
                 },
                 title: ":make".into(),
             })),
-            "lint" | "Lint" => self.queue_effect(ExEffect::Lint),
             "grep" | "gr" => {
                 let words: Vec<String> = arg.split_whitespace().map(str::to_string).collect();
                 if words.is_empty() {
@@ -3448,6 +3620,21 @@ fn prev_char_boundary(line: &str, col: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Auto-closed bracket pairs. `<`/`>` are deliberately not here — see
+/// [`Session::insert_with_auto_pair`].
+const AUTO_PAIR_OPENERS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+/// Auto-closed quote characters — each is its own closer.
+const AUTO_PAIR_QUOTES: [char; 3] = ['"', '\'', '`'];
+
+/// Whether `before`/`after` are an auto-inserted pair with nothing typed
+/// between them yet, so `<Backspace>` should remove both sides at once.
+fn is_empty_auto_pair(before: Option<char>, after: Option<char>) -> bool {
+    match (before, after) {
+        (Some(b), Some(a)) => AUTO_PAIR_OPENERS.contains(&(b, a)) || (AUTO_PAIR_QUOTES.contains(&b) && b == a),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3490,6 +3677,110 @@ mod tests {
         s.feed_str("ifoo <Esc>");
         assert_eq!(s.lines(), vec!["foo bar"]);
         assert_eq!(s.mode_name(), "n");
+    }
+
+    #[test]
+    fn autoindent_carries_the_previous_lines_indent() {
+        let mut s = Session::with_text("    foo");
+        s.feed_str("A<CR>bar<Esc>");
+        assert_eq!(s.lines(), vec!["    foo", "    bar"]);
+    }
+
+    #[test]
+    fn autoindent_adds_a_level_after_an_opening_brace() {
+        let mut s = Session::with_text("    if x {");
+        s.feed_str(":set shiftwidth=4<CR>");
+        s.feed_str("A<CR>body<Esc>");
+        assert_eq!(s.lines(), vec!["    if x {", "        body"]);
+    }
+
+    #[test]
+    fn autoindent_splits_an_empty_auto_paired_brace_across_three_lines() {
+        let mut s = Session::with_text("");
+        s.feed_str(":set shiftwidth=4<CR>");
+        // `i{` auto-closes to `{}` with the cursor in between; `<CR>` there
+        // should open a third line for the `}` rather than just indenting
+        // the whole `{}` onto one continuation line.
+        s.feed_str("i{<CR>");
+        assert_eq!(s.lines(), vec!["{", "    ", "}"]);
+        assert_eq!(s.cursor(), Position::new(1, 4), "cursor sits on the blank indented line");
+    }
+
+    #[test]
+    fn autoindent_splits_nested_brackets_the_same_way() {
+        let mut s = Session::with_text("");
+        s.feed_str(":set shiftwidth=2<CR>");
+        s.feed_str("ifn f(<CR>");
+        assert_eq!(s.lines(), vec!["fn f(", "  ", ")"]);
+    }
+
+    #[test]
+    fn typing_a_closing_brace_dedents_a_blank_line_to_match() {
+        // No auto-paired closer in play here (the buffer starts with `{`
+        // already on its own, unclosed) — this exercises the case where the
+        // user types the body then the closer manually, not the split path.
+        let mut s = Session::with_text("if x {");
+        s.feed_str(":set shiftwidth=4<CR>");
+        s.feed_str("A<CR>x = 1;<CR>}<Esc>");
+        assert_eq!(s.lines(), vec!["if x {", "    x = 1;", "}"]);
+    }
+
+    #[test]
+    fn noautoindent_leaves_the_new_line_bare() {
+        let mut s = Session::with_text("    foo");
+        s.feed_str(":set noautoindent<CR>");
+        s.feed_str("A<CR>bar<Esc>");
+        assert_eq!(s.lines(), vec!["    foo", "bar"]);
+    }
+
+    #[test]
+    fn auto_pair_closes_brackets_and_quotes() {
+        let mut s = Session::with_text("");
+        s.feed_str("i(");
+        assert_eq!(s.lines(), vec!["()"], "cursor lands between the pair");
+        assert_eq!(s.cursor(), Position::new(0, 1));
+        s.feed_str("<Esc>cc\"");
+        assert_eq!(s.lines(), vec!["\"\""]);
+    }
+
+    #[test]
+    fn auto_pair_types_through_an_existing_closer() {
+        let mut s = Session::with_text("");
+        // "(" auto-pairs to "()"; typing ")" ourselves must step over the
+        // auto-inserted one rather than adding a second.
+        s.feed_str("i()<Esc>");
+        assert_eq!(s.lines(), vec!["()"]);
+        assert_eq!(s.cursor(), Position::new(0, 1), "left in Normal mode one before the end");
+    }
+
+    #[test]
+    fn auto_pair_leaves_angle_brackets_alone() {
+        let mut s = Session::with_text("");
+        s.feed_str("i<");
+        assert_eq!(s.lines(), vec!["<"], "comparisons/generics are too ambiguous to pair");
+    }
+
+    #[test]
+    fn auto_pair_backspace_removes_both_sides_at_once() {
+        let mut s = Session::with_text("");
+        s.feed_str("i(<BS>");
+        assert_eq!(s.lines(), vec![""], "an empty auto-pair is removed whole");
+        s.feed_str("[<BS>");
+        assert_eq!(s.lines(), vec![""]);
+    }
+
+    #[test]
+    fn auto_pair_backspace_with_content_between_only_removes_one_side() {
+        let mut s = Session::with_text("");
+        s.feed_str("i(x<BS>");
+        assert_eq!(s.lines(), vec!["()"], "only the typed 'x' is removed, not the pair");
+    }
+
+    #[test]
+    fn auto_pair_quote_does_not_split_a_word() {
+        let mut s = Session::with_text("don");
+        s.feed_str("A't<Esc>");
+        assert_eq!(s.lines(), vec!["don't"], "not \"don''t\"");
     }
 
     #[test]

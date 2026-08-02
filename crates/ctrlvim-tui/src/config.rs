@@ -86,7 +86,8 @@ pub struct AutocmdEntry {
 pub struct PluginEntry {
     /// Display name.
     pub name: String,
-    /// Directory holding the plugin. `~` is expanded.
+    /// Path to the plugin's Lua entry point file, e.g.
+    /// `~/.config/ctrlvim/plugins/example.lua`. `~` is expanded.
     pub path: String,
     /// Load lazily on this event instead of at startup.
     #[serde(default)]
@@ -106,6 +107,32 @@ fn default_true() -> bool {
     true
 }
 
+/// The value shapes a [`SettingItem`] can hold — a strict subset of what
+/// `:set` supports, but enough for every row the Settings tab's EDITOR panel
+/// shows today.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingValue {
+    Bool(bool),
+    Int(i64),
+    Text(String),
+    /// The current choice, plus the finite set it cycles through — a
+    /// renderer doesn't need to know the cycle order to display it.
+    Choice { current: String, options: &'static [&'static str] },
+}
+
+/// One row of the Settings tab's EDITOR panel, as an item independent of
+/// [`Config`]'s own field types — what the search filter and the generic
+/// list renderer both operate on. See [`Config::to_setting_items`] and
+/// [`Config::apply_setting_change`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingItem {
+    /// Stable identifier; also what [`Config::apply_setting_change`] matches
+    /// on and what the `/` search filters by, alongside `label`.
+    pub key: &'static str,
+    pub label: &'static str,
+    pub value: SettingValue,
+}
+
 /// Parsed user configuration. Every field has a sensible default so a missing
 /// or partial file still yields a usable config.
 ///
@@ -114,6 +141,11 @@ fn default_true() -> bool {
 pub struct Config {
     /// Open the file drawer (the `Ctrl+B` sidebar) automatically on startup.
     pub drawer: bool,
+    /// Show the top tab bar for open files. Off by default: files still open
+    /// into the buffer list and `gt`/`gT`/`:b N`/`<leader>N` still switch
+    /// between them either way — this only controls whether that list is
+    /// drawn as a row of chips.
+    pub tabs: bool,
     /// Enable mouse support in the editor (wheel scrolling). On by default, as
     /// in Neovim since 0.8; set `mouse = false` to give the wheel back to the
     /// terminal for its own scrollback.
@@ -126,6 +158,12 @@ pub struct Config {
     /// `[options]` flattened into `:set` arguments, in file order — e.g.
     /// `number = true` becomes `number`, `tabstop = 4` becomes `tabstop=4`.
     pub set_args: Vec<String>,
+    /// `'tabstop'`/`'shiftwidth'`, kept equal, from `[options] tabstop`. The
+    /// Settings tab's "Indent width" row owns this one pair of `[options]`
+    /// keys specifically — see `Config::save_to` — everything else `[options]`
+    /// might hold (ignorecase, foldmethod, ...) only ever round-trips through
+    /// `set_args` above and is never written back.
+    pub indent_width: i64,
     pub keymaps: Vec<KeymapEntry>,
     /// Built-in mappings to remove, from `[[unmap]]`.
     pub unmaps: Vec<UnmapEntry>,
@@ -147,10 +185,13 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             drawer: false,
+            tabs: false,
             mouse: true,
             icons: IconMode::Auto,
             theme: None,
             set_args: Vec::new(),
+            // Matches `ctrlvim_options::GlobalOptions`'s own default.
+            indent_width: 4,
             keymaps: Vec::new(),
             unmaps: Vec::new(),
             commands: Vec::new(),
@@ -262,6 +303,7 @@ struct RawConfig {
     // sectioned schema keep working untouched.
     drawer: Option<bool>,
     sidebar: Option<bool>,
+    tabs: Option<bool>,
     mouse: Option<bool>,
     icons: Option<String>,
     nerd_font: Option<String>,
@@ -320,6 +362,7 @@ enum OptionValue {
 struct UiSection {
     drawer: Option<bool>,
     sidebar: Option<bool>,
+    tabs: Option<bool>,
     mouse: Option<bool>,
     icons: Option<String>,
     theme: Option<String>,
@@ -332,12 +375,27 @@ impl Config {
     }
 
     /// Load the config, falling back to defaults if the file is absent or
-    /// unreadable.
+    /// unreadable. On a genuinely fresh install, this also writes the starter
+    /// file to disk — see [`Self::load_or_init_from`].
     pub fn load() -> Self {
         match Self::path() {
-            Some(path) => Self::load_from(&path),
+            Some(path) => Self::load_or_init_from(&path),
             None => Config::default(),
         }
+    }
+
+    /// Load from a specific path, writing a starter file there first if none
+    /// exists yet. That's what makes `config.toml` the single bootstrap file:
+    /// a fresh install has one on disk from the very first launch, ready to
+    /// edit by hand, rather than only gaining one the first time a setting is
+    /// toggled from the Settings tab.
+    pub fn load_or_init_from(path: &Path) -> Self {
+        if !path.exists() {
+            let cfg = Config::default();
+            let _ = cfg.save_to(path);
+            return cfg;
+        }
+        Self::load_from(path)
     }
 
     /// Load from a specific path (defaults if absent/unreadable).
@@ -365,6 +423,7 @@ impl Config {
                 .or(raw.drawer)
                 .or(raw.sidebar)
                 .unwrap_or(d.drawer),
+            tabs: raw.ui.tabs.or(raw.tabs).unwrap_or(d.tabs),
             mouse: raw.ui.mouse.or(raw.mouse).unwrap_or(d.mouse),
             icons: raw
                 .ui
@@ -375,6 +434,10 @@ impl Config {
                 .and_then(|v| IconMode::parse(&v))
                 .unwrap_or(d.icons),
             theme: raw.ui.theme,
+            indent_width: match raw.options.get("tabstop") {
+                Some(OptionValue::Int(n)) => *n,
+                _ => d.indent_width,
+            },
             set_args: set_args_from(&raw.options),
             keymaps: raw.keymap,
             unmaps: raw.unmap,
@@ -419,13 +482,27 @@ impl Config {
         if doc.get("ui").is_some() {
             let ui = &mut doc["ui"];
             ui["drawer"] = toml_edit::value(self.drawer);
+            ui["tabs"] = toml_edit::value(self.tabs);
             ui["mouse"] = toml_edit::value(self.mouse);
             ui["icons"] = toml_edit::value(self.icons.as_str());
         } else {
             doc["drawer"] = toml_edit::value(self.drawer);
+            doc["tabs"] = toml_edit::value(self.tabs);
             doc["mouse"] = toml_edit::value(self.mouse);
             doc["icons"] = toml_edit::value(self.icons.as_str());
         }
+
+        // `[options]` is otherwise a free-form bag of `:set` arguments (see the
+        // module docs) that this struct doesn't own — only `tabstop`/
+        // `shiftwidth` get written here, the one pair the Settings tab's
+        // "Indent width" row edits, the same surgical approach `[ai]` below
+        // takes with `enabled`: every other key a hand-written `[options]`
+        // holds (ignorecase, foldmethod, ...) survives untouched.
+        if !doc.get("options").is_some_and(|item| item.is_table()) {
+            doc["options"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["options"]["tabstop"] = toml_edit::value(self.indent_width);
+        doc["options"]["shiftwidth"] = toml_edit::value(self.indent_width);
 
         // `[ai]` always lives in its own table — there is no legacy top-level
         // spelling to preserve. Only `enabled` is written: the model, device,
@@ -439,12 +516,77 @@ impl Config {
         std::fs::write(path, doc.to_string())
     }
 
+    /// Flatten the config into the rows the Settings tab's EDITOR panel
+    /// lists, searches, and filters — see [`SettingItem`]. Each `key` here is
+    /// also what [`Self::apply_setting_change`] accepts, so the two stay in
+    /// sync by construction rather than by convention.
+    pub fn to_setting_items(&self) -> Vec<SettingItem> {
+        vec![
+            SettingItem {
+                key: "drawer",
+                label: "Open file drawer on startup",
+                value: SettingValue::Bool(self.drawer),
+            },
+            SettingItem {
+                key: "tabs",
+                label: "Show tabs for open files",
+                value: SettingValue::Bool(self.tabs),
+            },
+            SettingItem {
+                key: "mouse",
+                label: "Mouse support (scroll the editor)",
+                value: SettingValue::Bool(self.mouse),
+            },
+            SettingItem {
+                key: "icons",
+                label: "File icons (Nerd Font)",
+                value: SettingValue::Choice {
+                    current: self.icons.as_str().to_string(),
+                    options: &["auto", "nerd", "text"],
+                },
+            },
+            SettingItem {
+                key: "indent_width",
+                label: "Indent width",
+                value: SettingValue::Int(self.indent_width),
+            },
+            SettingItem {
+                key: "ai_enabled",
+                label: "Inline AI suggestions (CodeGemma)",
+                value: SettingValue::Bool(self.ai.enabled),
+            },
+        ]
+    }
+
+    /// Apply a single setting change by `key`, mutating the matching field in
+    /// place. Returns whether `key` (and the value's shape) was recognized —
+    /// a stale or mistyped key is a no-op rather than a panic, the same
+    /// leniency [`Self::parse`] gives a malformed file.
+    pub fn apply_setting_change(&mut self, key: &str, value: SettingValue) -> bool {
+        match (key, value) {
+            ("drawer", SettingValue::Bool(b)) => self.drawer = b,
+            ("tabs", SettingValue::Bool(b)) => self.tabs = b,
+            ("mouse", SettingValue::Bool(b)) => self.mouse = b,
+            ("icons", SettingValue::Choice { current, .. }) => match IconMode::parse(&current) {
+                Some(mode) => self.icons = mode,
+                None => return false,
+            },
+            ("indent_width", SettingValue::Int(n)) => self.indent_width = n,
+            ("ai_enabled", SettingValue::Bool(b)) => self.ai.enabled = b,
+            _ => return false,
+        }
+        true
+    }
+
     /// The starter config written when none exists yet.
     fn template() -> &'static str {
         "# ctrlvim config\n\
          \n\
          # Open the file drawer on startup.\n\
          drawer = false\n\
+         \n\
+         # Show a tab bar for open files. Off by default.\n\
+         tabs = false\n\
          \n\
          # Mouse wheel scrolling in the editor. Turn this off to give the\n\
          # wheel back to the terminal's own scrollback.\n\
@@ -522,6 +664,14 @@ mod tests {
         assert!(cfg.drawer);
         assert!(!cfg.mouse);
         assert_eq!(cfg.theme.as_deref(), Some("Gruvbox"));
+    }
+
+    #[test]
+    fn tabs_are_off_by_default_and_opt_in() {
+        assert!(!Config::default().tabs);
+        assert!(Config::parse("tabs = true").tabs);
+        assert!(Config::parse("[ui]\ntabs = true\n").tabs);
+        assert!(!Config::parse("[ui]\ntabs = false\n").tabs);
     }
 
     #[test]
@@ -756,7 +906,12 @@ rhs = \":Files<CR>\"
         let reloaded = Config::load_from(&path);
         assert!(reloaded.drawer, "the toggled setting was persisted");
         assert_eq!(reloaded.keymaps.len(), 1);
-        assert_eq!(reloaded.set_args, vec!["number".to_string()]);
+        // `save_to` stamps `tabstop`/`shiftwidth` into `[options]` on every
+        // save (same as `[ai].enabled` below), so they show up here even
+        // though this test only touched `drawer` — `number` surviving
+        // alongside them is what actually matters.
+        assert!(reloaded.set_args.contains(&"number".to_string()));
+        assert_eq!(reloaded.indent_width, 4, "the untouched default round-trips");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -790,6 +945,53 @@ precision = \"f16\"
     }
 
     #[test]
+    fn indent_width_reads_from_options_and_persists_without_flattening_it() {
+        let path = std::env::temp_dir()
+            .join(format!("ctrlvim-indent-cfg-{}-{:p}.toml", std::process::id(), &()));
+        let original = "\
+[options]
+number = true
+ignorecase = true
+tabstop = 8
+shiftwidth = 8
+";
+        std::fs::write(&path, original).unwrap();
+
+        let mut cfg = Config::load_from(&path);
+        assert_eq!(cfg.indent_width, 8, "read from the hand-written [options]");
+
+        cfg.indent_width = 4;
+        cfg.save_to(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("number = true"), "other [options] keys survive");
+        assert!(written.contains("ignorecase = true"), "other [options] keys survive");
+
+        let reloaded = Config::load_from(&path);
+        assert_eq!(reloaded.indent_width, 4, "the new value was persisted");
+        assert!(reloaded.set_args.contains(&"tabstop=4".to_string()));
+        assert!(reloaded.set_args.contains(&"shiftwidth=4".to_string()));
+        assert!(reloaded.set_args.contains(&"number".to_string()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn indent_width_creates_the_options_table_when_the_file_has_none() {
+        let path = std::env::temp_dir()
+            .join(format!("ctrlvim-indent-new-{}-{:p}.toml", std::process::id(), &()));
+        std::fs::write(&path, "# my config\ndrawer = true\n").unwrap();
+
+        let mut cfg = Config::load_from(&path);
+        cfg.indent_width = 2;
+        cfg.save_to(&path).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("# my config"), "comments survive:\n{written}");
+        assert_eq!(Config::load_from(&path).indent_width, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn toggling_ai_creates_the_section_when_the_file_has_none() {
         let path = std::env::temp_dir()
             .join(format!("ctrlvim-ai-new-{}-{:p}.toml", std::process::id(), &()));
@@ -814,5 +1016,88 @@ precision = \"f16\"
         cfg.save_to(&path).unwrap();
         assert!(Config::load_from(&path).drawer);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fresh_install_gets_a_config_file_on_first_load_not_just_the_first_edit() {
+        let path = std::env::temp_dir()
+            .join(format!("ctrlvim-first-run-{}-{:p}.toml", std::process::id(), &()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists());
+
+        let cfg = Config::load_or_init_from(&path);
+        assert_eq!(cfg, Config::default(), "first load still returns defaults");
+        assert!(path.exists(), "a starter config.toml must exist after the very first load");
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("ctrlvim config"), "the starter template was written, got:\n{written}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_existing_config_file_is_left_untouched_by_load_or_init() {
+        let path = std::env::temp_dir()
+            .join(format!("ctrlvim-first-run-existing-{}-{:p}.toml", std::process::id(), &()));
+        std::fs::write(&path, "# hand-written\ndrawer = true\n").unwrap();
+
+        let cfg = Config::load_or_init_from(&path);
+        assert!(cfg.drawer, "the existing file's contents were honored, not overwritten with defaults");
+
+        let untouched = std::fs::read_to_string(&path).unwrap();
+        assert!(untouched.contains("# hand-written"), "an existing file must not be replaced");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn to_setting_items_reflects_the_current_config() {
+        let cfg = Config { drawer: true, indent_width: 8, ..Config::default() };
+        let items = cfg.to_setting_items();
+        let drawer = items.iter().find(|i| i.key == "drawer").expect("a drawer item");
+        assert_eq!(drawer.value, SettingValue::Bool(true));
+        let indent = items.iter().find(|i| i.key == "indent_width").expect("an indent_width item");
+        assert_eq!(indent.value, SettingValue::Int(8));
+    }
+
+    #[test]
+    fn apply_setting_change_mutates_the_matching_field_and_nothing_else() {
+        let mut cfg = Config::default();
+        assert!(cfg.apply_setting_change("mouse", SettingValue::Bool(false)));
+        assert!(!cfg.mouse);
+        assert_eq!(cfg, Config { mouse: false, ..Config::default() }, "only `mouse` changed");
+    }
+
+    #[test]
+    fn apply_setting_change_ignores_an_unrecognized_key_rather_than_panicking() {
+        let mut cfg = Config::default();
+        assert!(!cfg.apply_setting_change("not_a_real_key", SettingValue::Bool(true)));
+        assert_eq!(cfg, Config::default(), "an unknown key is a no-op");
+    }
+
+    #[test]
+    fn apply_setting_change_updates_icons_by_parsing_the_choice() {
+        let mut cfg = Config::default();
+        assert!(cfg.apply_setting_change(
+            "icons",
+            SettingValue::Choice { current: "nerd".to_string(), options: &["auto", "nerd", "text"] }
+        ));
+        assert_eq!(cfg.icons, IconMode::Nerd);
+    }
+
+    #[test]
+    fn setting_items_and_apply_setting_change_round_trip() {
+        // Every key `to_setting_items` produces must be one
+        // `apply_setting_change` actually recognizes — otherwise a rendered
+        // row would silently fail to persist a change.
+        let cfg = Config::default();
+        for item in cfg.to_setting_items() {
+            let mut cfg = Config::default();
+            assert!(
+                cfg.apply_setting_change(item.key, item.value.clone()),
+                "key {:?} from to_setting_items was rejected by apply_setting_change",
+                item.key
+            );
+        }
     }
 }

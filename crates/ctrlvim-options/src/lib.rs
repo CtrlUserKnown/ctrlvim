@@ -160,10 +160,14 @@ pub struct GlobalOptions {
 
 impl Default for GlobalOptions {
     fn default() -> Self {
-        // Neovim defaults.
+        // Neovim defaults, except `tabstop`/`shiftwidth`: Neovim's own
+        // default of 8 makes every indent level (and every level
+        // `autoindent` adds after a `{`/`(`/`[`) twice as deep as most
+        // people actually want. 4 is the common default across editors and
+        // is what `autoindent` should feel like out of the box.
         GlobalOptions {
-            tabstop: 8,
-            shiftwidth: 8,
+            tabstop: 4,
+            shiftwidth: 4,
             expandtab: false,
             number: false,
             relativenumber: false,
@@ -175,7 +179,12 @@ impl Default for GlobalOptions {
             foldenable: true,
             foldmethod: FoldMethod::Manual,
             foldcolumn: 0,
-            autoindent: false,
+            // Unlike the rest of this struct, this deliberately isn't
+            // Neovim's own default (off) — a from-scratch editor with no
+            // filetype indent plugins needs *something* to carry indentation
+            // across `<CR>`, and `:set noautoindent` is one keystroke away
+            // for anyone who wants it off.
+            autoindent: true,
             ignorecase: false,
             smartcase: false,
             // Neovim defaults 'hlsearch' on; Vim defaults it off.
@@ -379,9 +388,9 @@ mod tests {
         let g = GlobalOptions::default();
         let mut b = BufferOptions::default();
         let w = WindowOptions::default();
-        assert_eq!(OptionContext { global: &g, buffer: &b, window: &w }.tabstop(), 8);
-        b.tabstop = Some(4);
         assert_eq!(OptionContext { global: &g, buffer: &b, window: &w }.tabstop(), 4);
+        b.tabstop = Some(8);
+        assert_eq!(OptionContext { global: &g, buffer: &b, window: &w }.tabstop(), 8);
     }
 
     #[test]

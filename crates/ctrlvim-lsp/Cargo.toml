@@ -1,0 +1,11 @@
+[package]
+name = "ctrlvim-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A minimal LSP client: process lifecycle, Content-Length framing, and textDocument/completion"
+
+[dependencies]
+ctrlvim-async.workspace = true
+serde.workspace = true
+serde_json.workspace = true
