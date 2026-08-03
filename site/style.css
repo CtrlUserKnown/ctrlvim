@@ -144,6 +144,26 @@ body:not(.js) #editor { height: auto; }
 }
 .tabline .brand b { color: var(--fg); font-weight: 600; }
 
+/* The one link out of the page, kept where a browser tab bar would end.
+   Sticky, so it stays in the corner when narrow screens scroll the tabs. */
+.tabline .ghlink {
+  position: sticky;
+  right: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 1em;
+  background: var(--bg-dark);
+  color: var(--fg-muted);
+  font-size: 0.86em;
+  white-space: nowrap;
+  border-bottom: none;
+  border-left: 1px solid var(--border-dim);
+}
+.tabline .ghlink:hover, .tabline .ghlink:focus-visible {
+  color: var(--fg);
+  background: var(--bg-hl);
+}
+
 /* ── viewport ──────────────────────────────────────────────── */
 
 .viewport {
@@ -195,6 +215,13 @@ body.js .l::before { content: attr(data-num); }
 .box::-webkit-scrollbar { display: none; }
 .box .l { line-height: 1.15; min-height: 0; white-space: pre; width: max-content; }
 
+/* Code blocks and callouts in the docs: same deal as .box — they are drawn
+   with characters, so they scroll sideways rather than reflowing. */
+.cb, .note { overflow-x: auto; scrollbar-width: none; }
+.cb::-webkit-scrollbar, .note::-webkit-scrollbar { display: none; }
+.cb .l, .note .l { white-space: pre; width: max-content; min-width: 100%; }
+.note .l { color: var(--fg-muted); }
+
 /* ASCII art: never wrap, scale down instead of overflowing */
 .art { overflow: hidden; }
 .art .l { white-space: pre; font-size: min(1em, 1.62vw); line-height: 1.12; min-height: 0; }
@@ -232,7 +259,15 @@ body.js .l::before { content: attr(data-num); }
 .lg    { color: var(--blue); }
 .h1    { color: var(--purple); font-weight: 700; }
 .h2    { color: var(--blue); font-weight: 600; }
+.h3    { color: var(--cyan); font-weight: 600; }
+.b     { color: var(--fg); font-weight: 700; }
+.i     { color: var(--fg-muted); font-style: italic; }
+.th    { color: var(--fg); font-weight: 600; }
 .quote { color: var(--fg-muted); font-style: italic; }
+
+/* Inline code carries no padding on purpose: the box-drawn tables in the
+   docs are aligned by counting characters, and padding would break them. */
+.code  { color: var(--orange); }
 .key {
   color: var(--orange);
   background: var(--code-bg);
@@ -244,6 +279,68 @@ body.js .l::before { content: attr(data-num); }
 ::selection { background: var(--selection); color: var(--fg); }
 ::highlight(search) { background: var(--search); color: var(--bg-dark); }
 ::highlight(searchcur) { background: var(--orange); color: var(--bg-dark); }
+
+/* ── docs search ───────────────────────────────────────────────
+   Lives inside the docs buffer as a line of it, not as chrome. */
+
+.searchline { display: flex; align-items: center; gap: 0.7em; }
+body:not(.js) .searchline { display: none; }
+
+#docq {
+  flex: 1;
+  max-width: 44em;
+  min-width: 0;
+  background: var(--bg-dark);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font: inherit;
+  padding: 0 0.6em;
+  outline: none;
+}
+#docq:focus { border-color: var(--blue); }
+#docq::placeholder { color: var(--fg-dim); }
+#docq-status { color: var(--fg-dim); white-space: nowrap; }
+
+#docq-results {
+  margin: 0.3em 0 0.9em var(--gutter);
+  max-width: 78em;
+  border-left: 2px solid var(--border);
+}
+.dres {
+  display: flex;
+  align-items: baseline;
+  gap: 1em;
+  padding: 0.15em 0.9em;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  margin-left: -2px;
+}
+.dres:hover { background: var(--bg-hl); }
+.dres[aria-selected="true"] { background: var(--bg-hl); border-left-color: var(--blue); }
+.dwhere {
+  flex: none;
+  width: 17em;
+  color: var(--blue);
+  font-size: 0.88em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dtext {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dtext .m { color: var(--bg-dark); background: var(--search); }
+.dempty { padding: 0.3em 0.9em; color: var(--red); }
+
+@media (max-width: 720px) {
+  .dres { display: block; }
+  .dwhere { width: auto; display: block; }
+}
 
 /* ── statusline ────────────────────────────────────────────── */
 
@@ -289,6 +386,7 @@ body:not(.js) .statusline { display: none; }
 
 @media (max-width: 720px) {
   .branch, .hint, .pct { display: none; }
+  .tabline .brand { display: none; }   /* the GitHub link keeps the corner */
 }
 
 /* ── command line ──────────────────────────────────────────── */

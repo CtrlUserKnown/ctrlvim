@@ -76,7 +76,7 @@ XDG_CONFIG_HOME ?= $(HOME)/.config
 USER_CONFIG      = $(XDG_CONFIG_HOME)/$(PKG)/config.toml
 
 .PHONY: all build install uninstall user-config test lint clean deps help \
-        macos macos-install macos-deps universal
+        macos macos-install macos-deps universal site-docs
 
 all: build
 
@@ -196,6 +196,24 @@ user-config:
 		echo "wrote $(USER_CONFIG)"; \
 	fi
 
+# --- site --------------------------------------------------------------------
+
+# The docs page on the site is the wiki, rendered into site/index.html. The
+# wiki is a separate repository and GitHub Pages runs nothing at deploy time,
+# so the result is generated here and committed. Point WIKI at your checkout.
+WIKI ?= $(HOME)/development/wikis/ctrlvim.wiki
+
+site-docs:
+	@command -v node >/dev/null 2>&1 || { \
+		echo "error: node not found — needed to render the wiki into site/"; \
+		exit 1; }
+	@test -d "$(WIKI)" || { \
+		echo "error: no wiki checkout at $(WIKI)"; \
+		echo "       git clone https://github.com/CtrlUserKnown/ctrlvim.wiki.git $(WIKI)"; \
+		echo "       or: make site-docs WIKI=/path/to/ctrlvim.wiki"; \
+		exit 1; }
+	@node site/build-docs.mjs "$(WIKI)"
+
 # --- housekeeping ------------------------------------------------------------
 
 clean:
@@ -209,6 +227,7 @@ help:
 	@echo "  user-config   seed $(USER_CONFIG) if it does not exist"
 	@echo "  test          run the workspace test suite"
 	@echo "  lint          run clippy over the workspace"
+	@echo "  site-docs     re-render the wiki into the site's docs page"
 	@echo "  clean         remove build artifacts"
 ifeq ($(MACOS),1)
 	@echo
