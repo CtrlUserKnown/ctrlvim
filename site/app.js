@@ -33,6 +33,9 @@ const palette = $('palette');
 const help = $('help');
 const helpBody = $('help-body');
 const fab = $('fab');
+const docq = $('docq');
+const docqStatus = $('docq-status');
+const docqResults = $('docq-results');
 
 const REPO = 'https://github.com/CtrlUserKnown/ctrlvim';
 
@@ -92,6 +95,9 @@ const state = {
   match: -1,
   pitems: [],
   pidx: 0,
+  dhits: [],         // docs-search results (capped for rendering)
+  dtotal: 0,         // …how many there were before the cap
+  didx: 0,
 };
 
 const buf = () => bufs[state.buf];
@@ -122,15 +128,36 @@ function placeCursor() {
 
 /* ── rendering ─────────────────────────────────────────────────────────── */
 
+/** What the gutter last drew, so a `j` in a 2,400-line buffer stays cheap. */
+let painted = { mode: null, buf: -1, cursor: 0 };
+
+function gutterLabel(i, cur) {
+  if (state.number === 'abs') return String(i + 1);
+  if (state.number === 'rel') return i === cur ? String(i + 1) : String(Math.abs(i - cur));
+  return '';
+}
+
 function paintGutter() {
-  const cur = buf().cursor;
-  lines().forEach((line, i) => {
-    let label = '';
-    if (state.number === 'abs') label = String(i + 1);
-    else if (state.number === 'rel') label = i === cur ? String(i + 1) : String(Math.abs(i - cur));
-    line.dataset.num = label;
-    line.classList.toggle('cursorline', i === cur);
-  });
+  const b = buf();
+  const cur = b.cursor;
+  // Absolute numbers never change, so moving the cursor only moves one class.
+  // Relative ones renumber the whole buffer by definition.
+  const relabel = painted.mode !== state.number || painted.buf !== state.buf
+    || state.number === 'rel';
+
+  if (relabel) {
+    b.lines.forEach((line, i) => {
+      line.dataset.num = gutterLabel(i, cur);
+      line.classList.toggle('cursorline', i === cur);
+    });
+  } else {
+    const was = b.lines[painted.cursor];
+    if (was) was.classList.remove('cursorline');
+    const now = b.lines[cur];
+    if (now) now.classList.add('cursorline');
+  }
+
+  painted = { mode: state.number, buf: state.buf, cursor: cur };
 }
 
 function paintStatus() {
@@ -171,7 +198,10 @@ function moveTo(idx, opts = {}) {
   render();
   if (opts.scroll !== false) {
     // Instant by default: smooth scrolling can't keep up with a held-down `j`.
-    cursorLine().scrollIntoView({ block: 'nearest', behavior: opts.smooth ? 'smooth' : 'auto' });
+    cursorLine().scrollIntoView({
+      block: opts.center ? 'center' : 'nearest',
+      behavior: opts.smooth ? 'smooth' : 'auto',
+    });
   }
 }
 
@@ -211,7 +241,9 @@ function paragraph(dir) {
 /* ── buffers / tabline ─────────────────────────────────────────────────── */
 
 function buildTabline() {
-  tabline.replaceChildren();
+  // The spacer, the brand and the GitHub link are authored in the HTML, so
+  // they survive with JS off — tabs are inserted ahead of them.
+  const before = $('tabline-spacer');
   bufs.forEach((b, i) => {
     const tab = document.createElement('button');
     tab.className = 'tab';
@@ -227,15 +259,8 @@ function buildTabline() {
     tab.append(num, document.createTextNode(`${b.icon} ${b.name}`.trim()));
 
     tab.addEventListener('click', () => { gotoBuf(i); tab.blur(); });
-    tabline.appendChild(tab);
+    tabline.insertBefore(tab, before);
   });
-
-  const spacer = document.createElement('span');
-  spacer.className = 'spacer';
-  const brand = document.createElement('span');
-  brand.className = 'brand';
-  brand.innerHTML = '<b>ctrlvim</b> v0.1.0 · Rust · Apache-2.0';
-  tabline.append(spacer, brand);
 }
 
 function syncTabs() {
@@ -269,7 +294,7 @@ function gotoBuf(idx, opts = {}) {
 const bufStep = (delta) =>
   gotoBuf((state.buf + delta + bufs.length) % bufs.length);
 
-/** Resolve ":e feat", ":e features.rs", ":b 3" to a buffer index. */
+/** Resolve ":e docs", ":e docs.txt", ":b 4" to a buffer index. */
 function findBuf(arg) {
   const want = arg.trim().toLowerCase();
   if (!want) return -1;
@@ -359,6 +384,229 @@ function showMatch(note) {
   message(note || `/${state.pattern}  [${state.match + 1}/${state.matches.length}]`);
 }
 
+/* ── docs ──────────────────────────────────────────────────────────────────
+ * The docs buffer is the wiki, rendered into one long help buffer by
+ * site/build-docs.mjs. Two ways in: the search box at the top of it, and
+ * `:help <topic>` (or the palette), which jumps to a heading.
+ */
+
+const docsIdx = bufs.findIndex((b) => b.key === 'docs');
+const docsBuf = docsIdx >= 0 ? bufs[docsIdx] : null;
+
+let docLines = null;
+let docHeads = null;
+
+/** Every non-blank docs line, tagged with the section and heading above it. */
+function docIndex() {
+  if (docLines) return docLines;
+  docLines = [];
+  if (!docsBuf) return docLines;
+
+  let sec = '';
+  let head = '';
+  docsBuf.lines.forEach((el, idx) => {
+    const owner = el.closest('.docsec');
+    if (!owner) return;                      // the buffer's own header lines
+    const at = owner.dataset.sec || '';
+    if (at !== sec) { sec = at; head = ''; }
+    const h = el.querySelector('.h2, .h3');
+    if (h) head = h.textContent.replace(/^#+\s*/, '').trim();
+    const text = el.textContent.replace(/\s+/g, ' ').trim();
+    if (text) docLines.push({ idx, text, sec, head, heading: !!h });
+  });
+  return docLines;
+}
+
+/** Anchored headings, for `:help <topic>`. `top` marks a whole section. */
+function docTopics() {
+  if (docHeads) return docHeads;
+  docHeads = [];
+  if (!docsBuf) return docHeads;
+  docsBuf.el.querySelectorAll('.l[id^="doc-"]').forEach((el) => {
+    docHeads.push({
+      id: el.id,
+      title: el.textContent.replace(/^#+\s*/, '').trim(),
+      top: !!el.querySelector('.h1'),
+    });
+  });
+  return docHeads;
+}
+
+/** Move to an `id` anywhere in the page, switching buffers if need be. */
+function jumpToAnchor(id) {
+  const el = document.getElementById(id);
+  const owner = el && el.closest('.buf');
+  if (!owner) {
+    const key = bufs.findIndex((b) => b.key === id);
+    return key >= 0 ? gotoBuf(key, { top: true }) : false;
+  }
+
+  const bi = bufs.findIndex((b) => b.el === owner);
+  if (bi < 0) return false;
+  if (bi !== state.buf) gotoBuf(bi);
+  const idx = bufs[bi].lines.indexOf(el);
+  if (idx >= 0) moveTo(idx, { center: true });
+  try { history.replaceState(null, '', `#${id}`); } catch (_) { /* no deep link */ }
+  message(el.textContent.replace(/^#+\s*/, '').trim());
+  return true;
+}
+
+/** The matched run, with ~30 columns of context either side. */
+function resultText(row, q) {
+  const pre = Math.max(0, row.at - 30);
+  const body = row.text.slice(pre, pre + 150);
+  const at = row.at - pre;
+  const frag = document.createDocumentFragment();
+  const hit = document.createElement('span');
+  hit.className = 'm';
+  hit.textContent = body.slice(at, at + q.length);
+  frag.append(
+    (pre ? '…' : '') + body.slice(0, at),
+    hit,
+    body.slice(at + q.length) + (row.text.length > pre + 150 ? '…' : ''),
+  );
+  return frag;
+}
+
+function drawDocResults(q, total) {
+  docqResults.replaceChildren();
+
+  if (!q) {
+    docqResults.hidden = true;
+    docqStatus.textContent = '';
+    return;
+  }
+  if (!state.dhits.length) {
+    docqStatus.textContent = 'no matches';
+    const empty = document.createElement('div');
+    empty.className = 'dempty';
+    empty.textContent = `E486: Pattern not found: ${q}`;
+    docqResults.append(empty);
+    docqResults.hidden = false;
+    return;
+  }
+
+  docqStatus.textContent = total > state.dhits.length
+    ? `${total} matches — first ${state.dhits.length}`
+    : `${total} match${total === 1 ? '' : 'es'}`;
+
+  state.dhits.forEach((row, i) => {
+    const item = document.createElement('div');
+    item.className = 'dres';
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(i === state.didx));
+
+    const where = document.createElement('span');
+    where.className = 'dwhere';
+    where.textContent = row.head ? `${row.sec} › ${row.head}` : row.sec;
+
+    const text = document.createElement('span');
+    text.className = 'dtext';
+    text.append(resultText(row, q));
+
+    item.append(where, text);
+    item.addEventListener('mousedown', (e) => { e.preventDefault(); docJump(i); });
+    docqResults.append(item);
+  });
+  docqResults.hidden = false;
+}
+
+/** Plain substring search over the docs, headings first. */
+function docSearch(query) {
+  const q = query.trim().toLowerCase();
+  state.dhits = [];
+  state.didx = 0;
+  if (!q) { drawDocResults('', 0); return; }
+
+  for (const row of docIndex()) {
+    const at = row.text.toLowerCase().indexOf(q);
+    if (at === -1) continue;
+    // Headings answer "where is this documented"; body lines answer "where is
+    // it mentioned". The first question is almost always the one being asked.
+    const score = (row.heading ? 500 : 0) + (at === 0 ? 40 : 0)
+      - Math.min(at, 60) - row.idx / 10000;
+    state.dhits.push({ ...row, at, score });
+  }
+
+  state.dhits.sort((a, b) => b.score - a.score);
+  state.dtotal = state.dhits.length;
+  state.dhits = state.dhits.slice(0, 40);
+  drawDocResults(query.trim(), state.dtotal);
+}
+
+function docMove(delta) {
+  if (!state.dhits.length) return;
+  state.didx = (state.didx + delta + state.dhits.length) % state.dhits.length;
+  drawDocResults(docq.value.trim(), state.dtotal);
+  const sel = docqResults.children[state.didx];
+  if (sel) sel.scrollIntoView({ block: 'nearest' });
+}
+
+function docJump(i) {
+  const row = state.dhits[i];
+  if (!row) return;
+  state.didx = i;
+  if (state.buf !== docsIdx) gotoBuf(docsIdx);
+  docq.blur();
+
+  moveTo(row.idx, { center: true });
+  // Leave the query as the buffer's search pattern, so `n` / `N` walk the
+  // rest of the hits the way they would after a `/`. A match that only exists
+  // across two spans won't be found by the line search — no error for that.
+  search(docq.value.trim());
+  if (!state.matches.length) clearSearch({ quiet: true });
+  moveTo(row.idx, { center: true });
+
+  const where = row.head ? `${row.sec} › ${row.head}` : row.sec;
+  message(`${where}  —  n / N for the next hit, Esc to clear`);
+}
+
+function openDocSearch(query) {
+  if (!docsBuf) return;
+  if (state.buf !== docsIdx) gotoBuf(docsIdx, { top: true });
+  else viewport.scrollTo({ top: 0, behavior: 'auto' });
+  docq.value = query || '';
+  docSearch(docq.value);
+  docq.focus();
+  message(query ? `docs: ${query}` : 'type to search the docs');
+}
+
+/** `:help folds` — a heading if there is one, the search box otherwise. */
+function docHelp(topic) {
+  if (!docsBuf) { toggleHelp(true); return; }
+  const want = topic.trim().toLowerCase();
+  if (!want) { gotoBuf(docsIdx, { top: true }); return; }
+
+  const topics = docTopics();
+  const eq = (t) => t.title.toLowerCase() === want;
+  const starts = (t) => t.title.toLowerCase().startsWith(want);
+  const has = (t) => t.title.toLowerCase().includes(want);
+  const hit = topics.find((t) => t.top && eq(t)) || topics.find(eq)
+    || topics.find((t) => t.top && starts(t)) || topics.find(starts)
+    || topics.find(has);
+
+  if (hit) { jumpToAnchor(hit.id); return; }
+  openDocSearch(topic.trim());
+  message(`no section called "${topic.trim()}" — searching the docs instead`);
+}
+
+if (docq) {
+  docq.addEventListener('input', () => docSearch(docq.value));
+  docq.addEventListener('keydown', (e) => {
+    const { key, ctrlKey } = e;
+    if (key === 'ArrowDown' || (ctrlKey && key === 'n')) { e.preventDefault(); docMove(1); }
+    else if (key === 'ArrowUp' || (ctrlKey && key === 'p')) { e.preventDefault(); docMove(-1); }
+    else if (key === 'Enter') { e.preventDefault(); docJump(state.didx); }
+    else if (key === 'Escape') {
+      e.preventDefault();
+      docq.value = '';
+      docSearch('');
+      docq.blur();
+      message('');
+    }
+  });
+}
+
 /* ── commands ──────────────────────────────────────────────────────────── */
 
 function openLink(url) {
@@ -385,13 +633,8 @@ function setOption(arg) {
 function toggleHelp(force) {
   const show = force !== undefined ? force : help.hidden;
   if (show && !helpBody.childElementCount) {
-    const src = bufs.find((b) => b.key === 'keymaps');
-    if (src) {
-      helpBody.innerHTML = src.el.innerHTML;
-      // The live block cursor may have been sitting in that buffer.
-      const stowaway = helpBody.querySelector('#cursor');
-      if (stowaway) stowaway.remove();
-    }
+    const src = $('site-keymaps');
+    if (src) helpBody.innerHTML = src.innerHTML;
   }
   help.hidden = !show;
   state.mode = show ? 'HELP' : 'NORMAL';
@@ -416,8 +659,14 @@ const COMMANDS = [
     desc: `open ${b.name}`,
     run: () => gotoBuf(i, { top: true }),
   })),
-  { name: ':bnext', desc: 'next buffer (gt)', run: () => bufStep(1) },
-  { name: ':bprevious', desc: 'previous buffer (gT)', run: () => bufStep(-1) },
+  { name: ':bnext', desc: 'next page (gt)', run: () => bufStep(1) },
+  { name: ':bprevious', desc: 'previous page (gT)', run: () => bufStep(-1) },
+  { name: ':docs', desc: 'search the documentation', run: () => openDocSearch('') },
+  ...docTopics().filter((t) => t.top).map((t) => ({
+    name: `:help ${t.title}`,
+    desc: `docs → ${t.title}`,
+    run: () => jumpToAnchor(t.id),
+  })),
   ...THEMES.map((t) => ({
     name: `:colorscheme ${t}`,
     desc: `theme → ${THEME_NAMES[t]}`,
@@ -427,7 +676,7 @@ const COMMANDS = [
   { name: ':set relativenumber', desc: 'relative line numbers', run: () => setOption('relativenumber') },
   { name: ':set nonumber', desc: 'hide the gutter', run: () => setOption('nonumber') },
   { name: ':nohlsearch', desc: 'clear search highlighting', run: () => clearSearch() },
-  { name: ':help', desc: 'the keymap, as an overlay', run: () => toggleHelp(true) },
+  { name: ':keymap', desc: "this page's keys, as an overlay", run: () => toggleHelp(true) },
   { name: ':clone', desc: 'yank the git clone line to the clipboard', run: copyClone },
   { name: ':GitHub', desc: 'open the repository', run: () => openLink(REPO) },
   { name: ':issues', desc: 'open the issue tracker', run: () => openLink(`${REPO}/issues`) },
@@ -463,7 +712,9 @@ function execute(raw) {
     }
     case 'se': case 'set': setOption(arg); return;
     case 'noh': case 'nohl': case 'nohls': case 'nohlsearch': clearSearch(); return;
-    case 'h': case 'help': toggleHelp(true); return;
+    case 'h': case 'help': if (arg) docHelp(arg); else toggleHelp(true); return;
+    case 'keymap': case 'keys': toggleHelp(true); return;
+    case 'doc': case 'docs': openDocSearch(arg); return;
     case 'clone': copyClone(); return;
     case 'github': case 'gh': openLink(REPO); return;
     case 'issues': openLink(`${REPO}/issues`); return;
@@ -670,6 +921,8 @@ cmdinput.addEventListener('keydown', (e) => {
 function followLink() {
   const link = cursorLine() && cursorLine().querySelector('a[href]');
   if (!link) { message('E447: No link on this line', true); return; }
+  const href = link.getAttribute('href');
+  if (href.startsWith('#')) { jumpToAnchor(href.slice(1)); return; }
   openLink(link.href);
 }
 
@@ -740,6 +993,15 @@ document.addEventListener('keydown', (e) => {
 
 /* ── mouse & misc ──────────────────────────────────────────────────────── */
 
+// Cross-references stay inside the page: they move the cursor rather than
+// navigating, so the docs read as one buffer.
+document.addEventListener('click', (e) => {
+  const link = e.target.closest('a[href^="#"]');
+  if (!link) return;
+  e.preventDefault();
+  jumpToAnchor(link.getAttribute('href').slice(1));
+});
+
 viewport.addEventListener('click', (e) => {
   if (e.target.closest('a')) return;
   const line = e.target.closest('.l');
@@ -763,7 +1025,8 @@ window.addEventListener('resize', () => { chWidth = 0; });
 
   buildTabline();
 
-  const wanted = bufs.findIndex((b) => b.key === location.hash.replace(/^#(buf-)?/, ''));
+  const hash = location.hash.replace(/^#/, '');
+  const wanted = bufs.findIndex((b) => b.key === hash.replace(/^buf-/, ''));
   if (wanted > 0) {
     bufs.forEach((b, i) => b.el.classList.toggle('active', i === wanted));
     state.buf = wanted;
@@ -771,6 +1034,9 @@ window.addEventListener('resize', () => { chWidth = 0; });
   }
 
   render();
+
+  // A deep link into the docs (…/#doc-folds) lands on the line itself.
+  if (wanted < 0 && hash) jumpToAnchor(hash);
   const touch = typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
   message(touch
     ? `"${buf().name}" ${buf().lines.length}L — tap a tab to switch files`
