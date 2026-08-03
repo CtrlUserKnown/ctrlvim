@@ -3073,6 +3073,25 @@
       <div class="l"></div>
       <div class="l"><span class="h2">## Unreleased — v0.1.0</span></div>
       <div class="l"></div>
+      <div class="l"><span class="h3">### 2026-08-02</span></div>
+      <div class="l"></div>
+      <div class="l">  <span class="green">+</span> an LSP client — a declared server is spawned for the buffers it</div>
+      <div class="l">    claims, kept in sync as you edit, and asked for completions</div>
+      <div class="l">  <span class="green">+</span> <span class="key">lsp.lua</span> — every language server and build linker is declared</div>
+      <div class="l">    there and nowhere else; nothing is baked into the binary, so a</div>
+      <div class="l">    server you don't name never appears anywhere in the editor</div>
+      <div class="l">  <span class="green">+</span> a completion popup — server results refiltered locally as you</div>
+      <div class="l">    type, with buffer words appended after them</div>
+      <div class="l">  <span class="green">+</span> <span class="key">&lt;C-o&gt;</span>/<span class="key">&lt;C-i&gt;</span> carry on across files once a file's own</div>
+      <div class="l">    jumplist is exhausted</div>
+      <div class="l">  <span class="green">+</span> <span class="key">cvi tool fetch-release</span> — a generic GitHub-release installer,</div>
+      <div class="l">    for the servers with no <span class="key">cargo</span>/<span class="key">npm</span>/<span class="key">pip</span> install path</div>
+      <div class="l">  <span class="green">+</span> auto-closing brackets and quotes in Insert mode</div>
+      <div class="l">  <span class="green">+</span> Settings: searchable rows, an indent-width cycle, a tab-bar</div>
+      <div class="l">    toggle; a fresh install now writes <span class="key">config.toml</span> on first launch</div>
+      <div class="l">  <span class="green">+</span> this site rebuilt — the docs are generated from the wiki, so</div>
+      <div class="l">    they're the same text the repository ships</div>
+      <div class="l"></div>
       <div class="l"><span class="h3">### 2026-07-31</span></div>
       <div class="l"></div>
       <div class="l">  <span class="green">+</span> <span class="key">:Lint</span> runs a filetype's linter and fills the quickfix list</div>
@@ -3145,11 +3164,10 @@
       <div class="l"></div>
       <div class="l"><span class="h2">## Next</span></div>
       <div class="l"></div>
-      <div class="l">  <span class="dim">·</span> an LSP client — servers can be installed and tracked today, but</div>
-      <div class="l">    nothing spawns one</div>
+      <div class="l">  <span class="dim">·</span> the rest of LSP — diagnostics, go-to-definition, hover, rename;</div>
+      <div class="l">    the client only does document sync and completion today</div>
       <div class="l">  <span class="dim">·</span> incremental tree-sitter parsing; a full reparse still happens on</div>
       <div class="l">    every edit</div>
-      <div class="l">  <span class="dim">·</span> an inline completion popup</div>
       <div class="l">  <span class="dim">·</span> prebuilt binaries and a tagged release</div>
       <div class="l"></div>
       <div class="l"><span class="c">The commit log is the authority:</span></div>
